@@ -94,11 +94,15 @@ class PhoneNumber(Base):
 
 
 class Connection(Base):
+    """One mailbox. A customer can have several."""
     __tablename__ = "connections"
     id = Column(Integer, primary_key=True)
     account_id = Column(Integer, ForeignKey("accounts.id"))
     provider = Column(String(30), default="google")
     email = Column(String(200))
+    label = Column(String(60), default="")        # "work", "shul", "personal"
+    is_default = Column(Integer, default=0)
+    use_count = Column(Integer, default=0)
     secret_blob = Column(Text)                        # encrypted token json
     linked_at = Column(DateTime, default=datetime.utcnow)
 
@@ -161,6 +165,29 @@ class Onboard(Base):
 
 Base.metadata.create_all(engine)
 
+
+def _ensure_columns():
+    """Add columns that newer versions introduced, on existing databases."""
+    from sqlalchemy import text as _sql
+    wanted = {
+        "connections": [
+            ("label", "VARCHAR(60) DEFAULT ''"),
+            ("is_default", "INTEGER DEFAULT 0"),
+            ("use_count", "INTEGER DEFAULT 0"),
+        ],
+    }
+    with engine.begin() as c:
+        for table, cols in wanted.items():
+            for name, decl in cols:
+                try:
+                    c.execute(_sql(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {decl}"))
+                except Exception:
+                    pass          # already there
+
+
+_ensure_columns()
+
 # ----------------------------------------------------------------- vault
 # Swap the two functions below for AWS KMS before real customers.
 # Everything else in the app stays the same.
@@ -189,17 +216,58 @@ def _flow(state=None):
     return f
 
 
-def gmail_client(account_id: int):
-    """Returns an authorised Gmail client for this account."""
+def list_mailboxes(account_id: int) -> list:
     db = Session()
-    conn = (db.query(Connection)
-              .filter_by(account_id=account_id, provider="google")
-              .first())
+    rows = (db.query(Connection)
+              .filter_by(account_id=account_id, provider="google").all())
+    out = [{"id": r.id, "email": r.email, "label": r.label,
+            "default": bool(r.is_default), "used": r.use_count or 0}
+           for r in rows]
     db.close()
+    out.sort(key=lambda x: (not x["default"], -x["used"]))
+    return out
+
+
+def pick_connection(account_id: int, which: str = ""):
+    """Find the right mailbox: by name, else the default, else most used."""
+    db = Session()
+    rows = (db.query(Connection)
+              .filter_by(account_id=account_id, provider="google").all())
+    if not rows:
+        db.close()
+        return None, []
+    chosen = None
+    if which:
+        w = which.strip().lower()
+        for r in rows:
+            if w and (w == (r.label or "").lower()
+                      or w == (r.email or "").lower()):
+                chosen = r
+                break
+        if not chosen:
+            for r in rows:
+                if w in (r.label or "").lower() or w in (r.email or "").lower():
+                    chosen = r
+                    break
+    if not chosen:
+        rows.sort(key=lambda r: (not bool(r.is_default), -(r.use_count or 0)))
+        chosen = rows[0]
+    chosen.use_count = (chosen.use_count or 0) + 1
+    db.commit()
+    cid, email = chosen.id, chosen.email
+    blob = chosen.secret_blob
+    others = [{"email": r.email, "label": r.label} for r in rows]
+    db.close()
+    return {"id": cid, "email": email, "blob": blob}, others
+
+
+def gmail_client(account_id: int, which: str = ""):
+    """Returns an authorised Gmail client for one of this account's mailboxes."""
+    conn, _ = pick_connection(account_id, which)
     if not conn:
         raise HTTPException(400, "This account has no Gmail linked yet.")
 
-    tok = vault_get(conn.secret_blob)
+    tok = vault_get(conn["blob"])
     creds = Credentials(
         token=tok.get("token"),
         refresh_token=tok.get("refresh_token"),
@@ -213,8 +281,8 @@ def gmail_client(account_id: int):
 # ----------------------------------------------------------------- tools
 # These are the functions the voice agent will call later.
 
-def tool_unread_summary(account_id: int, limit: int = 5) -> dict:
-    svc = gmail_client(account_id)
+def tool_unread_summary(account_id: int, limit: int = 5, which: str = "") -> dict:
+    svc = gmail_client(account_id, which)
     res = svc.users().messages().list(
         userId="me", q="is:unread in:inbox", maxResults=limit).execute()
     ids = [m["id"] for m in res.get("messages", [])]
@@ -252,8 +320,8 @@ def _extract_body(payload) -> str:
     return ""
 
 
-def tool_read_email(account_id: int, msg_id: str) -> dict:
-    svc = gmail_client(account_id)
+def tool_read_email(account_id: int, msg_id: str, which: str = "") -> dict:
+    svc = gmail_client(account_id, which)
     m = svc.users().messages().get(
         userId="me", id=msg_id, format="full").execute()
     h = {x["name"]: x["value"] for x in m["payload"].get("headers", [])}
@@ -266,8 +334,9 @@ def tool_read_email(account_id: int, msg_id: str) -> dict:
     }
 
 
-def tool_send_email(account_id: int, to: str, subject: str, body: str) -> dict:
-    svc = gmail_client(account_id)
+def tool_send_email(account_id: int, to: str, subject: str,
+                    body: str, which: str = "") -> dict:
+    svc = gmail_client(account_id, which)
     msg = MIMEText(body)
     msg["to"] = to
     msg["subject"] = subject
@@ -277,9 +346,9 @@ def tool_send_email(account_id: int, to: str, subject: str, body: str) -> dict:
     return {"sent": True, "id": sent.get("id")}
 
 
-def tool_search_email(account_id: int, query: str, limit: int = 5) -> dict:
+def tool_search_email(account_id: int, query: str, limit: int = 5, which: str = "") -> dict:
     """Search the whole mailbox, not just unread."""
-    svc = gmail_client(account_id)
+    svc = gmail_client(account_id, which)
     res = svc.users().messages().list(
         userId="me", q=query, maxResults=limit).execute()
     items = []
@@ -299,9 +368,9 @@ def tool_search_email(account_id: int, query: str, limit: int = 5) -> dict:
     return {"found": len(items), "messages": items}
 
 
-def tool_find_contact(account_id: int, name: str) -> dict:
+def tool_find_contact(account_id: int, name: str, which: str = "") -> dict:
     """Find someone's email address from past messages, by name or partial."""
-    svc = gmail_client(account_id)
+    svc = gmail_client(account_id, which)
     seen = {}
     for q in (f"from:{name}", f"to:{name}", name):
         try:
@@ -332,15 +401,12 @@ def tool_find_contact(account_id: int, name: str) -> dict:
 
 
 
-def google_client(account_id: int, api: str, version: str):
+def google_client(account_id: int, api: str, version: str, which: str = ""):
     """Same credentials, different Google API."""
-    db = Session()
-    conn = (db.query(Connection)
-              .filter_by(account_id=account_id, provider="google").first())
-    db.close()
+    conn, _ = pick_connection(account_id, which)
     if not conn:
         raise HTTPException(400, "This account has no Google account linked.")
-    tok = vault_get(conn.secret_blob)
+    tok = vault_get(conn["blob"])
     creds = Credentials(
         token=tok.get("token"),
         refresh_token=tok.get("refresh_token"),
@@ -352,13 +418,13 @@ def google_client(account_id: int, api: str, version: str):
     return build(api, version, credentials=creds, cache_discovery=False)
 
 
-def _cal(account_id: int):
-    return google_client(account_id, "calendar", "v3")
+def _cal(account_id: int, which: str = ""):
+    return google_client(account_id, "calendar", "v3", which)
 
 
-def tool_list_events(account_id: int, days: int = 1) -> dict:
+def tool_list_events(account_id: int, days: int = 1, which: str = "") -> dict:
     """Upcoming events over the next N days."""
-    svc = _cal(account_id)
+    svc = _cal(account_id, which)
     now = datetime.now(timezone.utc)
     end = now + timedelta(days=days)
     res = svc.events().list(
@@ -1025,16 +1091,57 @@ def list_accounts(request: Request):
     for acct in db.query(Account).all():
         nums = [p.number for p in
                 db.query(PhoneNumber).filter_by(account_id=acct.id).all()]
-        conn = (db.query(Connection)
-                  .filter_by(account_id=acct.id, provider="google").first())
+        conns = (db.query(Connection)
+                   .filter_by(account_id=acct.id, provider="google").all())
         rows.append({
             "account_id": acct.id,
             "name": acct.name,
             "phones": nums,
-            "gmail": conn.email if conn else None,
+            "gmail": conns[0].email if conns else None,
+            "mailboxes": [{"id": c.id, "email": c.email, "label": c.label,
+                           "default": bool(c.is_default),
+                           "used": c.use_count or 0} for c in conns],
         })
     db.close()
     return rows
+
+
+@app.get("/mailboxes")
+def mailboxes(request: Request, account_id: int):
+    require_auth(request)
+    return list_mailboxes(account_id)
+
+
+@app.post("/mailboxes/label")
+def mailbox_label(request: Request, connection_id: int, label: str = "",
+                  make_default: int = 0):
+    require_auth(request)
+    db = Session()
+    row = db.query(Connection).filter_by(id=connection_id).first()
+    if not row:
+        db.close()
+        raise HTTPException(404, "Unknown mailbox.")
+    if label:
+        row.label = label[:60]
+    if make_default:
+        for other in (db.query(Connection)
+                        .filter_by(account_id=row.account_id).all()):
+            other.is_default = 1 if other.id == connection_id else 0
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
+@app.delete("/mailboxes")
+def mailbox_remove(request: Request, connection_id: int):
+    require_auth(request)
+    db = Session()
+    row = db.query(Connection).filter_by(id=connection_id).first()
+    if row:
+        db.delete(row)
+        db.commit()
+    db.close()
+    return {"ok": True}
 
 
 @app.get("/link/start")
@@ -1070,15 +1177,17 @@ def link_callback(request: Request):
     })
 
     db = Session()
-    conn = (db.query(Connection)
-              .filter_by(account_id=account_id, provider="google").first())
-    if conn:
-        conn.secret_blob = blob
-        conn.email = email
-        conn.linked_at = datetime.utcnow()
+    existing = (db.query(Connection)
+                  .filter_by(account_id=account_id, provider="google").all())
+    same = next((c for c in existing
+                 if (c.email or "").lower() == (email or "").lower()), None)
+    if same:
+        same.secret_blob = blob
+        same.linked_at = datetime.utcnow()
     else:
         db.add(Connection(account_id=account_id, provider="google",
-                          email=email, secret_blob=blob))
+                          email=email, secret_blob=blob,
+                          is_default=0 if existing else 1))
     db.commit()
     db.close()
 
@@ -1088,27 +1197,31 @@ def link_callback(request: Request):
 
 
 @app.get("/test/unread")
-def test_unread(request: Request, account_id: int, limit: int = 5):
+def test_unread(request: Request, account_id: int, limit: int = 5,
+                which: str = ""):
     require_auth(request)
-    return tool_unread_summary(account_id, limit)
+    return tool_unread_summary(account_id, limit, which)
 
 
 @app.get("/test/read")
-def test_read(request: Request, account_id: int, msg_id: str):
+def test_read(request: Request, account_id: int, msg_id: str,
+              which: str = ""):
     require_auth(request)
-    return tool_read_email(account_id, msg_id)
+    return tool_read_email(account_id, msg_id, which)
 
 
 @app.get("/test/search")
-def test_search(request: Request, account_id: int, q: str, limit: int = 5):
+def test_search(request: Request, account_id: int, q: str, limit: int = 5,
+                which: str = ""):
     require_auth(request)
-    return tool_search_email(account_id, q, limit)
+    return tool_search_email(account_id, q, limit, which)
 
 
 @app.get("/test/contact")
-def test_contact(request: Request, account_id: int, name: str):
+def test_contact(request: Request, account_id: int, name: str,
+                 which: str = ""):
     require_auth(request)
-    return tool_find_contact(account_id, name)
+    return tool_find_contact(account_id, name, which)
 
 
 @app.get("/sms/status")
@@ -1468,9 +1581,10 @@ def web_search(request: Request, q: str, near: str = ""):
 
 
 @app.get("/cal/events")
-def cal_events(request: Request, account_id: int, days: int = 1):
+def cal_events(request: Request, account_id: int, days: int = 1,
+               which: str = ""):
     require_auth(request)
-    return tool_list_events(account_id, days)
+    return tool_list_events(account_id, days, which)
 
 
 @app.get("/cal/free")
@@ -1506,12 +1620,13 @@ class SendBody(BaseModel):
     to: str
     subject: str
     body: str
+    which: str = ""
 
 
 @app.post("/test/send")
 def test_send(s: SendBody, request: Request):
     require_auth(request)
-    return tool_send_email(s.account_id, s.to, s.subject, s.body)
+    return tool_send_email(s.account_id, s.to, s.subject, s.body, s.which)
 
 
 # ----------------------------------------------------------------- admin
@@ -1719,8 +1834,7 @@ async function load(){
     tb.innerHTML = d.map(function(a){
       return '<tr><td>'+a.account_id+'</td><td>'+esc(a.name)+'</td>'+
         '<td>'+esc((a.phones||[]).join(', '))+'</td>'+
-        '<td>'+(a.gmail?'<span class="ok">'+esc(a.gmail)+'</span>'
-                       :'<span class="no">not linked</span>')+'</td>'+
+        '<td>'+mboxes(a)+'</td>'+
         '<td><a class="btn" target="_blank" href="/link/start?account_id='+
         a.account_id+'">Link Gmail</a>'+
         '<button class="sec" onclick="copyLink('+a.account_id+')">Copy</button>'+
@@ -1733,6 +1847,34 @@ async function load(){
   }
 }
 
+function mboxes(a){
+  var m = a.mailboxes || [];
+  if(!m.length) return '<span class="no">not linked</span>';
+  return m.map(function(b){
+    return '<div style="margin-bottom:4px">'+
+      '<span class="ok">'+esc(b.email)+'</span>'+
+      (b.label?' <span class="tag">'+esc(b.label)+'</span>':'')+
+      (b.default?' <span class="tag">main</span>':'')+
+      ' <span style="color:#8b94a7;font-size:11px">'+b.used+' uses</span>'+
+      ' <a href="#" style="font-size:11px;color:#8b94a7" '+
+      'onclick="labelBox('+b.id+');return false">rename</a>'+
+      (b.default?'':' <a href="#" style="font-size:11px;color:#8b94a7" '+
+      'onclick="defaultBox('+b.id+');return false">make main</a>')+
+      '</div>';
+  }).join('');
+}
+async function labelBox(id){
+  var l = prompt('Short name for this mailbox (work, personal, shul):');
+  if(l === null) return;
+  await fetch('/mailboxes/label?connection_id='+id+
+              '&label='+encodeURIComponent(l), {method:'POST'});
+  load();
+}
+async function defaultBox(id){
+  await fetch('/mailboxes/label?connection_id='+id+'&make_default=1',
+              {method:'POST'});
+  load();
+}
 function copyLink(id){
   const url = location.origin + '/link/start?account_id=' + id;
   navigator.clipboard.writeText(url);

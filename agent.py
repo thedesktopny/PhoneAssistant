@@ -91,6 +91,7 @@ class Assistant(Agent):
         self.last_list = []
         self.last_events = []
         self.onboard_sid = None
+        self.mailbox = ""
 
         today = datetime.now(ZoneInfo("America/New_York")).strftime(
             "%A, %B %-d, %Y")
@@ -155,6 +156,16 @@ CALENDAR
 - Speak times naturally: "Tuesday at two thirty", never ISO timestamps.
 - Today is {today}. Work out relative dates like "tomorrow" or "next Tuesday"
   yourself before calling a tool.
+
+MORE THAN ONE MAILBOX
+Some callers have several email addresses. list_mailboxes tells you which
+they have and which one they use most.
+- If they have one, just use it. Don't mention there's only one.
+- If they have several and it's obvious which they mean ("my work email"),
+  pass that name as the mailbox.
+- If it's not obvious, ask once: "Which one — work or personal?" Then use it
+  for the rest of the call unless they say otherwise.
+- When reading email from a specific mailbox, say which one you're reading.
 
 CONNECTING THEIR EMAIL (only if they aren't connected yet)
 If check_email says their account has no email linked, offer to connect it
@@ -223,13 +234,16 @@ FINDING EMAIL
         return "PIN incorrect."
 
     @function_tool
-    async def check_email(self, context: RunContext, how_many: int = 5):
-        """Get the caller's unread emails — count, senders and subjects."""
+    async def check_email(self, context: RunContext, how_many: int = 5,
+                          mailbox: str = ""):
+        """Get the caller's unread emails. Set mailbox to their name for it
+        ("work", "personal") if they have more than one."""
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
         try:
             data = await backend_get(
-                "/test/unread", account_id=self.account_id, limit=how_many)
+                "/test/unread", account_id=self.account_id, limit=how_many,
+                which=mailbox or self.mailbox)
         except Exception as e:
             log.error(f"unread failed: {e}")
             return "I couldn't reach the mailbox just now."
@@ -255,7 +269,8 @@ FINDING EMAIL
         msg_id = self.last_list[which - 1]["id"]
         try:
             data = await backend_get(
-                "/test/read", account_id=self.account_id, msg_id=msg_id)
+                "/test/read", account_id=self.account_id, msg_id=msg_id,
+                which=self.mailbox)
         except Exception as e:
             log.error(f"read failed: {e}")
             return "I couldn't open that message."
@@ -264,7 +279,7 @@ FINDING EMAIL
 
     @function_tool
     async def search_email(self, context: RunContext, query: str,
-                           how_many: int = 5):
+                           how_many: int = 5, mailbox: str = ""):
         """Search the whole mailbox using Gmail search syntax. Use this for
         anything that isn't the unread list — a person, a topic, an old
         thread. Examples: 'from:chaim', 'invoice', 'from:amazon'."""
@@ -273,7 +288,8 @@ FINDING EMAIL
         try:
             data = await backend_get("/test/search",
                                      account_id=self.account_id,
-                                     q=query, limit=how_many)
+                                     q=query, limit=how_many,
+                                     which=mailbox or self.mailbox)
         except Exception as e:
             log.error(f"search failed: {e}")
             return "The search didn't go through."
@@ -307,6 +323,38 @@ FINDING EMAIL
             return f"No address found for {name}. Ask the caller to spell it."
         return "; ".join(f"{m['name'] or m['email']} at {m['email']}"
                          for m in matches)
+
+    @function_tool
+    async def list_mailboxes(self, context: RunContext):
+        """Which email addresses this caller has connected, most-used first."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            rows = await backend_get("/mailboxes",
+                                     account_id=self.account_id)
+        except Exception:
+            return "Couldn't check their mailboxes."
+        if not rows:
+            return "No email connected yet. Offer to connect one."
+        if len(rows) == 1:
+            self.mailbox = rows[0]["email"]
+            return f"One mailbox: {rows[0]['email']}. Just use it."
+        parts = []
+        for r in rows:
+            name = r.get("label") or r.get("email")
+            tags = []
+            if r.get("default"):
+                tags.append("main")
+            tags.append(f"{r.get('used', 0)} uses")
+            parts.append(f"{name} ({', '.join(tags)})")
+        return ("They have several: " + "; ".join(parts) +
+                ". Ask which one if it isn't obvious.")
+
+    @function_tool
+    async def use_mailbox(self, context: RunContext, mailbox: str):
+        """Set which mailbox to use for the rest of the call."""
+        self.mailbox = mailbox.strip()
+        return f"Using {self.mailbox} from now on."
 
     @function_tool
     async def connect_email(self, context: RunContext, email: str,
@@ -502,6 +550,7 @@ FINDING EMAIL
             await backend_post("/test/send", {
                 "account_id": self.account_id,
                 "to": to, "subject": subject, "body": body,
+                "which": self.mailbox,
             })
         except Exception as e:
             log.error(f"send failed: {e}")
