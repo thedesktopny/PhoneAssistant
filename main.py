@@ -825,8 +825,18 @@ def _run_signin(sid: int, account_id: int, email: str):
             page.keyboard.press("Enter")
             page.wait_for_timeout(6000)
 
-            if page.query_selector('text=/Wrong password|incorrect|try again/i'):
-                _ob_set(sid, "failed", "Google says the password is wrong.")
+            if page.query_selector('text=/Wrong password/i'):
+                _ob_set(sid, "failed",
+                        "Google says the password is wrong. " + where(page))
+                browser.close()
+                return
+
+            blocked = page.query_selector(
+                'text=/couldn.t sign you in|browser or app may not be secure|'
+                'verify it.s you|suspicious|unusual activity/i')
+            if blocked:
+                _ob_set(sid, "failed",
+                        "Google blocked the automated sign-in. " + where(page))
                 browser.close()
                 return
 
