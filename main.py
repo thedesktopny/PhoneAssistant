@@ -317,3 +317,90 @@ class SendBody(BaseModel):
 @app.post("/test/send")
 def test_send(s: SendBody):
     return tool_send_email(s.account_id, s.to, s.subject, s.body)
+
+
+# ----------------------------------------------------------------- admin
+
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "changeme")
+
+ADMIN_HTML = """<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Phone Assistant — Admin</title>
+<style>
+ body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#0f1115;
+      color:#e6e6e6;margin:0;padding:24px;}
+ h1{font-size:20px;margin:0 0 20px;}
+ .card{background:#171a21;border:1px solid #262b36;border-radius:10px;
+       padding:18px;margin-bottom:18px;max-width:900px;}
+ label{display:block;font-size:12px;color:#8b94a7;margin:10px 0 4px;}
+ input{width:100%;padding:9px 10px;background:#0f1115;border:1px solid #2c3240;
+       border-radius:6px;color:#e6e6e6;font-size:14px;box-sizing:border-box;}
+ button{margin-top:14px;padding:9px 16px;background:#3b82f6;border:0;
+        border-radius:6px;color:#fff;font-size:14px;cursor:pointer;}
+ button.sec{background:#2c3240;}
+ table{width:100%;border-collapse:collapse;margin-top:8px;font-size:14px;}
+ th{text-align:left;color:#8b94a7;font-weight:500;font-size:12px;
+    padding:8px 6px;border-bottom:1px solid #262b36;}
+ td{padding:10px 6px;border-bottom:1px solid #1c212b;}
+ .ok{color:#4ade80;} .no{color:#f87171;}
+ a.btn{display:inline-block;padding:6px 12px;background:#2c3240;color:#e6e6e6;
+       border-radius:6px;text-decoration:none;font-size:13px;}
+ .msg{margin-top:10px;font-size:13px;color:#8b94a7;}
+</style></head><body>
+<h1>Phone Assistant — Admin</h1>
+
+<div class="card">
+  <b>Add a customer</b>
+  <label>Name</label><input id="n" placeholder="Chaim Weiss">
+  <label>Their phone number (the one they'll call from)</label>
+  <input id="p" placeholder="+18455551234">
+  <label>PIN</label><input id="k" value="1234">
+  <button onclick="add()">Create</button>
+  <div class="msg" id="msg"></div>
+</div>
+
+<div class="card">
+  <b>Customers</b>
+  <table><thead><tr><th>ID</th><th>Name</th><th>Phone</th>
+  <th>Gmail</th><th></th></tr></thead><tbody id="rows"></tbody></table>
+</div>
+
+<script>
+const q = new URLSearchParams(location.search).get('key') || '';
+async function load(){
+  const r = await fetch('/accounts');
+  const d = await r.json();
+  document.getElementById('rows').innerHTML = d.map(a =>
+    `<tr><td>${a.account_id}</td><td>${a.name||''}</td>
+     <td>${(a.phones||[]).join(', ')}</td>
+     <td>${a.gmail ? '<span class=ok>'+a.gmail+'</span>'
+                   : '<span class=no>not linked</span>'}</td>
+     <td><a class="btn" target="_blank"
+        href="/link/start?account_id=${a.account_id}">Link Gmail</a></td></tr>`
+  ).join('') || '<tr><td colspan=5 style="color:#8b94a7">None yet.</td></tr>';
+}
+async function add(){
+  const body = {name:document.getElementById('n').value,
+                phone:document.getElementById('p').value,
+                pin:document.getElementById('k').value};
+  const r = await fetch('/accounts',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const m = document.getElementById('msg');
+  if(r.ok){ m.textContent='Created. Now click Link Gmail on their row.';
+            document.getElementById('n').value='';
+            document.getElementById('p').value=''; load(); }
+  else { m.textContent='Failed — that phone number may already exist.'; }
+}
+load();
+</script></body></html>"""
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin(key: str = ""):
+    if key != ADMIN_PASSWORD:
+        return HTMLResponse(
+            "<body style='font-family:sans-serif;padding:40px'>"
+            "<h3>Add ?key=YOUR_ADMIN_PASSWORD to the URL.</h3></body>",
+            status_code=401)
+    return HTMLResponse(ADMIN_HTML)
