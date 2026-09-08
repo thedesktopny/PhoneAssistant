@@ -66,22 +66,40 @@ class Assistant(Agent):
 
         super().__init__(instructions=f"""
 You are a phone assistant for {account.get('name', 'the caller')}.
-You speak out loud, so keep every answer short and natural — one or two
-sentences. Never read out URLs, long headers, or raw email addresses unless
-asked.
 
-Before doing ANYTHING with email, the caller must give their PIN. Ask for it
-once at the start and call verify_pin. If it fails, ask again; after three
-failures, politely end.
+HOW YOU TALK
+- You are on a phone call. Keep every reply to one or two short sentences.
+- NEVER go silent. Every single turn you take must end with either a question
+  or a clear statement of what you are doing next. If you have just told the
+  caller something, immediately ask what they want to do about it.
+- Never trail off after a tool result. Say the result, then ask the next
+  question in the same breath.
+- Before any lookup, say something brief like "one second" so the line is
+  never quiet.
+- Do not read out URLs, long headers, or raw email addresses unless asked.
 
-When reading unread email, summarise: how many are unread, then who each is
-from and what it's about. Do not read the whole message unless asked.
+PIN
+Ask for the PIN once at the start and call verify_pin. If it fails, ask again.
+After three failures, apologise and say goodbye.
 
-Before sending any email, read the recipient, subject and message back to the
-caller and wait for them to say yes.
+SENDING EMAIL — follow this exactly
+1. Collect recipient, subject and message.
+2. If the caller names a person instead of an address, call find_contact and
+   confirm which address they mean out loud.
+3. Read the whole thing back, then ALWAYS finish by asking, in the same turn:
+   "Should I send it?" You must ask this out loud. Never read the draft back
+   and then stop talking.
+4. Only call send_email after the caller clearly says yes.
+5. After sending, say it's sent and ask if there's anything else.
 
-If a lookup takes a moment, say something like "one second" so the caller
-knows you're working.
+FINDING EMAIL
+- check_email is for unread mail only.
+- To find anything else — a person, an old thread, a topic, an attachment —
+  use search_email. It searches the whole mailbox with Gmail search syntax,
+  e.g. "from:chaim", "invoice", "from:amazon after:2026/08/01".
+- If a search returns nothing, do not just say you found nothing. Try a
+  different, broader wording once, and tell the caller what you tried.
+- To get somebody's address, use find_contact with their name.
 """.strip())
 
     @function_tool
@@ -138,9 +156,54 @@ knows you're working.
         return f"From {data.get('from')}. Subject {data.get('subject')}. {body}"
 
     @function_tool
+    async def search_email(self, context: RunContext, query: str,
+                           how_many: int = 5):
+        """Search the whole mailbox using Gmail search syntax. Use this for
+        anything that isn't the unread list — a person, a topic, an old
+        thread. Examples: 'from:chaim', 'invoice', 'from:amazon'."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            data = await backend_get("/test/search",
+                                     account_id=self.account_id,
+                                     q=query, limit=how_many)
+        except Exception as e:
+            log.error(f"search failed: {e}")
+            return "The search didn't go through."
+
+        msgs = data.get("messages", [])
+        if not msgs:
+            return (f"Nothing matched '{query}'. Tell the caller what you "
+                    f"searched and try a broader wording once.")
+        self.last_list = msgs
+        lines = [f"{len(msgs)} found."]
+        for i, m in enumerate(msgs, 1):
+            sender = m.get("from", "").split("<")[0].strip().strip('"')
+            lines.append(f"{i}. From {sender}: {m.get('subject')}")
+        return "\n".join(lines)
+
+    @function_tool
+    async def find_contact(self, context: RunContext, name: str):
+        """Look up someone's email address from past correspondence."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            data = await backend_get("/test/contact",
+                                     account_id=self.account_id, name=name)
+        except Exception as e:
+            log.error(f"contact failed: {e}")
+            return "The lookup didn't go through."
+        matches = data.get("matches", [])
+        if not matches:
+            return f"No address found for {name}. Ask the caller to spell it."
+        return "; ".join(f"{m['name'] or m['email']} at {m['email']}"
+                         for m in matches)
+
+    @function_tool
     async def send_email(self, context: RunContext,
                          to: str, subject: str, body: str):
-        """Send an email. Only call after the caller has confirmed out loud."""
+        """Send an email. Only call AFTER you have read the draft back out loud
+        and the caller has clearly said yes."""
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
         try:

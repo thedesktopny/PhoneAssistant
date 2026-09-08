@@ -197,6 +197,61 @@ def tool_send_email(account_id: int, to: str, subject: str, body: str) -> dict:
         userId="me", body={"raw": raw}).execute()
     return {"sent": True, "id": sent.get("id")}
 
+
+def tool_search_email(account_id: int, query: str, limit: int = 5) -> dict:
+    """Search the whole mailbox, not just unread."""
+    svc = gmail_client(account_id)
+    res = svc.users().messages().list(
+        userId="me", q=query, maxResults=limit).execute()
+    items = []
+    for m in res.get("messages", []):
+        d = svc.users().messages().get(
+            userId="me", id=m["id"], format="metadata",
+            metadataHeaders=["From", "To", "Subject", "Date"]).execute()
+        h = {x["name"]: x["value"] for x in d["payload"].get("headers", [])}
+        items.append({
+            "id": m["id"],
+            "from": h.get("From", ""),
+            "to": h.get("To", ""),
+            "subject": h.get("Subject", "(no subject)"),
+            "date": h.get("Date", ""),
+            "snippet": d.get("snippet", "")[:200],
+        })
+    return {"found": len(items), "messages": items}
+
+
+def tool_find_contact(account_id: int, name: str) -> dict:
+    """Find someone's email address from past messages, by name or partial."""
+    svc = gmail_client(account_id)
+    seen = {}
+    for q in (f"from:{name}", f"to:{name}", name):
+        try:
+            res = svc.users().messages().list(
+                userId="me", q=q, maxResults=10).execute()
+        except Exception:
+            continue
+        for m in res.get("messages", []):
+            d = svc.users().messages().get(
+                userId="me", id=m["id"], format="metadata",
+                metadataHeaders=["From", "To"]).execute()
+            h = {x["name"]: x["value"] for x in d["payload"].get("headers", [])}
+            for field in ("From", "To"):
+                for chunk in (h.get(field, "") or "").split(","):
+                    chunk = chunk.strip()
+                    if "@" not in chunk:
+                        continue
+                    if "<" in chunk:
+                        label = chunk.split("<")[0].strip().strip('"')
+                        addr = chunk.split("<")[1].rstrip(">").strip()
+                    else:
+                        label, addr = "", chunk
+                    if name.lower() in (label + " " + addr).lower():
+                        seen[addr.lower()] = label or addr
+        if seen:
+            break
+    return {"matches": [{"name": v, "email": k} for k, v in seen.items()][:5]}
+
+
 # ----------------------------------------------------------------- api
 
 app = FastAPI(title="Phone Assistant")
@@ -307,6 +362,16 @@ def test_read(account_id: int, msg_id: str):
     return tool_read_email(account_id, msg_id)
 
 
+@app.get("/test/search")
+def test_search(account_id: int, q: str, limit: int = 5):
+    return tool_search_email(account_id, q, limit)
+
+
+@app.get("/test/contact")
+def test_contact(account_id: int, name: str):
+    return tool_find_contact(account_id, name)
+
+
 class SendBody(BaseModel):
     account_id: int
     to: str
@@ -377,8 +442,16 @@ async function load(){
      <td>${a.gmail ? '<span class=ok>'+a.gmail+'</span>'
                    : '<span class=no>not linked</span>'}</td>
      <td><a class="btn" target="_blank"
-        href="/link/start?account_id=${a.account_id}">Link Gmail</a></td></tr>`
+        href="/link/start?account_id=${a.account_id}">Link Gmail</a>
+      <button class="sec" style="margin:0 0 0 6px;padding:6px 12px"
+        onclick="copyLink(${a.account_id})">Copy link</button></td></tr>`
   ).join('') || '<tr><td colspan=5 style="color:#8b94a7">None yet.</td></tr>';
+}
+function copyLink(id){
+  const url = location.origin + '/link/start?account_id=' + id;
+  navigator.clipboard.writeText(url);
+  document.getElementById('msg').textContent =
+    'Link copied — text it to the customer: ' + url;
 }
 async function add(){
   const body = {name:document.getElementById('n').value,
