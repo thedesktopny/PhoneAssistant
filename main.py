@@ -885,6 +885,12 @@ def _run_signin(sid: int, account_id: int, email: str):
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             page.set_default_timeout(45000)
 
+            db = Session()
+            before_ids = {c.id for c in db.query(Connection)
+                          .filter_by(account_id=account_id,
+                                     provider="google").all()}
+            db.close()
+
             _ob_set(sid, "signing_in", "Opening Google.")
             page.goto(f"{PUBLIC_URL}/link/start?account_id={account_id}",
                       wait_until="domcontentloaded", timeout=60000)
@@ -1000,15 +1006,24 @@ def _run_signin(sid: int, account_id: int, email: str):
                         pass
 
             db = Session()
-            linked = (db.query(Connection)
-                        .filter_by(account_id=account_id, provider="google")
-                        .order_by(Connection.id.desc()).first())
+            rows = (db.query(Connection)
+                      .filter_by(account_id=account_id, provider="google")
+                      .all())
+            want = (email or "").strip().lower()
+            match = next((c for c in rows
+                          if (c.email or "").lower() == want), None)
+            fresh = [c for c in rows if c.id not in before_ids]
             db.close()
             final = where(page)
             browser.close()
 
-            if linked:
-                _ob_set(sid, "done", f"Connected {linked.email or email}.")
+            if match:
+                _ob_set(sid, "done", f"Connected {match.email}.")
+            elif fresh:
+                _ob_set(sid, "failed",
+                        f"Signed in as {fresh[0].email}, not {email}. "
+                        f"Google was already signed into another account. "
+                        f"Try again.")
             else:
                 _ob_set(sid, "failed", "Consent not completed. " + final)
     except Exception as e:
