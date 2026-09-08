@@ -18,6 +18,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 
+import urllib.request
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import RedirectResponse, HTMLResponse
 from pydantic import BaseModel
@@ -39,6 +40,8 @@ GOOGLE_CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"]
 GOOGLE_CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"]
 PUBLIC_URL = os.environ["PUBLIC_URL"].rstrip("/")   # e.g. https://xxx.up.railway.app
 ENCRYPTION_KEY = os.environ["ENCRYPTION_KEY"]       # Fernet key, see setup notes
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
+SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
@@ -365,6 +368,115 @@ def tool_find_free(account_id: int, date_iso: str,
     return {"date": day.strftime("%A %B %-d"), "free": slots[:8]}
 
 
+
+BLOCKED_TERMS = {
+    "sex", "sexual", "sexy", "porn", "pornography", "nude", "nudity", "naked",
+    "erotic", "explicit", "intimacy", "intimate", "arousal", "arousing",
+    "adultery", "affair", "underwear", "lingerie", "bikini", "puberty",
+    "fertility", "dating", "tinder", "hookup", "romance", "romantic",
+    "marriage counseling", "relationship advice",
+    "idolatry", "idol worship", "halacha", "halachot", "jewish law",
+    "gossip", "celebrity", "gossip column",
+    "addiction", "drugs", "rehab",
+    "joke", "jokes", "humor", "funny",
+    "news", "headlines", "sports", "score", "game", "movie", "movies",
+    "netflix", "tv show", "music video", "entertainment",
+}
+
+
+def is_blocked(text: str) -> bool:
+    t = " " + (text or "").lower().replace("-", " ") + " "
+    for term in BLOCKED_TERMS:
+        if f" {term} " in t or t.strip() == term:
+            return True
+    return False
+
+
+def _search_serper(q: str) -> dict:
+    payload = json.dumps({"q": q, "num": 5}).encode()
+    req = urllib.request.Request(
+        "https://google.serper.dev/search", data=payload,
+        headers={"X-API-KEY": SERPER_API_KEY,
+                 "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        d = json.loads(r.read().decode())
+
+    answer = ""
+    if d.get("answerBox"):
+        ab = d["answerBox"]
+        answer = ab.get("answer") or ab.get("snippet") or ""
+    elif d.get("knowledgeGraph"):
+        kg = d["knowledgeGraph"]
+        bits = [kg.get("title", ""), kg.get("description", "")]
+        for k in ("address", "phone", "hours", "website"):
+            if kg.get(k):
+                bits.append(f"{k}: {kg[k]}")
+        answer = ". ".join(b for b in bits if b)
+
+    results = [{"title": x.get("title", ""),
+                "snippet": (x.get("snippet") or "")[:300],
+                "url": x.get("link", "")}
+               for x in d.get("organic", [])[:4]]
+
+    for p in d.get("places", [])[:3]:
+        results.append({
+            "title": p.get("title", ""),
+            "snippet": " ".join(filter(None, [
+                p.get("address", ""),
+                f"phone {p['phoneNumber']}" if p.get("phoneNumber") else "",
+            ]))[:300],
+            "url": "",
+        })
+
+    return {"answer": answer[:800], "results": results}
+
+
+def _search_tavily(q: str) -> dict:
+    payload = json.dumps({
+        "api_key": TAVILY_API_KEY, "query": q,
+        "search_depth": "basic", "include_answer": True, "max_results": 4,
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.tavily.com/search", data=payload,
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        d = json.loads(r.read().decode())
+    return {
+        "answer": (d.get("answer") or "")[:800],
+        "results": [{"title": x.get("title", ""),
+                     "snippet": (x.get("content") or "")[:300],
+                     "url": x.get("url", "")}
+                    for x in d.get("results", [])[:4]],
+    }
+
+
+def tool_web_search(query: str, near: str = "") -> dict:
+    """Google-backed web search with a content filter."""
+    if is_blocked(query):
+        return {"blocked": True,
+                "answer": "I am not allowed to talk to you about this.",
+                "results": []}
+
+    q = f"{query} near {near}" if near else query
+    try:
+        if SERPER_API_KEY:
+            out = _search_serper(q)
+        elif TAVILY_API_KEY:
+            out = _search_tavily(q)
+        else:
+            return {"answer": "Web search isn't configured.", "results": []}
+    except Exception as e:
+        return {"answer": f"Search failed: {e}", "results": []}
+
+    combined = out.get("answer", "") + " " + " ".join(
+        r.get("snippet", "") for r in out.get("results", []))
+    if is_blocked(combined):
+        return {"blocked": True,
+                "answer": "I am not allowed to talk to you about this.",
+                "results": []}
+    return out
+
+
 # ----------------------------------------------------------------- api
 
 app = FastAPI(title="Phone Assistant")
@@ -483,6 +595,11 @@ def test_search(account_id: int, q: str, limit: int = 5):
 @app.get("/test/contact")
 def test_contact(account_id: int, name: str):
     return tool_find_contact(account_id, name)
+
+
+@app.get("/web/search")
+def web_search(q: str, near: str = ""):
+    return tool_web_search(q, near)
 
 
 @app.get("/cal/events")
