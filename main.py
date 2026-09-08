@@ -984,6 +984,18 @@ async def sms_incoming(request: Request):
     frm = str(raw_from or "")
     text = urllib.parse.unquote_plus(str(raw_msg or ""))
 
+    # A delivery receipt, not a customer message: no body, has a status.
+    status = pick("Status", "DeliveryStatus", "state", "MessageStatus")
+    if status and not raw_msg:
+        db = Session()
+        db.add(Dlr(ref_id=str(pick("RefId", "MessageId", "id") or ""),
+                   to_number=str(raw_to or frm or ""),
+                   status=str(status),
+                   raw=json.dumps(body)[:3000]))
+        db.commit()
+        db.close()
+        return {"ok": True, "dlr": True}
+
     if not frm:
         return {"ok": False, "error": "no sender"}
 
