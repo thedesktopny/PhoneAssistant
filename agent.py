@@ -90,6 +90,7 @@ class Assistant(Agent):
         self.verified = False
         self.last_list = []
         self.last_events = []
+        self.onboard_sid = None
 
         today = datetime.now(ZoneInfo("America/New_York")).strftime(
             "%A, %B %-d, %Y")
@@ -154,6 +155,25 @@ CALENDAR
 - Speak times naturally: "Tuesday at two thirty", never ISO timestamps.
 - Today is {today}. Work out relative dates like "tomorrow" or "next Tuesday"
   yourself before calling a tool.
+
+CONNECTING THEIR EMAIL (only if they aren't connected yet)
+If check_email says their account has no email linked, offer to connect it
+on this call. Then:
+1. Ask for their email address. Have them spell the part before the @.
+   Read it back and get a yes.
+2. Ask for their password. Tell them to say it slowly, one character at a
+   time, and to say "capital" before any capital letter. Read the whole
+   thing back character by character and get a yes before continuing.
+3. Call connect_email. It takes up to a minute — tell them you're working
+   on it and stay on the line.
+4. Call check_connect often. If it says needs_code, Google has texted them
+   a code. Ask them to read it out, then call submit_code.
+5. When it says done, tell them their email is connected and offer to read
+   their new messages.
+6. If it fails, apologise, say you'll have someone call them back, and move
+   on. Do not ask for the password again.
+Never repeat their password back to anyone else, never say it after the
+sign-in is finished, and never put it in a text message.
 
 TEXTING
 - You can text the caller. Use send_text for an address, a phone number, a
@@ -287,6 +307,66 @@ FINDING EMAIL
             return f"No address found for {name}. Ask the caller to spell it."
         return "; ".join(f"{m['name'] or m['email']} at {m['email']}"
                          for m in matches)
+
+    @function_tool
+    async def connect_email(self, context: RunContext, email: str,
+                            password: str):
+        """Connect the caller's Gmail using the address and password they
+        just gave you. Only call after reading both back and getting a yes."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            data = await backend_post("/onboard/start", {
+                "account_id": self.account_id,
+                "email": email.strip(),
+                "password": password,
+            })
+        except Exception as e:
+            log.error(f"onboard start failed: {e}")
+            return "I couldn't start the sign-in. Tell them you'll have "\
+                   "someone call back."
+        self.onboard_sid = data.get("session_id")
+        await log_turn(self.call_id, "tool", f"signin started for {email}",
+                       "connect_email")
+        return ("Sign-in started. Tell them it takes about a minute, then "
+                "call check_connect.")
+
+    @function_tool
+    async def check_connect(self, context: RunContext):
+        """How the email sign-in is going. Call every 15 seconds or so."""
+        if not getattr(self, "onboard_sid", None):
+            return "No sign-in running."
+        try:
+            d = await backend_get("/onboard/status",
+                                  session_id=self.onboard_sid)
+        except Exception:
+            return "Couldn't check just now. Try again shortly."
+        state = d.get("state", "")
+        msg = d.get("message", "")
+        if state == "needs_code":
+            return ("Google sent them a verification code. Ask them to read "
+                    "it out, then call submit_code.")
+        if state == "done":
+            return f"Connected. {msg}"
+        if state == "failed":
+            return (f"It didn't work: {msg}. Apologise, say someone will "
+                    f"call them back, and move on.")
+        return f"Still working ({state}). Keep them company and check again."
+
+    @function_tool
+    async def submit_code(self, context: RunContext, code: str):
+        """Give Google the verification code the caller just read out."""
+        if not getattr(self, "onboard_sid", None):
+            return "No sign-in running."
+        try:
+            await backend_post("/onboard/code", {
+                "session_id": self.onboard_sid,
+                "code": "".join(ch for ch in code if ch.isdigit()),
+            })
+        except Exception as e:
+            log.error(f"code submit failed: {e}")
+            return "That code didn't go through. Ask them to read it again."
+        return "Code sent. Wait a few seconds and call check_connect."
 
     @function_tool
     async def send_text(self, context: RunContext, message: str,

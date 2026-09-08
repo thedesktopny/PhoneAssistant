@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 
 import time
+import threading
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -826,6 +827,24 @@ TEXT_TOOLS = [
             "minutes": {"type": "integer"}},
             "required": ["title", "start_iso"]}}},
     {"type": "function", "function": {
+        "name": "connect_email",
+        "description": ("Connect this person's Gmail using an address and "
+                        "password they sent. Confirm both back first."),
+        "parameters": {"type": "object", "properties": {
+            "email": {"type": "string"}, "password": {"type": "string"}},
+            "required": ["email", "password"]}}},
+    {"type": "function", "function": {
+        "name": "check_connect",
+        "description": "How the email sign-in is going.",
+        "parameters": {"type": "object", "properties": {
+            "session_id": {"type": "integer"}}, "required": ["session_id"]}}},
+    {"type": "function", "function": {
+        "name": "submit_code",
+        "description": "Give Google the verification code they sent you.",
+        "parameters": {"type": "object", "properties": {
+            "session_id": {"type": "integer"}, "code": {"type": "string"}},
+            "required": ["session_id", "code"]}}},
+    {"type": "function", "function": {
         "name": "web_search",
         "description": "Search the web — addresses, hours, phone numbers, facts.",
         "parameters": {"type": "object", "properties": {
@@ -849,7 +868,13 @@ If someone is in danger or a medical emergency, help them reach emergency
 services — that comes first.
 
 Before sending an email or booking anything, state what you're about to do
-and wait for a yes."""
+and wait for a yes.
+
+If they have no email connected yet, you can connect it. Ask for their Gmail
+address and password, read both back, then use connect_email. Poll
+check_connect. If it says needs_code, ask them for the code Google just sent
+and use submit_code. Never repeat their password back after the sign-in is
+done, and never include it in any later message."""
 
 
 def _run_text_tool(account_id: int, name: str, args: dict):
@@ -869,6 +894,34 @@ def _run_text_tool(account_id: int, name: str, args: dict):
             return tool_create_event(account_id, args["title"],
                                      args["start_iso"],
                                      args.get("minutes", 60))
+        if name == "connect_email":
+            db = Session()
+            row = Onboard(account_id=account_id, email=args["email"],
+                          state="starting")
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+            sid = row.id
+            db.close()
+            _PENDING[sid] = {"password": args["password"], "code": None}
+            threading.Thread(target=_run_signin,
+                             args=(sid, account_id, args["email"]),
+                             daemon=True).start()
+            return {"session_id": sid,
+                    "note": "Started. Tell them it takes about a minute."}
+        if name == "check_connect":
+            db = Session()
+            row = db.query(Onboard).filter_by(id=args["session_id"]).first()
+            db.close()
+            return {"state": row.state, "message": row.message} if row \
+                else {"error": "unknown session"}
+        if name == "submit_code":
+            sid = args["session_id"]
+            if sid in _PENDING:
+                _PENDING[sid]["code"] = "".join(
+                    ch for ch in args["code"] if ch.isdigit())
+                return {"ok": True}
+            return {"error": "that sign-in is no longer running"}
         if name == "web_search":
             return tool_web_search(args["query"])
     except Exception as e:
