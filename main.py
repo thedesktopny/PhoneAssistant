@@ -130,6 +130,17 @@ class Memory(Base):
     text = Column(Text)
 
 
+class Dlr(Base):
+    """Carrier delivery receipts — why a text did or didn't arrive."""
+    __tablename__ = "dlr"
+    id = Column(Integer, primary_key=True)
+    at = Column(DateTime, default=datetime.utcnow)
+    ref_id = Column(String(60), default="")
+    to_number = Column(String(20), default="")
+    status = Column(String(40), default="")
+    raw = Column(Text, default="")
+
+
 Base.metadata.create_all(engine)
 
 # ----------------------------------------------------------------- vault
@@ -896,6 +907,51 @@ def test_contact(request: Request, account_id: int, name: str):
     return tool_find_contact(account_id, name)
 
 
+@app.post("/sms/dlr")
+async def sms_dlr(request: Request):
+    """Delivery receipt webhook. Records whatever the carrier reports."""
+    try:
+        body = await request.json()
+    except Exception:
+        try:
+            form = await request.form()
+            body = dict(form)
+        except Exception:
+            body = {"raw": (await request.body()).decode("utf-8", "replace")}
+
+    def pick(*names):
+        for n in names:
+            for k, v in body.items():
+                if k.lower() == n.lower() and v:
+                    return v
+        return ""
+
+    to = pick("To", "Destination", "msisdn")
+    if isinstance(to, list):
+        to = to[0] if to else ""
+
+    db = Session()
+    db.add(Dlr(ref_id=str(pick("RefId", "MessageId", "id") or ""),
+               to_number=str(to or ""),
+               status=str(pick("Status", "DeliveryStatus", "state") or ""),
+               raw=json.dumps(body)[:3000]))
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
+@app.get("/sms/dlr")
+def dlr_list(request: Request, limit: int = 30):
+    require_auth(request)
+    db = Session()
+    rows = db.query(Dlr).order_by(Dlr.id.desc()).limit(limit).all()
+    out = [{"at": r.at.strftime("%b %-d %-I:%M:%S %p") if r.at else "",
+            "ref_id": r.ref_id, "to": r.to_number,
+            "status": r.status, "raw": r.raw} for r in rows]
+    db.close()
+    return out
+
+
 @app.post("/sms/incoming")
 async def sms_incoming(request: Request):
     """Inbound text webhook.
@@ -1279,6 +1335,15 @@ ADMIN_HTML = """<!doctype html>
 </div>
 
 <div class="card">
+  <b>Text delivery</b>
+  <button class="sec" onclick="loadDlr()">Refresh</button>
+  <table><thead><tr><th>When</th><th>To</th><th>Status</th>
+  <th>Detail</th></tr></thead>
+  <tbody id="dlr"><tr><td colspan="4" style="color:#8b94a7">
+  Nothing yet.</td></tr></tbody></table>
+</div>
+
+<div class="card">
   <b>Add a customer</b>
   <label>Name</label><input id="n" placeholder="Chaim Weiss">
   <label>Their phone number (the one they'll call from)</label>
@@ -1421,8 +1486,24 @@ async function add(){
 
 document.getElementById('clock').textContent =
   'Updated ' + new Date().toLocaleTimeString();
-load(); loadCalls(); loadStats();
-setInterval(function(){ loadCalls(); loadStats(); }, 20000);
+async function loadDlr(){
+  const tb = document.getElementById('dlr');
+  try{
+    const d = await (await fetch('/sms/dlr?limit=20')).json();
+    if(!d.length){ tb.innerHTML='<tr><td colspan="4" style="color:#8b94a7">'+
+      'No delivery receipts yet.</td></tr>'; return; }
+    tb.innerHTML = d.map(function(x){
+      var good = /deliver|success|ok/i.test(x.status||'');
+      return '<tr><td>'+esc(x.at)+'</td><td>'+esc(x.to)+'</td>'+
+        '<td class="'+(good?'ok':'no')+'">'+esc(x.status||'?')+'</td>'+
+        '<td style="font-size:12px;color:#8b94a7">'+esc((x.raw||'').slice(0,180))+
+        '</td></tr>';
+    }).join('');
+  }catch(e){ tb.innerHTML='<tr><td colspan="4" class="no">'+esc(e.message)+
+    '</td></tr>'; }
+}
+load(); loadCalls(); loadStats(); loadDlr();
+setInterval(function(){ loadCalls(); loadStats(); loadDlr(); }, 20000);
 </script></body></html>"""
 
 
