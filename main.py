@@ -752,7 +752,8 @@ def _ob_set(sid: int, state: str, message: str = ""):
 
 
 def _run_signin(sid: int, account_id: int, email: str):
-    """Drive a hosted browser through Google sign-in and consent."""
+    """Drive a hosted browser through Google sign-in, any 2FA, and consent."""
+    import re as _re
     from playwright.sync_api import sync_playwright
 
     creds = _PENDING.get(sid) or {}
@@ -769,14 +770,110 @@ def _run_signin(sid: int, account_id: int, email: str):
     PW_SEL = ('input[type="password"], input[name="Passwd"], '
               'input[name="password"]')
     CODE_SEL = ('input[type="tel"], input[name="totpPin"], input#idvPin, '
-                'input[name="Pin"], input[autocomplete="one-time-code"]')
+                'input[name="Pin"], input[name="code"], '
+                'input[autocomplete="one-time-code"], '
+                'input[aria-label*="code" i]')
+
+    def screen(page):
+        try:
+            return (page.inner_text("body") or "").replace("\n", " ")
+        except Exception:
+            return ""
 
     def where(page):
+        return f"url={page.url[:110]} | screen: {screen(page)[:260]}"
+
+    def wants_tap(page):
+        return page.query_selector(
+            'text=/Check your device|Tap Yes on the notification|'
+            'Open the Gmail app|notification to your/i')
+
+    def tap_number(page):
+        body = screen(page)
+        m = (_re.search(r"\b(\d{2})\b\s*Check your device", body)
+             or _re.search(r"Check your device.{0,120}?\b(\d{2})\b", body)
+             or _re.search(r"tap\s+(\d{2})\b", body, _re.I))
+        return m.group(1) if m else ""
+
+    def describe_code_screen(page):
+        """Say where the code went, so the caller knows what to look for."""
+        body = screen(page)
+        m = _re.search(r"\(?\s*[•\*\u2022]{0,3}\s*(\d{2,4})\s*\)?\s*$", "")
+        if _re.search(r"authenticator|Google Authenticator", body, _re.I):
+            return ("Google wants the 6-digit code from their authenticator "
+                    "app. Ask them to open it and read the current code.")
+        if _re.search(r"backup code|recovery code", body, _re.I):
+            return "Google wants one of their backup codes."
+        if _re.search(r"security key|USB|tap your key", body, _re.I):
+            return ("Google wants a physical security key, which we can't do. "
+                    "Offer try_another_way.")
+        tail = _re.search(r"(?:ending in|\u2022{2,}\s*)(\d{2,4})", body)
+        if _re.search(r"call|voice", body, _re.I) and _re.search(
+                r"code", body, _re.I):
+            return ("Google is calling their phone with a spoken code. Ask "
+                    "them to answer and read it out.")
+        if tail:
+            return (f"Google texted a code to the number ending {tail.group(1)}."
+                    f" Ask them to read it out.")
+        return "Google sent a code. Ask them to read it out."
+
+    def pick_another_method(page):
+        """Open 'Try another way' and choose a text/call option if offered."""
         try:
-            body = (page.inner_text("body") or "")[:300].replace("\n", " ")
-            return f"url={page.url[:120]} | screen: {body}"
+            alt = (page.query_selector('text=/Try another way/i')
+                   or page.query_selector('text=/More ways to verify/i')
+                   or page.query_selector('text=/Try another method/i'))
+            if not alt:
+                return False
+            alt.click()
+            page.wait_for_timeout(3500)
+            for sel in ('text=/Get a verification code at/i',
+                        'text=/Text message/i',
+                        'text=/Send code/i',
+                        'text=/Get a code|verification code/i',
+                        'text=/Phone call/i'):
+                opt = page.query_selector(sel)
+                if opt:
+                    opt.click()
+                    page.wait_for_timeout(4000)
+                    return True
+            return True          # menu is open; caller can be told options
         except Exception:
-            return f"url={page.url[:120]}"
+            return False
+
+    def wait_for_code(page, sid, note):
+        """Sit on a code screen until the caller supplies one."""
+        _ob_set(sid, "needs_code", note)
+        waited = 0
+        while waited < 240:
+            time.sleep(3)
+            waited += 3
+            st = _PENDING.get(sid) or {}
+            if st.get("other_way"):
+                _PENDING[sid]["other_way"] = False
+                if pick_another_method(page):
+                    page.wait_for_timeout(2000)
+                    if wants_tap(page):
+                        return "tap"
+                    _ob_set(sid, "needs_code", describe_code_screen(page))
+                continue
+            code = st.get("code")
+            if code:
+                _PENDING[sid]["code"] = None
+                try:
+                    page.fill(CODE_SEL, code, timeout=10000)
+                    page.keyboard.press("Enter")
+                    page.wait_for_timeout(6000)
+                except Exception:
+                    pass
+                if page.query_selector(
+                        'text=/Wrong code|incorrect code|try again/i'):
+                    _ob_set(sid, "needs_code",
+                            "That code didn't work. Ask them to read it "
+                            "again, or call try_another_way.")
+                    continue
+                return "ok"
+        return "timeout"
 
     page = None
     browser = None
@@ -793,7 +890,6 @@ def _run_signin(sid: int, account_id: int, email: str):
                       wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(4000)
 
-            # Google sometimes shows an account chooser first
             try:
                 other = page.query_selector('text=/Use another account/i')
                 if other:
@@ -805,8 +901,7 @@ def _run_signin(sid: int, account_id: int, email: str):
             try:
                 page.wait_for_selector(EMAIL_SEL, timeout=30000)
             except Exception:
-                _ob_set(sid, "failed",
-                        "No email box. " + where(page))
+                _ob_set(sid, "failed", "No email box. " + where(page))
                 browser.close()
                 return
 
@@ -827,42 +922,63 @@ def _run_signin(sid: int, account_id: int, email: str):
 
             if page.query_selector('text=/Wrong password/i'):
                 _ob_set(sid, "failed",
-                        "Google says the password is wrong. " + where(page))
+                        "Google says the password is wrong. Ask them to say "
+                        "it again slowly, or have someone call them back.")
                 browser.close()
                 return
 
-            blocked = page.query_selector(
-                'text=/couldn.t sign you in|browser or app may not be secure|'
-                'verify it.s you|suspicious|unusual activity/i')
-            if blocked:
+            if page.query_selector(
+                    'text=/couldn.t sign you in|browser or app may not be '
+                    'secure|unusual activity/i'):
                 _ob_set(sid, "failed",
                         "Google blocked the automated sign-in. " + where(page))
                 browser.close()
                 return
 
-            if page.query_selector(CODE_SEL):
-                _ob_set(sid, "needs_code",
-                        "Google sent a code. Ask them to read it out.")
-                waited = 0
-                got = False
-                while waited < 180:
-                    time.sleep(3)
-                    waited += 3
-                    code = (_PENDING.get(sid) or {}).get("code")
-                    if code:
-                        _PENDING[sid]["code"] = None
-                        try:
-                            page.fill(CODE_SEL, code, timeout=10000)
-                            page.keyboard.press("Enter")
-                            page.wait_for_timeout(6000)
-                            got = True
-                        except Exception:
-                            pass
-                        break
-                if not got:
-                    _ob_set(sid, "failed", "Timed out waiting for the code.")
-                    browser.close()
-                    return
+            # ---- verification, whichever form it takes, possibly twice
+            for _round in range(3):
+                if "/link/callback" in page.url:
+                    break
+                if wants_tap(page):
+                    num = tap_number(page)
+                    _ob_set(sid, "needs_tap",
+                            (f"Google sent a prompt to their phone. They tap "
+                             f"Yes and choose {num}." if num else
+                             "Google sent a prompt to their phone. They tap "
+                             "Yes on the notification."))
+                    waited = 0
+                    switched = False
+                    while waited < 200:
+                        time.sleep(4)
+                        waited += 4
+                        if (_PENDING.get(sid) or {}).get("other_way"):
+                            _PENDING[sid]["other_way"] = False
+                            if pick_another_method(page):
+                                switched = True
+                                break
+                        if not wants_tap(page):
+                            break
+                    if switched:
+                        continue
+                    if wants_tap(page):
+                        _ob_set(sid, "failed",
+                                "They never approved the prompt.")
+                        browser.close()
+                        return
+                    page.wait_for_timeout(3000)
+                    continue
+
+                if page.query_selector(CODE_SEL):
+                    res = wait_for_code(page, sid, describe_code_screen(page))
+                    if res == "timeout":
+                        _ob_set(sid, "failed", "Timed out waiting for a code.")
+                        browser.close()
+                        return
+                    if res == "tap":
+                        continue
+                    page.wait_for_timeout(2000)
+                    continue
+                break
 
             _ob_set(sid, "consenting", "Approving access.")
             for _ in range(8):
@@ -910,7 +1026,6 @@ def _run_signin(sid: int, account_id: int, email: str):
             pass
     finally:
         _PENDING.pop(sid, None)      # password gone from memory
-
 
 
 def revoke_google(blob: str) -> bool:
@@ -1174,7 +1289,8 @@ def _run_text_tool(account_id: int, name: str, args: dict):
             db.refresh(row)
             sid = row.id
             db.close()
-            _PENDING[sid] = {"password": args["password"], "code": None}
+            _PENDING[sid] = {"password": args["password"],
+                             "code": None, "other_way": False}
             threading.Thread(target=_run_signin,
                              args=(sid, account_id, args["email"]),
                              daemon=True).start()
@@ -2277,9 +2393,20 @@ def onboard_start(b: OnboardStart, request: Request,
     sid = row.id
     db.close()
 
-    _PENDING[sid] = {"password": b.password, "code": None}
+    _PENDING[sid] = {"password": b.password, "code": None,
+                     "other_way": False}
     background.add_task(_run_signin, sid, b.account_id, b.email)
     return {"session_id": sid, "state": "starting"}
+
+
+@app.post("/onboard/another-way")
+def onboard_another_way(request: Request, session_id: int):
+    """Caller can't tap the phone prompt — ask Google for a texted code."""
+    require_auth(request)
+    if session_id in _PENDING:
+        _PENDING[session_id]["other_way"] = True
+        return {"ok": True}
+    raise HTTPException(400, "That sign-in is no longer running.")
 
 
 class OnboardCode(BaseModel):

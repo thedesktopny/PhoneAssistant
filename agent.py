@@ -195,8 +195,21 @@ on this call. Then:
    thing back character by character and get a yes before continuing.
 3. Call connect_email. It takes up to a minute — tell them you're working
    on it and stay on the line.
-4. Call check_connect often. If it says needs_code, Google has texted them
-   a code. Ask them to read it out, then call submit_code.
+4. Call check_connect every 15 seconds or so. Google will ask them to prove
+   it's them. It picks the method, and there are several — just do what
+   check_connect tells you:
+   - needs_tap: a notification went to their phone. Tell them to unlock it,
+     tap Yes, and choose the number you give them.
+   - needs_code: read out whatever check_connect says — it will tell you
+     whether the code came by text, by phone call, or is in their
+     authenticator app — then ask for the code and call submit_code.
+   Whenever they can't do the method Google chose — no smartphone, phone in
+   another room, no authenticator app, didn't get the text — call
+   try_another_way. Google will offer a different method and check_connect
+   will tell you the new one. You can do this more than once.
+   Google sometimes asks twice. That's normal; keep going.
+   If a code doesn't work, ask them to read it again rather than assuming
+   you misheard.
 5. When it says done, tell them their email is connected and offer to read
    their new messages.
 6. If it fails, apologise, say you'll have someone call them back, and move
@@ -499,6 +512,9 @@ FINDING EMAIL
             return "Couldn't check just now. Try again shortly."
         state = d.get("state", "")
         msg = d.get("message", "")
+        if state == "needs_tap":
+            return msg + (" Keep checking. If they can't do it, "
+                          "call try_another_way.")
         if state == "needs_code":
             return ("Google sent them a verification code. Ask them to read "
                     "it out, then call submit_code.")
@@ -508,6 +524,22 @@ FINDING EMAIL
             return (f"It didn't work: {msg}. Apologise, say someone will "
                     f"call them back, and move on.")
         return f"Still working ({state}). Keep them company and check again."
+
+    @function_tool
+    async def try_another_way(self, context: RunContext):
+        """If the caller can't tap the notification on their phone, ask
+        Google to text them a code instead."""
+        if not getattr(self, "onboard_sid", None):
+            return "No sign-in running."
+        try:
+            async with httpx.AsyncClient(timeout=20) as c:
+                await c.post(f"{BACKEND}/onboard/another-way", headers=AUTH,
+                             params={"session_id": self.onboard_sid})
+        except Exception as e:
+            log.error(f"another way failed: {e}")
+            return "Couldn't switch methods."
+        return ("Asked Google to text a code instead. Wait about ten seconds, "
+                "then check_connect again.")
 
     @function_tool
     async def submit_code(self, context: RunContext, code: str):
