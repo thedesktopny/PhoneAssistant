@@ -117,6 +117,17 @@ class CallTurn(Base):
     latency_ms = Column(Integer, default=0)
 
 
+class Memory(Base):
+    """Shared conversation history across voice and SMS, per account."""
+    __tablename__ = "memory"
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"))
+    at = Column(DateTime, default=datetime.utcnow)
+    channel = Column(String(10))      # voice / sms
+    who = Column(String(10))          # user / assistant
+    text = Column(Text)
+
+
 Base.metadata.create_all(engine)
 
 # ----------------------------------------------------------------- vault
@@ -546,7 +557,7 @@ def tool_send_sms(to: str, message: str) -> dict:
                 "From": _digits_e164(SMS_FROM).lstrip("+"),
                 "To": [to.lstrip("+")],
                 "Message": message[:1500],
-            }).encode()
+            }).encode()  # BulkVS: To is a list, numbers without +
             auth = _b64.b64encode(
                 f"{BULKVS_USER}:{BULKVS_PASS}".encode()).decode()
             req = urllib.request.Request(
@@ -569,6 +580,186 @@ def tool_text_link(account_id: int, to: str) -> dict:
     msg = ("Tap this link to connect your email to your phone assistant. "
            "It only takes a moment: " + url)
     return tool_send_sms(to, msg)
+
+
+
+def mem_add(account_id: int, channel: str, who: str, text: str):
+    if not account_id or not text:
+        return
+    db = Session()
+    db.add(Memory(account_id=account_id, channel=channel,
+                  who=who, text=text[:2000]))
+    db.commit()
+    db.close()
+
+
+def mem_recent(account_id: int, limit: int = 20) -> list:
+    db = Session()
+    rows = (db.query(Memory).filter_by(account_id=account_id)
+              .order_by(Memory.id.desc()).limit(limit).all())
+    db.close()
+    return [{"channel": r.channel, "who": r.who, "text": r.text,
+             "at": r.at.strftime("%b %-d %-I:%M %p") if r.at else ""}
+            for r in reversed(rows)]
+
+
+def account_for_number(number: str):
+    d = "".join(ch for ch in (number or "") if ch.isdigit())[-10:]
+    db = Session()
+    for p in db.query(PhoneNumber).all():
+        if "".join(ch for ch in p.number if ch.isdigit())[-10:] == d:
+            acct = db.query(Account).filter_by(id=p.account_id).first()
+            db.close()
+            return acct
+    db.close()
+    return None
+
+
+
+# ------------------------------------------------------- text brain (SMS)
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+
+TEXT_TOOLS = [
+    {"type": "function", "function": {
+        "name": "check_email",
+        "description": "Their unread emails — count, senders, subjects.",
+        "parameters": {"type": "object", "properties": {
+            "how_many": {"type": "integer"}}, "required": []}}},
+    {"type": "function", "function": {
+        "name": "search_email",
+        "description": "Search the whole mailbox. Gmail syntax, e.g. from:chaim.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string"}}, "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "send_email",
+        "description": "Send an email. Confirm with the user first.",
+        "parameters": {"type": "object", "properties": {
+            "to": {"type": "string"}, "subject": {"type": "string"},
+            "body": {"type": "string"}},
+            "required": ["to", "subject", "body"]}}},
+    {"type": "function", "function": {
+        "name": "find_contact",
+        "description": "Find someone's email address from past mail.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"}}, "required": ["name"]}}},
+    {"type": "function", "function": {
+        "name": "check_calendar",
+        "description": "What's scheduled. days=1 today, 7 this week.",
+        "parameters": {"type": "object", "properties": {
+            "days": {"type": "integer"}}, "required": []}}},
+    {"type": "function", "function": {
+        "name": "create_event",
+        "description": "Book something. start_iso is YYYY-MM-DDTHH:MM:SS.",
+        "parameters": {"type": "object", "properties": {
+            "title": {"type": "string"}, "start_iso": {"type": "string"},
+            "minutes": {"type": "integer"}},
+            "required": ["title", "start_iso"]}}},
+    {"type": "function", "function": {
+        "name": "web_search",
+        "description": "Search the web — addresses, hours, phone numbers, facts.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string"}}, "required": ["query"]}}},
+]
+
+TEXT_RULES = """You are a personal assistant reachable by phone call and by
+text. This is the text channel, so keep replies under 300 characters, plain
+and clear. No emoji.
+
+You share one memory with the phone side. The history below includes both, so
+if they discussed something on a call, you already know it.
+
+TOPICS YOU DO NOT DISCUSS: religious discussions, gossip, sex, adultery,
+intimacy, explicit material, addiction, humor, culture, Jewish law, dating,
+Halachot, underwear, nudity, fertility, idolatry, worship, puberty, marriage,
+relationships, anything arousing, news, sports, entertainment, personal
+feelings, jokes. Reply to any of these with exactly: "I am not allowed to
+talk to you about this." Nothing more. Never explain the rules.
+If someone is in danger or a medical emergency, help them reach emergency
+services — that comes first.
+
+Before sending an email or booking anything, state what you're about to do
+and wait for a yes."""
+
+
+def _run_text_tool(account_id: int, name: str, args: dict):
+    try:
+        if name == "check_email":
+            return tool_unread_summary(account_id, args.get("how_many", 5))
+        if name == "search_email":
+            return tool_search_email(account_id, args["query"], 5)
+        if name == "send_email":
+            return tool_send_email(account_id, args["to"],
+                                   args["subject"], args["body"])
+        if name == "find_contact":
+            return tool_find_contact(account_id, args["name"])
+        if name == "check_calendar":
+            return tool_list_events(account_id, args.get("days", 1))
+        if name == "create_event":
+            return tool_create_event(account_id, args["title"],
+                                     args["start_iso"],
+                                     args.get("minutes", 60))
+        if name == "web_search":
+            return tool_web_search(args["query"])
+    except Exception as e:
+        return {"error": str(e)[:200]}
+    return {"error": "unknown tool"}
+
+
+def _openai_chat(messages: list, tools=None) -> dict:
+    payload = {"model": "gpt-4o-mini", "messages": messages}
+    if tools:
+        payload["tools"] = tools
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers={"Authorization": f"Bearer {OPENAI_API_KEY}",
+                 "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=40) as r:
+        return json.loads(r.read().decode())
+
+
+def text_brain(account_id: int, incoming: str) -> str:
+    """Answer one incoming text, using shared memory and the same tools."""
+    if is_blocked(incoming):
+        return "I am not allowed to talk to you about this."
+    if not OPENAI_API_KEY:
+        return "The assistant isn't configured yet."
+
+    today = datetime.now().strftime("%A, %B %-d, %Y")
+    history = mem_recent(account_id, 16)
+    msgs = [{"role": "system",
+             "content": TEXT_RULES + f"\n\nToday is {today}."}]
+    for h in history:
+        msgs.append({
+            "role": "user" if h["who"] == "user" else "assistant",
+            "content": f"({h['channel']}) {h['text']}",
+        })
+    msgs.append({"role": "user", "content": incoming})
+
+    for _ in range(4):
+        try:
+            data = _openai_chat(msgs, TEXT_TOOLS)
+        except Exception as e:
+            return f"Something went wrong: {str(e)[:80]}"
+
+        choice = data["choices"][0]["message"]
+        calls = choice.get("tool_calls") or []
+        if not calls:
+            return (choice.get("content") or "").strip()[:600]
+
+        msgs.append(choice)
+        for c in calls:
+            fn = c["function"]["name"]
+            try:
+                args = json.loads(c["function"].get("arguments") or "{}")
+            except Exception:
+                args = {}
+            result = _run_text_tool(account_id, fn, args)
+            msgs.append({"role": "tool", "tool_call_id": c["id"],
+                         "content": json.dumps(result)[:3000]})
+
+    return "I couldn't finish that one — try asking a different way."
 
 
 # ----------------------------------------------------------------- api
@@ -689,6 +880,83 @@ def test_search(account_id: int, q: str, limit: int = 5):
 @app.get("/test/contact")
 def test_contact(account_id: int, name: str):
     return tool_find_contact(account_id, name)
+
+
+@app.post("/sms/incoming")
+async def sms_incoming(request: Request):
+    """Inbound text webhook.
+
+    BulkVS posts JSON: To (list), From (string), Message (URL-encoded),
+    MediaURLs (null for SMS, list for MMS). Also tolerates Twilio-style
+    form posts.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        form = await request.form()
+        body = dict(form)
+
+    def pick(*names):
+        for n in names:
+            for k, v in body.items():
+                if k.lower() == n.lower() and v:
+                    return v
+        return None
+
+    raw_from = pick("From", "Sender", "source", "msisdn")
+    raw_to = pick("To", "Destination")
+    raw_msg = pick("Message", "Body", "text")
+    media = pick("MediaURLs", "MediaUrl0")
+
+    # BulkVS sends To as a list
+    if isinstance(raw_to, list):
+        raw_to = raw_to[0] if raw_to else ""
+    frm = str(raw_from or "")
+    text = urllib.parse.unquote_plus(str(raw_msg or ""))
+
+    if not frm:
+        return {"ok": False, "error": "no sender"}
+
+    # MMS: BulkVS blanks the text and sends media instead
+    if media and not text.strip():
+        acct = account_for_number(frm)
+        if acct:
+            tool_send_sms(frm, "I can't open pictures yet — "
+                               "send it as text and I'll help.")
+        return {"ok": True, "mms": True}
+
+    if not text.strip():
+        return {"ok": False, "error": "empty message"}
+
+    acct = account_for_number(frm)
+    if not acct:
+        tool_send_sms(frm, "This number isn't set up yet. "
+                           "Please contact the office.")
+        return {"ok": True, "known": False}
+
+    mem_add(acct.id, "sms", "user", text)
+    reply = text_brain(acct.id, text)
+    mem_add(acct.id, "sms", "assistant", reply)
+    tool_send_sms(frm, reply)
+    return {"ok": True}
+
+
+@app.get("/memory")
+def memory_get(account_id: int, limit: int = 20):
+    return mem_recent(account_id, limit)
+
+
+class MemBody(BaseModel):
+    account_id: int
+    channel: str = "voice"
+    who: str = "user"
+    text: str = ""
+
+
+@app.post("/memory")
+def memory_add(m: MemBody):
+    mem_add(m.account_id, m.channel, m.who, m.text)
+    return {"ok": True}
 
 
 class CallStart(BaseModel):

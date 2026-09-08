@@ -80,7 +80,7 @@ async def find_account(caller_number: str):
 
 class Assistant(Agent):
     def __init__(self, account: dict, caller_number: str = "",
-                 call_id: int | None = None):
+                 call_id: int | None = None, history: str = ""):
         self.account = account
         self.call_id = call_id
         self.caller_number = caller_number
@@ -92,7 +92,12 @@ class Assistant(Agent):
         today = datetime.now(ZoneInfo("America/New_York")).strftime(
             "%A, %B %-d, %Y")
         super().__init__(instructions=f"""
-You are a phone assistant for {account.get('name', 'the caller')}.
+You are a personal assistant for {account.get('name', 'the caller')},
+reachable by phone and by text. This is a phone call.
+
+RECENT HISTORY (shared with their text messages — you already know this)
+{history or "Nothing recent."}
+
 
 TOPICS YOU DO NOT DISCUSS
 Do not agree, under any circumstances, to talk about any of the following or
@@ -460,7 +465,16 @@ async def entrypoint(ctx: JobContext):
                          "the office. Keep it to one sentence.")
         return
 
-    agent_obj = Assistant(account, caller, call_id)
+    history = ""
+    try:
+        rows = await backend_get("/memory",
+                                 account_id=account["account_id"], limit=12)
+        history = "\n".join(
+            f"- ({r['channel']}) {r['who']}: {r['text'][:160]}" for r in rows)
+    except Exception as e:
+        log.warning(f"history load failed: {e}")
+
+    agent_obj = Assistant(account, caller, call_id, history)
 
     @session.on("conversation_item_added")
     def _on_item(ev):
@@ -471,6 +485,12 @@ async def entrypoint(ctx: JobContext):
             if text:
                 who = "caller" if role == "user" else "agent"
                 asyncio.create_task(log_turn(call_id, who, text))
+                if account:
+                    asyncio.create_task(backend_post("/memory", {
+                        "account_id": account["account_id"],
+                        "channel": "voice",
+                        "who": "user" if role == "user" else "assistant",
+                        "text": text}))
         except Exception:
             pass
 
