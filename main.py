@@ -20,6 +20,7 @@ from email.mime.text import MIMEText
 
 import urllib.request
 import urllib.parse
+import urllib.error
 import base64 as _b64
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import RedirectResponse, HTMLResponse
@@ -570,6 +571,12 @@ def tool_send_sms(to: str, message: str) -> dict:
             return {"sent": True, "raw": str(d)[:200]}
 
         return {"sent": False, "error": f"Unknown provider {SMS_PROVIDER}"}
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode()[:500]
+        except Exception:
+            detail = ""
+        return {"sent": False, "error": f"HTTP {e.code}", "detail": detail}
     except Exception as e:
         return {"sent": False, "error": str(e)[:200]}
 
