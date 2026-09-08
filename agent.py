@@ -13,6 +13,8 @@ Env vars needed:
 import os
 import logging
 import httpx
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from livekit.agents import (
     AgentServer, AgentSession, Agent, JobContext,
@@ -63,7 +65,10 @@ class Assistant(Agent):
         self.account_id = account["account_id"]
         self.verified = False
         self.last_list = []
+        self.last_events = []
 
+        today = datetime.now(ZoneInfo("America/New_York")).strftime(
+            "%A, %B %-d, %Y")
         super().__init__(instructions=f"""
 You are a phone assistant for {account.get('name', 'the caller')}.
 
@@ -91,6 +96,16 @@ SENDING EMAIL — follow this exactly
    and then stop talking.
 4. Only call send_email after the caller clearly says yes.
 5. After sending, say it's sent and ask if there's anything else.
+
+CALENDAR
+- "What's on my calendar" / "am I free" -> check_calendar.
+- To book something: get the day, the time and what it's for. If they are
+  vague about time, call find_free_time and offer two or three options out
+  loud. Read the whole thing back and ask "Should I put that in?" before
+  calling create_event.
+- Speak times naturally: "Tuesday at two thirty", never ISO timestamps.
+- Today is {today}. Work out relative dates like "tomorrow" or "next Tuesday"
+  yourself before calling a tool.
 
 FINDING EMAIL
 - check_email is for unread mail only.
@@ -198,6 +213,70 @@ FINDING EMAIL
             return f"No address found for {name}. Ask the caller to spell it."
         return "; ".join(f"{m['name'] or m['email']} at {m['email']}"
                          for m in matches)
+
+    @function_tool
+    async def check_calendar(self, context: RunContext, days: int = 1):
+        """What's on the caller's calendar. days=1 is today, 7 is the week."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            data = await backend_get("/cal/events",
+                                     account_id=self.account_id, days=days)
+        except Exception as e:
+            log.error(f"calendar failed: {e}")
+            return "I couldn't reach the calendar."
+        evs = data.get("events", [])
+        if not evs:
+            return "Nothing scheduled in that window."
+        self.last_events = evs
+        lines = []
+        for i, e in enumerate(evs, 1):
+            when = e.get("start", "")
+            if "T" in when:
+                try:
+                    when = datetime.fromisoformat(when).strftime(
+                        "%A %-I:%M %p")
+                except Exception:
+                    pass
+            lines.append(f"{i}. {e.get('title')} — {when}")
+        return "\n".join(lines)
+
+    @function_tool
+    async def find_free_time(self, context: RunContext, date: str,
+                             minutes: int = 60):
+        """Open slots on a date. date must be YYYY-MM-DD."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            data = await backend_get("/cal/free",
+                                     account_id=self.account_id,
+                                     date=date, minutes=minutes)
+        except Exception as e:
+            log.error(f"free failed: {e}")
+            return "I couldn't check availability."
+        free = data.get("free", [])
+        if not free:
+            return f"{data.get('date')} looks full."
+        return f"{data.get('date')} is open at: " + ", ".join(free)
+
+    @function_tool
+    async def create_event(self, context: RunContext, title: str,
+                           start_iso: str, minutes: int = 60,
+                           location: str = ""):
+        """Book something. start_iso is YYYY-MM-DDTHH:MM:SS, 24-hour clock.
+        Only call after reading it back and the caller saying yes."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            await backend_post("/cal/create", {
+                "account_id": self.account_id, "title": title,
+                "start_iso": start_iso, "minutes": minutes,
+                "location": location,
+            })
+        except Exception as e:
+            log.error(f"create event failed: {e}")
+            return "That didn't get added."
+        return "Added to the calendar."
 
     @function_tool
     async def send_email(self, context: RunContext,

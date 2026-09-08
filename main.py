@@ -15,7 +15,7 @@ Endpoints:
 import os
 import base64
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 
 from fastapi import FastAPI, HTTPException, Request
@@ -42,6 +42,7 @@ ENCRYPTION_KEY = os.environ["ENCRYPTION_KEY"]       # Fernet key, see setup note
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/userinfo.email",
     "openid",
 ]
@@ -252,6 +253,118 @@ def tool_find_contact(account_id: int, name: str) -> dict:
     return {"matches": [{"name": v, "email": k} for k, v in seen.items()][:5]}
 
 
+
+def google_client(account_id: int, api: str, version: str):
+    """Same credentials, different Google API."""
+    db = Session()
+    conn = (db.query(Connection)
+              .filter_by(account_id=account_id, provider="google").first())
+    db.close()
+    if not conn:
+        raise HTTPException(400, "This account has no Google account linked.")
+    tok = vault_get(conn.secret_blob)
+    creds = Credentials(
+        token=tok.get("token"),
+        refresh_token=tok.get("refresh_token"),
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        scopes=SCOPES,
+    )
+    return build(api, version, credentials=creds, cache_discovery=False)
+
+
+def _cal(account_id: int):
+    return google_client(account_id, "calendar", "v3")
+
+
+def tool_list_events(account_id: int, days: int = 1) -> dict:
+    """Upcoming events over the next N days."""
+    svc = _cal(account_id)
+    now = datetime.now(timezone.utc)
+    end = now + timedelta(days=days)
+    res = svc.events().list(
+        calendarId="primary",
+        timeMin=now.isoformat(),
+        timeMax=end.isoformat(),
+        singleEvents=True, orderBy="startTime", maxResults=20).execute()
+
+    items = []
+    for e in res.get("items", []):
+        start = e.get("start", {})
+        items.append({
+            "id": e.get("id"),
+            "title": e.get("summary", "(no title)"),
+            "start": start.get("dateTime") or start.get("date"),
+            "all_day": "date" in start,
+            "location": e.get("location", ""),
+        })
+    return {"count": len(items), "events": items}
+
+
+def tool_create_event(account_id: int, title: str, start_iso: str,
+                      minutes: int = 60, location: str = "",
+                      notes: str = "") -> dict:
+    """Create an event. start_iso like 2026-09-10T14:00:00."""
+    svc = _cal(account_id)
+    tz = (svc.settings().get(setting="timezone").execute()
+          .get("value", "America/New_York"))
+    start = datetime.fromisoformat(start_iso.replace("Z", ""))
+    end = start + timedelta(minutes=minutes)
+    body = {
+        "summary": title,
+        "location": location,
+        "description": notes,
+        "start": {"dateTime": start.isoformat(), "timeZone": tz},
+        "end": {"dateTime": end.isoformat(), "timeZone": tz},
+    }
+    ev = svc.events().insert(calendarId="primary", body=body).execute()
+    return {"created": True, "id": ev.get("id"),
+            "title": title, "start": start.isoformat()}
+
+
+def tool_cancel_event(account_id: int, event_id: str) -> dict:
+    svc = _cal(account_id)
+    svc.events().delete(calendarId="primary", eventId=event_id).execute()
+    return {"cancelled": True}
+
+
+def tool_find_free(account_id: int, date_iso: str,
+                   minutes: int = 60) -> dict:
+    """Open slots on a given date, 9am-6pm."""
+    svc = _cal(account_id)
+    tz = (svc.settings().get(setting="timezone").execute()
+          .get("value", "America/New_York"))
+    day = datetime.fromisoformat(date_iso[:10])
+    start = day.replace(hour=9, minute=0)
+    end = day.replace(hour=18, minute=0)
+
+    res = svc.freebusy().query(body={
+        "timeMin": start.isoformat() + "Z",
+        "timeMax": end.isoformat() + "Z",
+        "timeZone": tz,
+        "items": [{"id": "primary"}],
+    }).execute()
+
+    busy = []
+    for b in res["calendars"]["primary"].get("busy", []):
+        busy.append((
+            datetime.fromisoformat(b["start"].replace("Z", "")),
+            datetime.fromisoformat(b["end"].replace("Z", "")),
+        ))
+    busy.sort()
+
+    slots, cursor = [], start
+    for bs, be in busy:
+        if (bs - cursor).total_seconds() >= minutes * 60:
+            slots.append(cursor.strftime("%-I:%M %p"))
+        cursor = max(cursor, be)
+    if (end - cursor).total_seconds() >= minutes * 60:
+        slots.append(cursor.strftime("%-I:%M %p"))
+
+    return {"date": day.strftime("%A %B %-d"), "free": slots[:8]}
+
+
 # ----------------------------------------------------------------- api
 
 app = FastAPI(title="Phone Assistant")
@@ -370,6 +483,36 @@ def test_search(account_id: int, q: str, limit: int = 5):
 @app.get("/test/contact")
 def test_contact(account_id: int, name: str):
     return tool_find_contact(account_id, name)
+
+
+@app.get("/cal/events")
+def cal_events(account_id: int, days: int = 1):
+    return tool_list_events(account_id, days)
+
+
+@app.get("/cal/free")
+def cal_free(account_id: int, date: str, minutes: int = 60):
+    return tool_find_free(account_id, date, minutes)
+
+
+class NewEvent(BaseModel):
+    account_id: int
+    title: str
+    start_iso: str
+    minutes: int = 60
+    location: str = ""
+    notes: str = ""
+
+
+@app.post("/cal/create")
+def cal_create(e: NewEvent):
+    return tool_create_event(e.account_id, e.title, e.start_iso,
+                             e.minutes, e.location, e.notes)
+
+
+@app.post("/cal/cancel")
+def cal_cancel(account_id: int, event_id: str):
+    return tool_cancel_event(account_id, event_id)
 
 
 class SendBody(BaseModel):
