@@ -893,6 +893,17 @@ TEXT_TOOLS = [
             "minutes": {"type": "integer"}},
             "required": ["title", "start_iso"]}}},
     {"type": "function", "function": {
+        "name": "list_mailboxes",
+        "description": "Which email addresses this person has connected.",
+        "parameters": {"type": "object", "properties": {}, "required": []}}},
+    {"type": "function", "function": {
+        "name": "name_mailbox",
+        "description": ("Give a mailbox a short name they can say, and/or "
+                        "make it their main one."),
+        "parameters": {"type": "object", "properties": {
+            "mailbox": {"type": "string"}, "name": {"type": "string"},
+            "make_main": {"type": "boolean"}}, "required": ["mailbox"]}}},
+    {"type": "function", "function": {
         "name": "connect_email",
         "description": ("Connect this person's Gmail using an address and "
                         "password they sent. Confirm both back first."),
@@ -936,6 +947,9 @@ services — that comes first.
 Before sending an email or booking anything, state what you're about to do
 and wait for a yes.
 
+If they have several mailboxes, ask which one they mean when it isn't
+obvious, and you can name them with name_mailbox if they'd like.
+
 If they have no email connected yet, you can connect it. Ask for their Gmail
 address and password, read both back, then use connect_email. Poll
 check_connect. If it says needs_code, ask them for the code Google just sent
@@ -960,6 +974,26 @@ def _run_text_tool(account_id: int, name: str, args: dict):
             return tool_create_event(account_id, args["title"],
                                      args["start_iso"],
                                      args.get("minutes", 60))
+        if name == "list_mailboxes":
+            return {"mailboxes": list_mailboxes(account_id)}
+        if name == "name_mailbox":
+            rows = list_mailboxes(account_id)
+            w = (args.get("mailbox") or "").strip().lower()
+            m = next((r for r in rows if w in (r["email"] or "").lower()
+                      or w == (r["label"] or "").lower()), None)
+            if not m:
+                return {"error": "no mailbox matched"}
+            db = Session()
+            row = db.query(Connection).filter_by(id=m["id"]).first()
+            if args.get("name"):
+                row.label = args["name"][:60]
+            if args.get("make_main"):
+                for o in (db.query(Connection)
+                            .filter_by(account_id=account_id).all()):
+                    o.is_default = 1 if o.id == m["id"] else 0
+            db.commit()
+            db.close()
+            return {"ok": True, "email": m["email"]}
         if name == "connect_email":
             db = Session()
             row = Onboard(account_id=account_id, email=args["email"],

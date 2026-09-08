@@ -166,6 +166,12 @@ they have and which one they use most.
 - If it's not obvious, ask once: "Which one — work or personal?" Then use it
   for the rest of the call unless they say otherwise.
 - When reading email from a specific mailbox, say which one you're reading.
+- Right after they connect a second mailbox, offer once: "Do you want to
+  give these short names, like work and personal, so you can just say which
+  one you want?" If they say yes, ask for a name for each and use
+  name_mailbox. If they say no, drop it and don't ask again.
+- If they ever say something like "call this one my work email" or "make
+  this my main one", use name_mailbox straight away.
 
 CONNECTING THEIR EMAIL (only if they aren't connected yet)
 If check_email says their account has no email linked, offer to connect it
@@ -349,6 +355,45 @@ FINDING EMAIL
             parts.append(f"{name} ({', '.join(tags)})")
         return ("They have several: " + "; ".join(parts) +
                 ". Ask which one if it isn't obvious.")
+
+    @function_tool
+    async def name_mailbox(self, context: RunContext, mailbox: str,
+                           name: str = "", make_main: bool = False):
+        """Give a mailbox a short name the caller can say, and/or make it
+        their main one. 'mailbox' is its address or current name."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            rows = await backend_get("/mailboxes",
+                                     account_id=self.account_id)
+        except Exception:
+            return "Couldn't reach their mailboxes."
+        w = mailbox.strip().lower()
+        match = next((r for r in rows
+                      if w == (r.get("email") or "").lower()
+                      or w == (r.get("label") or "").lower()), None)
+        if not match:
+            match = next((r for r in rows
+                          if w and (w in (r.get("email") or "").lower()
+                                    or w in (r.get("label") or "").lower())),
+                         None)
+        if not match:
+            return f"Couldn't find a mailbox matching '{mailbox}'. Ask again."
+        try:
+            async with httpx.AsyncClient(timeout=20) as c:
+                await c.post(f"{BACKEND}/mailboxes/label", headers=AUTH,
+                             params={"connection_id": match["id"],
+                                     "label": name.strip(),
+                                     "make_default": 1 if make_main else 0})
+        except Exception as e:
+            log.error(f"name mailbox failed: {e}")
+            return "That didn't save."
+        bits = []
+        if name.strip():
+            bits.append(f"now called {name.strip()}")
+        if make_main:
+            bits.append("set as their main one")
+        return f"{match['email']} is " + " and ".join(bits or ["unchanged"]) + "."
 
     @function_tool
     async def use_mailbox(self, context: RunContext, mailbox: str):
