@@ -23,7 +23,8 @@ import urllib.parse
 import urllib.error
 import base64 as _b64
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import RedirectResponse, HTMLResponse
+from fastapi.responses import (RedirectResponse, HTMLResponse,
+                               JSONResponse)
 from pydantic import BaseModel
 from cryptography.fernet import Fernet
 from sqlalchemy import (create_engine, Column, Integer, String, DateTime,
@@ -786,7 +787,8 @@ class NewAccount(BaseModel):
 
 
 @app.post("/accounts")
-def create_account(a: NewAccount):
+def create_account(a: NewAccount, request: Request):
+    require_auth(request)
     db = Session()
     acct = Account(name=a.name, pin=a.pin)
     db.add(acct)
@@ -801,7 +803,8 @@ def create_account(a: NewAccount):
 
 
 @app.get("/accounts")
-def list_accounts():
+def list_accounts(request: Request):
+    require_auth(request)
     db = Session()
     rows = []
     for acct in db.query(Account).all():
@@ -870,22 +873,26 @@ def link_callback(request: Request):
 
 
 @app.get("/test/unread")
-def test_unread(account_id: int, limit: int = 5):
+def test_unread(request: Request, account_id: int, limit: int = 5):
+    require_auth(request)
     return tool_unread_summary(account_id, limit)
 
 
 @app.get("/test/read")
-def test_read(account_id: int, msg_id: str):
+def test_read(request: Request, account_id: int, msg_id: str):
+    require_auth(request)
     return tool_read_email(account_id, msg_id)
 
 
 @app.get("/test/search")
-def test_search(account_id: int, q: str, limit: int = 5):
+def test_search(request: Request, account_id: int, q: str, limit: int = 5):
+    require_auth(request)
     return tool_search_email(account_id, q, limit)
 
 
 @app.get("/test/contact")
-def test_contact(account_id: int, name: str):
+def test_contact(request: Request, account_id: int, name: str):
+    require_auth(request)
     return tool_find_contact(account_id, name)
 
 
@@ -949,7 +956,8 @@ async def sms_incoming(request: Request):
 
 
 @app.get("/memory")
-def memory_get(account_id: int, limit: int = 20):
+def memory_get(request: Request, account_id: int, limit: int = 20):
+    require_auth(request)
     return mem_recent(account_id, limit)
 
 
@@ -961,7 +969,8 @@ class MemBody(BaseModel):
 
 
 @app.post("/memory")
-def memory_add(m: MemBody):
+def memory_add(m: MemBody, request: Request):
+    require_auth(request)
     mem_add(m.account_id, m.channel, m.who, m.text)
     return {"ok": True}
 
@@ -973,7 +982,8 @@ class CallStart(BaseModel):
 
 
 @app.post("/calls/start")
-def call_start(c: CallStart):
+def call_start(c: CallStart, request: Request):
+    require_auth(request)
     db = Session()
     row = Call(account_id=c.account_id, from_number=c.from_number,
                room=c.room)
@@ -994,7 +1004,8 @@ class TurnBody(BaseModel):
 
 
 @app.post("/calls/turn")
-def call_turn(t: TurnBody):
+def call_turn(t: TurnBody, request: Request):
+    require_auth(request)
     db = Session()
     db.add(CallTurn(call_id=t.call_id, who=t.who, text=t.text[:4000],
                     tool=t.tool, latency_ms=t.latency_ms))
@@ -1004,7 +1015,8 @@ def call_turn(t: TurnBody):
 
 
 @app.post("/calls/end")
-def call_end(call_id: int, verified: int = 0):
+def call_end(request: Request, call_id: int, verified: int = 0):
+    require_auth(request)
     db = Session()
     row = db.query(Call).filter_by(id=call_id).first()
     if row:
@@ -1018,25 +1030,86 @@ def call_end(call_id: int, verified: int = 0):
 
 
 @app.get("/calls")
-def calls_list(limit: int = 50):
+def calls_list(request: Request, limit: int = 50):
+    require_auth(request)
     db = Session()
-    rows = (db.query(Call).order_by(Call.id.desc()).limit(limit).all())
+    rows = db.query(Call).order_by(Call.id.desc()).limit(limit).all()
     names = {a.id: a.name for a in db.query(Account).all()}
-    out = [{
-        "call_id": r.id,
-        "who": names.get(r.account_id) or "unknown",
-        "from": r.from_number,
-        "started": r.started_at.strftime("%b %-d %-I:%M %p")
-                   if r.started_at else "",
-        "seconds": r.duration_sec,
-        "verified": bool(r.verified),
-    } for r in rows]
+    ids = [r.id for r in rows]
+    turns = (db.query(CallTurn).filter(CallTurn.call_id.in_(ids)).all()
+             if ids else [])
     db.close()
+
+    by_call = {}
+    for t in turns:
+        by_call.setdefault(t.call_id, []).append(t)
+
+    out = []
+    for r in rows:
+        ts = by_call.get(r.id, [])
+        tools = []
+        problems = []
+        slowest = 0
+        for t in ts:
+            if t.tool and t.tool not in tools:
+                tools.append(t.tool)
+            slowest = max(slowest, t.latency_ms or 0)
+            low = (t.text or "").lower()
+            if any(p in low for p in (
+                    "didn't go", "couldn't", "not verified", "failed",
+                    "nothing matched", "no address found", "didn't get added",
+                    "did not go through", "i'm sorry", "not allowed")):
+                problems.append((t.text or "")[:120])
+        out.append({
+            "call_id": r.id,
+            "who": names.get(r.account_id) or "unknown",
+            "from": r.from_number,
+            "started": r.started_at.strftime("%b %-d %-I:%M %p")
+                       if r.started_at else "",
+            "seconds": r.duration_sec,
+            "verified": bool(r.verified),
+            "tasks": tools,
+            "turns": len(ts),
+            "slowest_ms": slowest,
+            "problems": problems[:3],
+        })
     return out
 
 
+@app.get("/stats")
+def stats(request: Request, days: int = 7):
+    require_auth(request)
+    since = datetime.utcnow() - timedelta(days=days)
+    db = Session()
+    rows = db.query(Call).filter(Call.started_at >= since).all()
+    ids = [r.id for r in rows]
+    turns = (db.query(CallTurn).filter(CallTurn.call_id.in_(ids)).all()
+             if ids else [])
+    db.close()
+
+    tool_counts = {}
+    lat = []
+    for t in turns:
+        if t.tool:
+            tool_counts[t.tool] = tool_counts.get(t.tool, 0) + 1
+        if t.latency_ms:
+            lat.append(t.latency_ms)
+
+    durations = [r.duration_sec for r in rows if r.duration_sec]
+    return {
+        "days": days,
+        "calls": len(rows),
+        "verified": sum(1 for r in rows if r.verified),
+        "avg_seconds": int(sum(durations) / len(durations)) if durations else 0,
+        "avg_tool_ms": int(sum(lat) / len(lat)) if lat else 0,
+        "top_tasks": sorted(tool_counts.items(),
+                            key=lambda x: -x[1])[:6],
+    }
+
+
 @app.get("/calls/{call_id}")
-def call_detail(call_id: int):
+def call_detail(call_id: int, request: Request):
+    require_auth(request)
     db = Session()
     turns = (db.query(CallTurn).filter_by(call_id=call_id)
                .order_by(CallTurn.id).all())
@@ -1054,12 +1127,14 @@ class SmsBody(BaseModel):
 
 
 @app.post("/sms/send")
-def sms_send(s: SmsBody):
+def sms_send(s: SmsBody, request: Request):
+    require_auth(request)
     return tool_send_sms(s.to, s.message)
 
 
 @app.post("/sms/link")
-def sms_link(account_id: int, to: str = ""):
+def sms_link(request: Request, account_id: int, to: str = ""):
+    require_auth(request)
     """Text a customer their linking link. Uses their stored number if blank."""
     if not to:
         db = Session()
@@ -1072,17 +1147,20 @@ def sms_link(account_id: int, to: str = ""):
 
 
 @app.get("/web/search")
-def web_search(q: str, near: str = ""):
+def web_search(request: Request, q: str, near: str = ""):
+    require_auth(request)
     return tool_web_search(q, near)
 
 
 @app.get("/cal/events")
-def cal_events(account_id: int, days: int = 1):
+def cal_events(request: Request, account_id: int, days: int = 1):
+    require_auth(request)
     return tool_list_events(account_id, days)
 
 
 @app.get("/cal/free")
-def cal_free(account_id: int, date: str, minutes: int = 60):
+def cal_free(request: Request, account_id: int, date: str, minutes: int = 60):
+    require_auth(request)
     return tool_find_free(account_id, date, minutes)
 
 
@@ -1096,13 +1174,15 @@ class NewEvent(BaseModel):
 
 
 @app.post("/cal/create")
-def cal_create(e: NewEvent):
+def cal_create(e: NewEvent, request: Request):
+    require_auth(request)
     return tool_create_event(e.account_id, e.title, e.start_iso,
                              e.minutes, e.location, e.notes)
 
 
 @app.post("/cal/cancel")
-def cal_cancel(account_id: int, event_id: str):
+def cal_cancel(request: Request, account_id: int, event_id: str):
+    require_auth(request)
     return tool_cancel_event(account_id, event_id)
 
 
@@ -1114,40 +1194,89 @@ class SendBody(BaseModel):
 
 
 @app.post("/test/send")
-def test_send(s: SendBody):
+def test_send(s: SendBody, request: Request):
+    require_auth(request)
     return tool_send_email(s.account_id, s.to, s.subject, s.body)
 
 
 # ----------------------------------------------------------------- admin
 
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "changeme")
+SERVICE_TOKEN = os.environ.get("SERVICE_TOKEN", "")
+
+
+def _session_value() -> str:
+    """Cookie value tied to the password and encryption key."""
+    import hashlib
+    return hashlib.sha256(
+        (ADMIN_PASSWORD + ENCRYPTION_KEY).encode()).hexdigest()[:40]
+
+
+def require_auth(request: Request):
+    """Allow the admin browser session or the agent's service token."""
+    if request.cookies.get("pa_session") == _session_value():
+        return True
+    auth = request.headers.get("authorization", "")
+    if SERVICE_TOKEN and auth == f"Bearer {SERVICE_TOKEN}":
+        return True
+    raise HTTPException(401, "Not authorised.")
 
 ADMIN_HTML = """<!doctype html>
 <html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Phone Assistant — Admin</title>
+<title>Phone Assistant &mdash; Admin</title>
 <style>
  body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#0f1115;
       color:#e6e6e6;margin:0;padding:24px;}
- h1{font-size:20px;margin:0 0 20px;}
+ h1{font-size:20px;margin:0 0 6px;}
+ .sub{color:#8b94a7;font-size:13px;margin-bottom:20px;}
  .card{background:#171a21;border:1px solid #262b36;border-radius:10px;
-       padding:18px;margin-bottom:18px;max-width:900px;}
+       padding:18px;margin-bottom:18px;max-width:1000px;}
+ .card b{font-size:15px;}
  label{display:block;font-size:12px;color:#8b94a7;margin:10px 0 4px;}
  input{width:100%;padding:9px 10px;background:#0f1115;border:1px solid #2c3240;
        border-radius:6px;color:#e6e6e6;font-size:14px;box-sizing:border-box;}
  button{margin-top:14px;padding:9px 16px;background:#3b82f6;border:0;
         border-radius:6px;color:#fff;font-size:14px;cursor:pointer;}
- button.sec{background:#2c3240;}
- table{width:100%;border-collapse:collapse;margin-top:8px;font-size:14px;}
+ button.sec{background:#2c3240;margin:0 0 0 6px;padding:6px 12px;}
+ table{width:100%;border-collapse:collapse;margin-top:10px;font-size:14px;}
  th{text-align:left;color:#8b94a7;font-weight:500;font-size:12px;
     padding:8px 6px;border-bottom:1px solid #262b36;}
- td{padding:10px 6px;border-bottom:1px solid #1c212b;}
- .ok{color:#4ade80;} .no{color:#f87171;}
+ td{padding:10px 6px;border-bottom:1px solid #1c212b;vertical-align:top;}
+ .ok{color:#4ade80;} .no{color:#f87171;} .warn{color:#fbbf24;}
+ .tag{display:inline-block;background:#232936;border-radius:4px;
+      padding:2px 7px;margin:2px 3px 2px 0;font-size:12px;color:#c3cad8;}
+ .prob{color:#f87171;font-size:12px;display:block;margin-top:4px;}
  a.btn{display:inline-block;padding:6px 12px;background:#2c3240;color:#e6e6e6;
        border-radius:6px;text-decoration:none;font-size:13px;}
  .msg{margin-top:10px;font-size:13px;color:#8b94a7;}
+ .nums{display:flex;gap:26px;flex-wrap:wrap;margin-top:12px;}
+ .num b{display:block;font-size:24px;color:#fff;}
+ .num span{font-size:12px;color:#8b94a7;}
+ pre{white-space:pre-wrap;background:#0f1115;padding:14px;border-radius:6px;
+     margin-top:12px;display:none;font-size:13px;max-height:420px;
+     overflow:auto;line-height:1.6;}
 </style></head><body>
-<h1>Phone Assistant — Admin</h1>
+<h1>Phone Assistant
+  <button class="sec" style="float:right;margin:0"
+    onclick="fetch('/admin/logout',{method:'POST'}).then(()=>location.reload())">
+    Sign out</button></h1>
+<div class="sub" id="clock"></div>
+
+<div class="card">
+  <b>Last 7 days</b>
+  <div class="nums" id="stats"><span style="color:#8b94a7">Loading…</span></div>
+</div>
+
+<div class="card">
+  <b>Recent calls</b>
+  <button class="sec" onclick="loadCalls()">Refresh</button>
+  <table><thead><tr><th>#</th><th>Who</th><th>When</th><th>Length</th>
+  <th>PIN</th><th>What they wanted</th><th></th></tr></thead>
+  <tbody id="calls"><tr><td colspan="7" style="color:#8b94a7">Loading…</td></tr>
+  </tbody></table>
+  <pre id="tx"></pre>
+</div>
 
 <div class="card">
   <b>Add a customer</b>
@@ -1160,96 +1289,202 @@ ADMIN_HTML = """<!doctype html>
 </div>
 
 <div class="card">
-  <b>Recent calls</b>
-  <table><thead><tr><th>#</th><th>Who</th><th>From</th><th>When</th>
-  <th>Length</th><th>PIN</th><th></th></tr></thead>
-  <tbody id="calls"></tbody></table>
-  <pre id="tx" style="white-space:pre-wrap;background:#0f1115;padding:12px;
-    border-radius:6px;margin-top:12px;display:none;font-size:13px;
-    max-height:400px;overflow:auto"></pre>
-</div>
-
-<div class="card">
   <b>Customers</b>
   <table><thead><tr><th>ID</th><th>Name</th><th>Phone</th>
-  <th>Gmail</th><th></th></tr></thead><tbody id="rows"></tbody></table>
+  <th>Gmail</th><th></th></tr></thead>
+  <tbody id="rows"><tr><td colspan="5" style="color:#8b94a7">Loading…</td></tr>
+  </tbody></table>
 </div>
 
 <script>
-const q = new URLSearchParams(location.search).get('key') || '';
-async function load(){
-  const r = await fetch('/accounts');
-  const d = await r.json();
-  document.getElementById('rows').innerHTML = d.map(a =>
-    `<tr><td>${a.account_id}</td><td>${a.name||''}</td>
-     <td>${(a.phones||[]).join(', ')}</td>
-     <td>${a.gmail ? '<span class=ok>'+a.gmail+'</span>'
-                   : '<span class=no>not linked</span>'}</td>
-     <td><a class="btn" target="_blank"
-        href="/link/start?account_id=${a.account_id}">Link Gmail</a>
-      <button class="sec" style="margin:0 0 0 6px;padding:6px 12px"
-        onclick="copyLink(${a.account_id})">Copy link</button>
-      <button class="sec" style="margin:0 0 0 6px;padding:6px 12px"
-        onclick="textLink(${a.account_id})">Text link</button></td></tr>`
-  ).join('') || '<tr><td colspan=5 style="color:#8b94a7">None yet.</td></tr>';
+function esc(x){ return String(x==null?'':x)
+  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+async function loadStats(){
+  try{
+    const d = await (await fetch('/stats?days=7')).json();
+    const tasks = (d.top_tasks||[]).map(t =>
+      '<span class="tag">'+esc(t[0])+' '+t[1]+'</span>').join('') || '&mdash;';
+    document.getElementById('stats').innerHTML =
+      '<div class="num"><b>'+d.calls+'</b><span>calls</span></div>'+
+      '<div class="num"><b>'+d.verified+'</b><span>passed PIN</span></div>'+
+      '<div class="num"><b>'+d.avg_seconds+'s</b><span>avg length</span></div>'+
+      '<div class="num"><b>'+d.avg_tool_ms+'ms</b><span>avg lookup</span></div>'+
+      '<div class="num" style="flex:1"><span>most asked for</span>'+
+      '<div style="margin-top:6px">'+tasks+'</div></div>';
+  }catch(e){
+    document.getElementById('stats').innerHTML =
+      '<span class="no">Could not load stats.</span>';
+  }
 }
+
+async function loadCalls(){
+  const tb = document.getElementById('calls');
+  try{
+    const d = await (await fetch('/calls?limit=25')).json();
+    if(!d.length){
+      tb.innerHTML = '<tr><td colspan="7" style="color:#8b94a7">'+
+        'No calls yet.</td></tr>'; return;
+    }
+    tb.innerHTML = d.map(function(c){
+      var tasks = (c.tasks||[]).map(function(t){
+        return '<span class="tag">'+esc(t)+'</span>'; }).join('');
+      if(!tasks) tasks = '<span style="color:#8b94a7">just talking</span>';
+      var probs = (c.problems||[]).map(function(p){
+        return '<span class="prob">stuck: '+esc(p)+'</span>'; }).join('');
+      var slow = c.slowest_ms > 2500
+        ? '<span class="warn"> slow '+c.slowest_ms+'ms</span>' : '';
+      return '<tr><td>'+c.call_id+'</td><td>'+esc(c.who)+'<br>'+
+        '<span style="color:#8b94a7;font-size:12px">'+esc(c.from)+'</span></td>'+
+        '<td>'+esc(c.started)+'</td><td>'+c.seconds+'s<br>'+
+        '<span style="color:#8b94a7;font-size:12px">'+c.turns+' turns</span></td>'+
+        '<td>'+(c.verified?'<span class="ok">ok</span>':'<span class="no">no</span>')+
+        '</td><td>'+tasks+slow+probs+'</td>'+
+        '<td><button class="sec" onclick="showTx('+c.call_id+')">'+
+        'Transcript</button></td></tr>';
+    }).join('');
+  }catch(e){
+    tb.innerHTML = '<tr><td colspan="7" class="no">Error loading calls: '+
+      esc(e.message)+'</td></tr>';
+  }
+}
+
+async function showTx(id){
+  const el = document.getElementById('tx');
+  el.style.display = 'block';
+  el.textContent = 'Loading…';
+  try{
+    const d = await (await fetch('/calls/'+id)).json();
+    el.textContent = d.length
+      ? d.map(function(t){
+          return '['+t.at+'] '+t.who+(t.tool?' ('+t.tool+')':'')+
+                 (t.latency_ms?' '+t.latency_ms+'ms':'')+': '+t.text;
+        }).join(String.fromCharCode(10))
+      : 'No transcript recorded for this call.';
+  }catch(e){ el.textContent = 'Could not load transcript.'; }
+}
+
+async function load(){
+  const tb = document.getElementById('rows');
+  try{
+    const d = await (await fetch('/accounts')).json();
+    if(!d.length){
+      tb.innerHTML = '<tr><td colspan="5" style="color:#8b94a7">'+
+        'No customers yet.</td></tr>'; return;
+    }
+    tb.innerHTML = d.map(function(a){
+      return '<tr><td>'+a.account_id+'</td><td>'+esc(a.name)+'</td>'+
+        '<td>'+esc((a.phones||[]).join(', '))+'</td>'+
+        '<td>'+(a.gmail?'<span class="ok">'+esc(a.gmail)+'</span>'
+                       :'<span class="no">not linked</span>')+'</td>'+
+        '<td><a class="btn" target="_blank" href="/link/start?account_id='+
+        a.account_id+'">Link Gmail</a>'+
+        '<button class="sec" onclick="copyLink('+a.account_id+')">Copy</button>'+
+        '<button class="sec" onclick="textLink('+a.account_id+')">Text</button>'+
+        '</td></tr>';
+    }).join('');
+  }catch(e){
+    tb.innerHTML = '<tr><td colspan="5" class="no">Error: '+
+      esc(e.message)+'</td></tr>';
+  }
+}
+
 function copyLink(id){
   const url = location.origin + '/link/start?account_id=' + id;
   navigator.clipboard.writeText(url);
-  document.getElementById('msg').textContent =
-    'Link copied — text it to the customer: ' + url;
+  document.getElementById('msg').textContent = 'Link copied: ' + url;
 }
+
 async function textLink(id){
   const m = document.getElementById('msg');
-  m.textContent = 'Sending...';
-  const r = await fetch('/sms/link?account_id=' + id, {method:'POST'});
-  const d = await r.json().catch(()=>({}));
-  m.textContent = d.sent ? 'Text sent.'
-                         : ('Not sent: ' + (d.error || 'check SMS settings'));
+  m.textContent = 'Sending…';
+  try{
+    const d = await (await fetch('/sms/link?account_id='+id,
+                                 {method:'POST'})).json();
+    m.textContent = d.sent ? 'Text sent.'
+      : ('Not sent: ' + (d.detail || d.error || 'check SMS settings'));
+  }catch(e){ m.textContent = 'Not sent: ' + e.message; }
 }
+
 async function add(){
   const body = {name:document.getElementById('n').value,
                 phone:document.getElementById('p').value,
                 pin:document.getElementById('k').value};
+  const m = document.getElementById('msg');
   const r = await fetch('/accounts',{method:'POST',
       headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  const m = document.getElementById('msg');
-  if(r.ok){ m.textContent='Created. Now click Link Gmail on their row.';
+  if(r.ok){ m.textContent='Created. Now click Link Gmail or Text on their row.';
             document.getElementById('n').value='';
             document.getElementById('p').value=''; load(); }
-  else { m.textContent='Failed — that phone number may already exist.'; }
+  else { m.textContent='Failed &mdash; that phone number may already exist.'; }
 }
-async function loadCalls(){
-  const r = await fetch('/calls?limit=25');
-  const d = await r.json();
-  document.getElementById('calls').innerHTML = d.map(c =>
-    `<tr><td>${c.call_id}</td><td>${c.who}</td><td>${c['from']||''}</td>
-     <td>${c.started}</td><td>${c.seconds}s</td>
-     <td>${c.verified?'<span class=ok>ok</span>':'<span class=no>no</span>'}</td>
-     <td><button class="sec" style="margin:0;padding:6px 12px"
-        onclick="showTx(${c.call_id})">Transcript</button></td></tr>`
-  ).join('') || '<tr><td colspan=7 style="color:#8b94a7">No calls yet.</td></tr>';
-}
-async function showTx(id){
-  const r = await fetch('/calls/' + id);
-  const d = await r.json();
-  const el = document.getElementById('tx');
-  el.style.display = 'block';
-  el.textContent = d.length
-    ? d.map(t => `[${t.at}] ${t.who}${t.tool?' ('+t.tool+')':''}` +
-        `${t.latency_ms?' '+t.latency_ms+'ms':''}: ${t.text}`).join('\n')
-    : 'No turns recorded for this call.';
-}
-load(); loadCalls();
-setInterval(loadCalls, 15000);
+
+document.getElementById('clock').textContent =
+  'Updated ' + new Date().toLocaleTimeString();
+load(); loadCalls(); loadStats();
+setInterval(function(){ loadCalls(); loadStats(); }, 20000);
 </script></body></html>"""
 
 
+LOGIN_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sign in</title>
+<style>
+ body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#0f1115;
+      color:#e6e6e6;display:flex;align-items:center;justify-content:center;
+      height:100vh;margin:0;}
+ .box{background:#171a21;border:1px solid #262b36;border-radius:10px;
+      padding:28px;width:300px;}
+ h2{margin:0 0 16px;font-size:17px;}
+ input{width:100%;padding:10px;background:#0f1115;border:1px solid #2c3240;
+       border-radius:6px;color:#e6e6e6;font-size:14px;box-sizing:border-box;}
+ button{width:100%;margin-top:14px;padding:10px;background:#3b82f6;border:0;
+        border-radius:6px;color:#fff;font-size:14px;cursor:pointer;}
+ .err{color:#f87171;font-size:13px;margin-top:10px;min-height:18px;}
+</style></head><body>
+<div class="box">
+  <h2>Phone Assistant</h2>
+  <input id="p" type="password" placeholder="Password"
+         onkeydown="if(event.key==='Enter')go()">
+  <button onclick="go()">Sign in</button>
+  <div class="err" id="e"></div>
+</div>
+<script>
+async function go(){
+  const r = await fetch('/admin/login', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({password: document.getElementById('p').value})});
+  if(r.ok){ location.href = '/admin'; }
+  else { document.getElementById('e').textContent = 'Wrong password.'; }
+}
+</script></body></html>"""
+
+
+class LoginBody(BaseModel):
+    password: str
+
+
+@app.post("/admin/login")
+def admin_login(b: LoginBody):
+    if b.password != ADMIN_PASSWORD:
+        raise HTTPException(401, "Wrong password.")
+    r = JSONResponse({"ok": True})
+    r.set_cookie("pa_session", _session_value(), httponly=True,
+                 secure=True, samesite="lax", max_age=60 * 60 * 12)
+    return r
+
+
+@app.post("/admin/logout")
+def admin_logout():
+    r = JSONResponse({"ok": True})
+    r.delete_cookie("pa_session")
+    return r
+
+
 @app.get("/admin", response_class=HTMLResponse)
-def admin(key: str = ""):
-    if key != ADMIN_PASSWORD:
-        return HTMLResponse(
-            "<body style='font-family:sans-serif;padding:40px'>"
-            "<h3>Add ?key=YOUR_ADMIN_PASSWORD to the URL.</h3></body>",
-            status_code=401)
-    return HTMLResponse(ADMIN_HTML)
+def admin(request: Request):
+    if request.cookies.get("pa_session") != _session_value():
+        return HTMLResponse(LOGIN_HTML,
+                            headers={"Cache-Control": "no-store, max-age=0"})
+    return HTMLResponse(ADMIN_HTML,
+                        headers={"Cache-Control": "no-store, max-age=0"})

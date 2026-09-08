@@ -28,6 +28,8 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("phone-assistant")
 
 BACKEND = os.environ["BACKEND_URL"].rstrip("/")
+SERVICE_TOKEN = os.environ.get("SERVICE_TOKEN", "")
+AUTH = {"Authorization": f"Bearer {SERVICE_TOKEN}"} if SERVICE_TOKEN else {}
 
 server = AgentServer()
 
@@ -37,7 +39,7 @@ server = AgentServer()
 async def backend_get(path: str, **params):
     t0 = time.time()
     async with httpx.AsyncClient(timeout=20) as c:
-        r = await c.get(f"{BACKEND}{path}", params=params)
+        r = await c.get(f"{BACKEND}{path}", params=params, headers=AUTH)
         r.raise_for_status()
         data = r.json()
     backend_get.last_ms = int((time.time() - t0) * 1000)
@@ -49,7 +51,7 @@ backend_get.last_ms = 0
 
 async def backend_post(path: str, payload: dict):
     async with httpx.AsyncClient(timeout=20) as c:
-        r = await c.post(f"{BACKEND}{path}", json=payload)
+        r = await c.post(f"{BACKEND}{path}", json=payload, headers=AUTH)
         r.raise_for_status()
         return r.json()
 
@@ -310,7 +312,7 @@ FINDING EMAIL
         try:
             async with httpx.AsyncClient(timeout=20) as c:
                 r = await c.post(
-                    f"{BACKEND}/sms/link",
+                    f"{BACKEND}/sms/link", headers=AUTH,
                     params={"account_id": self.account_id,
                             "to": self.caller_number or ""})
                 data = r.json()
