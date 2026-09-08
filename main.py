@@ -54,6 +54,8 @@ TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 BULKVS_USER = os.environ.get("BULKVS_API_USER", "")
 BULKVS_PASS = os.environ.get("BULKVS_API_PASSWORD", "")
+TELNYX_API_KEY = os.environ.get("TELNYX_API_KEY", "")
+TELNYX_PROFILE_ID = os.environ.get("TELNYX_MESSAGING_PROFILE_ID", "")
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
@@ -565,6 +567,20 @@ def tool_send_sms(to: str, message: str) -> dict:
                 d = json.loads(r.read().decode())
             return {"sent": True, "id": d.get("sid")}
 
+        if SMS_PROVIDER == "telnyx":
+            body = {"from": _digits_e164(SMS_FROM), "to": to,
+                    "text": message[:1500]}
+            if TELNYX_PROFILE_ID:
+                body["messaging_profile_id"] = TELNYX_PROFILE_ID
+            req = urllib.request.Request(
+                "https://api.telnyx.com/v2/messages",
+                data=json.dumps(body).encode(),
+                headers={"Authorization": f"Bearer {TELNYX_API_KEY}",
+                         "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                d = json.loads(r.read().decode())
+            return {"sent": True, "id": d.get("data", {}).get("id", "")}
+
         if SMS_PROVIDER == "bulkvs":
             payload = json.dumps({
                 "From": _digits_e164(SMS_FROM).lstrip("+"),
@@ -965,6 +981,23 @@ async def sms_incoming(request: Request):
     except Exception:
         form = await request.form()
         body = dict(form)
+
+    # Telnyx wraps everything in data.payload
+    tel = None
+    if isinstance(body.get("data"), dict):
+        tel = body["data"].get("payload") or {}
+        flat = dict(tel)
+        f = flat.get("from")
+        if isinstance(f, dict):
+            flat["From"] = f.get("phone_number", "")
+        t = flat.get("to")
+        if isinstance(t, list) and t:
+            flat["To"] = t[0].get("phone_number", "") \
+                if isinstance(t[0], dict) else t[0]
+            if isinstance(t[0], dict) and t[0].get("status"):
+                flat["Status"] = t[0]["status"]
+        flat["Message"] = flat.get("text", "")
+        body = flat
 
     def pick(*names):
         for n in names:
