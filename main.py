@@ -902,6 +902,95 @@ def _run_signin(sid: int, account_id: int, email: str):
         _PENDING.pop(sid, None)      # password gone from memory
 
 
+
+def revoke_google(blob: str) -> bool:
+    """Tell Google to invalidate the token, so access really ends."""
+    try:
+        tok = vault_get(blob)
+        t = tok.get("refresh_token") or tok.get("token")
+        if not t:
+            return False
+        req = urllib.request.Request(
+            "https://oauth2.googleapis.com/revoke",
+            data=urllib.parse.urlencode({"token": t}).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"})
+        urllib.request.urlopen(req, timeout=10)
+        return True
+    except Exception:
+        return False
+
+
+def disconnect_mailbox(account_id: int, which: str = "") -> dict:
+    """Revoke and remove one mailbox."""
+    db = Session()
+    rows = (db.query(Connection)
+              .filter_by(account_id=account_id, provider="google").all())
+    if not rows:
+        db.close()
+        return {"removed": False, "reason": "nothing connected"}
+
+    target = None
+    if which:
+        w = which.strip().lower()
+        target = next((r for r in rows
+                       if w == (r.email or "").lower()
+                       or w == (r.label or "").lower()), None)
+        if not target:
+            target = next((r for r in rows
+                           if w in (r.email or "").lower()
+                           or w in (r.label or "").lower()), None)
+        if not target:
+            db.close()
+            return {"removed": False, "reason": f"no mailbox like '{which}'"}
+    else:
+        if len(rows) > 1:
+            db.close()
+            return {"removed": False, "reason": "several mailboxes — ask which",
+                    "mailboxes": [r.email for r in rows]}
+        target = rows[0]
+
+    email = target.email
+    was_default = bool(target.is_default)
+    revoked = revoke_google(target.secret_blob)
+    db.delete(target)
+    db.commit()
+
+    left = (db.query(Connection)
+              .filter_by(account_id=account_id, provider="google").all())
+    if was_default and left:
+        left[0].is_default = 1
+        db.commit()
+    db.close()
+    return {"removed": True, "email": email, "revoked_at_google": revoked,
+            "remaining": len(left)}
+
+
+def delete_everything(account_id: int) -> dict:
+    """Remove the customer and every trace of them."""
+    db = Session()
+    conns = db.query(Connection).filter_by(account_id=account_id).all()
+    for c in conns:
+        revoke_google(c.secret_blob)
+        db.delete(c)
+
+    for model in (Memory, Onboard, PhoneNumber):
+        for row in db.query(model).filter_by(account_id=account_id).all():
+            db.delete(row)
+
+    calls = db.query(Call).filter_by(account_id=account_id).all()
+    for call in calls:
+        for t in db.query(CallTurn).filter_by(call_id=call.id).all():
+            db.delete(t)
+        db.delete(call)
+
+    acct = db.query(Account).filter_by(id=account_id).first()
+    if acct:
+        db.delete(acct)
+    db.commit()
+    db.close()
+    return {"deleted": True, "mailboxes": len(conns), "calls": len(calls)}
+
+
 # ------------------------------------------------------- text brain (SMS)
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -941,6 +1030,18 @@ TEXT_TOOLS = [
             "title": {"type": "string"}, "start_iso": {"type": "string"},
             "minutes": {"type": "integer"}},
             "required": ["title", "start_iso"]}}},
+    {"type": "function", "function": {
+        "name": "disconnect_email",
+        "description": "Remove one connected mailbox and revoke it at Google.",
+        "parameters": {"type": "object", "properties": {
+            "mailbox": {"type": "string"}}, "required": []}}},
+    {"type": "function", "function": {
+        "name": "delete_my_account",
+        "description": ("Erase this person entirely. Only after they have "
+                        "typed the word DELETE."),
+        "parameters": {"type": "object", "properties": {
+            "confirmation": {"type": "string"}},
+            "required": ["confirmation"]}}},
     {"type": "function", "function": {
         "name": "list_mailboxes",
         "description": "Which email addresses this person has connected.",
@@ -996,6 +1097,11 @@ services — that comes first.
 Before sending an email or booking anything, state what you're about to do
 and wait for a yes.
 
+They can undo anything. "Disconnect my work email" -> disconnect_email.
+"Delete everything" -> explain that every mailbox, all history and their
+account go, that it can't be undone, and ask them to reply with the word
+DELETE. Only then call delete_my_account. Never ask why.
+
 If they have several mailboxes, ask which one they mean when it isn't
 obvious, and you can name them with name_mailbox if they'd like.
 
@@ -1023,6 +1129,12 @@ def _run_text_tool(account_id: int, name: str, args: dict):
             return tool_create_event(account_id, args["title"],
                                      args["start_iso"],
                                      args.get("minutes", 60))
+        if name == "disconnect_email":
+            return disconnect_mailbox(account_id, args.get("mailbox", ""))
+        if name == "delete_my_account":
+            if (args.get("confirmation") or "").strip().upper() != "DELETE":
+                return {"error": "they did not type DELETE — do nothing"}
+            return delete_everything(account_id)
         if name == "list_mailboxes":
             return {"mailboxes": list_mailboxes(account_id)}
         if name == "name_mailbox":
@@ -1220,11 +1332,28 @@ def mailbox_remove(request: Request, connection_id: int):
     require_auth(request)
     db = Session()
     row = db.query(Connection).filter_by(id=connection_id).first()
-    if row:
-        db.delete(row)
-        db.commit()
+    if not row:
+        db.close()
+        raise HTTPException(404, "Unknown mailbox.")
+    acct_id, email = row.account_id, row.email
     db.close()
-    return {"ok": True}
+    out = disconnect_mailbox(acct_id, email)
+    return out
+
+
+@app.post("/mailboxes/disconnect")
+def mailbox_disconnect(request: Request, account_id: int, which: str = ""):
+    require_auth(request)
+    return disconnect_mailbox(account_id, which)
+
+
+@app.delete("/account")
+def account_delete(request: Request, account_id: int, confirm: str = ""):
+    """Erase a customer completely. confirm must be the word DELETE."""
+    require_auth(request)
+    if confirm != "DELETE":
+        raise HTTPException(400, "Pass confirm=DELETE.")
+    return delete_everything(account_id)
 
 
 @app.get("/link/start")

@@ -157,6 +157,18 @@ CALENDAR
 - Today is {today}. Work out relative dates like "tomorrow" or "next Tuesday"
   yourself before calling a tool.
 
+DISCONNECTING AND DELETING
+The caller can undo anything they've set up.
+- "Disconnect my work email" -> confirm which one out loud, then
+  disconnect_email. Tell them access has been removed at Google's end too.
+- "Delete everything" / "remove me from the system" -> take it seriously.
+  Say plainly what goes: every connected mailbox, all their call history,
+  and their account, and that it cannot be undone. Ask them to say the word
+  DELETE to go ahead. Only then call delete_my_account. If they hesitate or
+  give any answer other than DELETE, do not do it.
+- Never talk them out of it and never ask why. If they want it gone, remove
+  it.
+
 MORE THAN ONE MAILBOX
 Some callers have several email addresses. list_mailboxes tells you which
 they have and which one they use most.
@@ -329,6 +341,57 @@ FINDING EMAIL
             return f"No address found for {name}. Ask the caller to spell it."
         return "; ".join(f"{m['name'] or m['email']} at {m['email']}"
                          for m in matches)
+
+    @function_tool
+    async def disconnect_email(self, context: RunContext, mailbox: str = ""):
+        """Remove one connected mailbox and revoke access at Google."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            async with httpx.AsyncClient(timeout=25) as c:
+                r = await c.post(f"{BACKEND}/mailboxes/disconnect",
+                                 headers=AUTH,
+                                 params={"account_id": self.account_id,
+                                         "which": mailbox})
+                d = r.json()
+        except Exception as e:
+            log.error(f"disconnect failed: {e}")
+            return "That didn't go through."
+        if d.get("removed"):
+            await log_turn(self.call_id, "tool",
+                           f"disconnected {d.get('email')}",
+                           "disconnect_email")
+            self.mailbox = ""
+            return (f"{d.get('email')} is disconnected and access revoked "
+                    f"at Google. They have {d.get('remaining', 0)} left.")
+        if d.get("mailboxes"):
+            return ("Ask which one: " + ", ".join(d["mailboxes"]))
+        return f"Nothing removed: {d.get('reason', 'unknown')}."
+
+    @function_tool
+    async def delete_my_account(self, context: RunContext,
+                                confirmation: str):
+        """Erase the caller entirely. Only call when they have said the word
+        DELETE out loud after you explained what is removed."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        if confirmation.strip().upper() != "DELETE":
+            return ("They did not say DELETE. Do not delete anything. "
+                    "Ask again or drop it.")
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.request("DELETE", f"{BACKEND}/account",
+                                    headers=AUTH,
+                                    params={"account_id": self.account_id,
+                                            "confirm": "DELETE"})
+                d = r.json()
+        except Exception as e:
+            log.error(f"account delete failed: {e}")
+            return "That didn't go through."
+        if d.get("deleted"):
+            return ("Everything is deleted. Tell them it's done, that their "
+                    "email access has been revoked, and say goodbye warmly.")
+        return "Nothing was deleted."
 
     @function_tool
     async def list_mailboxes(self, context: RunContext):
