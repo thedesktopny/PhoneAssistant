@@ -11,6 +11,7 @@ Env vars needed:
 """
 
 import os
+import asyncio
 import logging
 import httpx
 from datetime import datetime
@@ -21,6 +22,7 @@ from livekit.agents import (
     RunContext, function_tool, cli,
 )
 from livekit.plugins import openai, silero
+import time
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("phone-assistant")
@@ -33,10 +35,16 @@ server = AgentServer()
 # ------------------------------------------------------------------ backend
 
 async def backend_get(path: str, **params):
+    t0 = time.time()
     async with httpx.AsyncClient(timeout=20) as c:
         r = await c.get(f"{BACKEND}{path}", params=params)
         r.raise_for_status()
-        return r.json()
+        data = r.json()
+    backend_get.last_ms = int((time.time() - t0) * 1000)
+    return data
+
+
+backend_get.last_ms = 0
 
 
 async def backend_post(path: str, payload: dict):
@@ -44,6 +52,17 @@ async def backend_post(path: str, payload: dict):
         r = await c.post(f"{BACKEND}{path}", json=payload)
         r.raise_for_status()
         return r.json()
+
+
+async def log_turn(call_id, who, text="", tool="", latency_ms=0):
+    if not call_id:
+        return
+    try:
+        await backend_post("/calls/turn", {
+            "call_id": call_id, "who": who, "text": text[:4000],
+            "tool": tool, "latency_ms": int(latency_ms)})
+    except Exception as e:
+        log.warning(f"log_turn failed: {e}")
 
 
 async def find_account(caller_number: str):
@@ -60,8 +79,11 @@ async def find_account(caller_number: str):
 # ------------------------------------------------------------------ agent
 
 class Assistant(Agent):
-    def __init__(self, account: dict):
+    def __init__(self, account: dict, caller_number: str = "",
+                 call_id: int | None = None):
         self.account = account
+        self.call_id = call_id
+        self.caller_number = caller_number
         self.account_id = account["account_id"]
         self.verified = False
         self.last_list = []
@@ -126,6 +148,16 @@ CALENDAR
 - Today is {today}. Work out relative dates like "tomorrow" or "next Tuesday"
   yourself before calling a tool.
 
+TEXTING
+- You can text the caller. Use send_text for an address, a phone number, a
+  link, or anything long or fiddly. Say you are texting it rather than
+  reading out a long string.
+- If the caller's email isn't connected yet, use text_setup_link — it sends
+  them a link they tap on their phone to connect their email. Tell them to
+  tap it and call back when done.
+- Texts go to the number they are calling from unless they give another one.
+- The topic rules above apply to texts exactly as they do to speech.
+
 LOOKING THINGS UP
 - Use web_search for anything outside their email and calendar: a business's
   address, phone number or hours, how far somewhere is, a fact, a price,
@@ -176,6 +208,8 @@ FINDING EMAIL
             return "I couldn't reach the mailbox just now."
 
         self.last_list = data.get("messages", [])
+        await log_turn(self.call_id, "tool", "unread check",
+                       "check_email", backend_get.last_ms)
         lines = [f"{data.get('unread_count', 0)} unread."]
         for i, m in enumerate(self.last_list, 1):
             sender = m.get("from", "").split("<")[0].strip().strip('"')
@@ -222,6 +256,8 @@ FINDING EMAIL
             return (f"Nothing matched '{query}'. Tell the caller what you "
                     f"searched and try a broader wording once.")
         self.last_list = msgs
+        await log_turn(self.call_id, "tool", f"search: {query}",
+                       "search_email", backend_get.last_ms)
         lines = [f"{len(msgs)} found."]
         for i, m in enumerate(msgs, 1):
             sender = m.get("from", "").split("<")[0].strip().strip('"')
@@ -244,6 +280,41 @@ FINDING EMAIL
             return f"No address found for {name}. Ask the caller to spell it."
         return "; ".join(f"{m['name'] or m['email']} at {m['email']}"
                          for m in matches)
+
+    @function_tool
+    async def send_text(self, context: RunContext, message: str,
+                        to: str = ""):
+        """Text the caller something — an address, a number, a link. Leave
+        'to' blank to text the number they are calling from."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        target = to or self.caller_number
+        if not target:
+            return "No number to text. Ask the caller for one."
+        try:
+            data = await backend_post("/sms/send",
+                                      {"to": target, "message": message})
+        except Exception as e:
+            log.error(f"sms failed: {e}")
+            return "The text didn't go out."
+        return "Text sent." if data.get("sent") else "The text didn't go out."
+
+    @function_tool
+    async def text_setup_link(self, context: RunContext):
+        """Text the caller the link to connect their email account."""
+        try:
+            async with httpx.AsyncClient(timeout=20) as c:
+                r = await c.post(
+                    f"{BACKEND}/sms/link",
+                    params={"account_id": self.account_id,
+                            "to": self.caller_number or ""})
+                data = r.json()
+        except Exception as e:
+            log.error(f"link sms failed: {e}")
+            return "The link didn't go out."
+        if data.get("sent"):
+            return ("Link sent. Tell them to tap it, sign in, then call back.")
+        return "The link didn't go out."
 
     @function_tool
     async def web_search(self, context: RunContext, query: str,
@@ -280,6 +351,8 @@ FINDING EMAIL
         if not evs:
             return "Nothing scheduled in that window."
         self.last_events = evs
+        await log_turn(self.call_id, "tool", f"calendar {days}d",
+                       "check_calendar", backend_get.last_ms)
         lines = []
         for i, e in enumerate(evs, 1):
             when = e.get("start", "")
@@ -327,6 +400,8 @@ FINDING EMAIL
         except Exception as e:
             log.error(f"create event failed: {e}")
             return "That didn't get added."
+        await log_turn(self.call_id, "tool", f"booked: {title} {start_iso}",
+                       "create_event")
         return "Added to the calendar."
 
     @function_tool
@@ -344,6 +419,8 @@ FINDING EMAIL
         except Exception as e:
             log.error(f"send failed: {e}")
             return "The message did not go through."
+        await log_turn(self.call_id, "tool", f"emailed {to}: {subject}",
+                       "send_email")
         return "Sent."
 
 
@@ -359,6 +436,17 @@ async def entrypoint(ctx: JobContext):
 
     account = await find_account(caller)
 
+    call_id = None
+    try:
+        started = await backend_post("/calls/start", {
+            "account_id": account["account_id"] if account else None,
+            "from_number": caller,
+            "room": ctx.room.name,
+        })
+        call_id = started.get("call_id")
+    except Exception as e:
+        log.warning(f"could not open call record: {e}")
+
     session = AgentSession(
         llm=openai.realtime.RealtimeModel(voice="alloy"),
         vad=silero.VAD.load(),
@@ -372,7 +460,33 @@ async def entrypoint(ctx: JobContext):
                          "the office. Keep it to one sentence.")
         return
 
-    await session.start(room=ctx.room, agent=Assistant(account))
+    agent_obj = Assistant(account, caller, call_id)
+
+    @session.on("conversation_item_added")
+    def _on_item(ev):
+        try:
+            item = getattr(ev, "item", None)
+            role = getattr(item, "role", "")
+            text = getattr(item, "text_content", None) or ""
+            if text:
+                who = "caller" if role == "user" else "agent"
+                asyncio.create_task(log_turn(call_id, who, text))
+        except Exception:
+            pass
+
+    async def _close():
+        if call_id:
+            try:
+                async with httpx.AsyncClient(timeout=10) as c:
+                    await c.post(f"{BACKEND}/calls/end",
+                                 params={"call_id": call_id,
+                                         "verified": int(agent_obj.verified)})
+            except Exception:
+                pass
+
+    ctx.add_shutdown_callback(_close)
+
+    await session.start(room=ctx.room, agent=agent_obj)
     await session.generate_reply(
         instructions=f"Greet {account.get('name')} by name in one short "
                      f"sentence and ask for their PIN.")

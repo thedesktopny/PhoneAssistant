@@ -19,6 +19,8 @@ from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 
 import urllib.request
+import urllib.parse
+import base64 as _b64
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import RedirectResponse, HTMLResponse
 from pydantic import BaseModel
@@ -42,6 +44,14 @@ PUBLIC_URL = os.environ["PUBLIC_URL"].rstrip("/")   # e.g. https://xxx.up.railwa
 ENCRYPTION_KEY = os.environ["ENCRYPTION_KEY"]       # Fernet key, see setup notes
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
+
+# SMS — set SMS_PROVIDER to "twilio" or "bulkvs"
+SMS_PROVIDER = os.environ.get("SMS_PROVIDER", "").lower()
+SMS_FROM = os.environ.get("SMS_FROM", "")           # your sending number
+TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
+TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
+BULKVS_USER = os.environ.get("BULKVS_API_USER", "")
+BULKVS_PASS = os.environ.get("BULKVS_API_PASSWORD", "")
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
@@ -82,6 +92,29 @@ class Connection(Base):
     email = Column(String(200))
     secret_blob = Column(Text)                        # encrypted token json
     linked_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Call(Base):
+    __tablename__ = "calls"
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"), nullable=True)
+    from_number = Column(String(20))
+    started_at = Column(DateTime, default=datetime.utcnow)
+    ended_at = Column(DateTime, nullable=True)
+    duration_sec = Column(Integer, default=0)
+    verified = Column(Integer, default=0)
+    room = Column(String(120))
+
+
+class CallTurn(Base):
+    __tablename__ = "call_turns"
+    id = Column(Integer, primary_key=True)
+    call_id = Column(Integer, ForeignKey("calls.id"))
+    at = Column(DateTime, default=datetime.utcnow)
+    who = Column(String(20))          # caller / agent / tool
+    text = Column(Text)
+    tool = Column(String(60), default="")
+    latency_ms = Column(Integer, default=0)
 
 
 Base.metadata.create_all(engine)
@@ -477,6 +510,67 @@ def tool_web_search(query: str, near: str = "") -> dict:
     return out
 
 
+
+def _digits_e164(number: str) -> str:
+    d = "".join(ch for ch in (number or "") if ch.isdigit())
+    if len(d) == 10:
+        d = "1" + d
+    return "+" + d
+
+
+def tool_send_sms(to: str, message: str) -> dict:
+    """Send a text message. Provider set by SMS_PROVIDER."""
+    to = _digits_e164(to)
+    if not SMS_PROVIDER or not SMS_FROM:
+        return {"sent": False, "error": "SMS isn't configured."}
+
+    try:
+        if SMS_PROVIDER == "twilio":
+            body = urllib.parse.urlencode({
+                "To": to, "From": _digits_e164(SMS_FROM), "Body": message[:1500],
+            }).encode()
+            auth = _b64.b64encode(
+                f"{TWILIO_SID}:{TWILIO_TOKEN}".encode()).decode()
+            req = urllib.request.Request(
+                f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_SID}"
+                f"/Messages.json",
+                data=body,
+                headers={"Authorization": f"Basic {auth}",
+                         "Content-Type": "application/x-www-form-urlencoded"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                d = json.loads(r.read().decode())
+            return {"sent": True, "id": d.get("sid")}
+
+        if SMS_PROVIDER == "bulkvs":
+            payload = json.dumps({
+                "From": _digits_e164(SMS_FROM).lstrip("+"),
+                "To": [to.lstrip("+")],
+                "Message": message[:1500],
+            }).encode()
+            auth = _b64.b64encode(
+                f"{BULKVS_USER}:{BULKVS_PASS}".encode()).decode()
+            req = urllib.request.Request(
+                "https://portal.bulkvs.com/api/v1.0/messageSend",
+                data=payload,
+                headers={"Authorization": f"Basic {auth}",
+                         "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                d = json.loads(r.read().decode())
+            return {"sent": True, "raw": str(d)[:200]}
+
+        return {"sent": False, "error": f"Unknown provider {SMS_PROVIDER}"}
+    except Exception as e:
+        return {"sent": False, "error": str(e)[:200]}
+
+
+def tool_text_link(account_id: int, to: str) -> dict:
+    """Text the customer their personal Gmail-linking link."""
+    url = f"{PUBLIC_URL}/link/start?account_id={account_id}"
+    msg = ("Tap this link to connect your email to your phone assistant. "
+           "It only takes a moment: " + url)
+    return tool_send_sms(to, msg)
+
+
 # ----------------------------------------------------------------- api
 
 app = FastAPI(title="Phone Assistant")
@@ -597,6 +691,111 @@ def test_contact(account_id: int, name: str):
     return tool_find_contact(account_id, name)
 
 
+class CallStart(BaseModel):
+    account_id: int | None = None
+    from_number: str = ""
+    room: str = ""
+
+
+@app.post("/calls/start")
+def call_start(c: CallStart):
+    db = Session()
+    row = Call(account_id=c.account_id, from_number=c.from_number,
+               room=c.room)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    out = {"call_id": row.id}
+    db.close()
+    return out
+
+
+class TurnBody(BaseModel):
+    call_id: int
+    who: str
+    text: str = ""
+    tool: str = ""
+    latency_ms: int = 0
+
+
+@app.post("/calls/turn")
+def call_turn(t: TurnBody):
+    db = Session()
+    db.add(CallTurn(call_id=t.call_id, who=t.who, text=t.text[:4000],
+                    tool=t.tool, latency_ms=t.latency_ms))
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
+@app.post("/calls/end")
+def call_end(call_id: int, verified: int = 0):
+    db = Session()
+    row = db.query(Call).filter_by(id=call_id).first()
+    if row:
+        row.ended_at = datetime.utcnow()
+        row.duration_sec = int(
+            (row.ended_at - row.started_at).total_seconds())
+        row.verified = verified
+        db.commit()
+    db.close()
+    return {"ok": True}
+
+
+@app.get("/calls")
+def calls_list(limit: int = 50):
+    db = Session()
+    rows = (db.query(Call).order_by(Call.id.desc()).limit(limit).all())
+    names = {a.id: a.name for a in db.query(Account).all()}
+    out = [{
+        "call_id": r.id,
+        "who": names.get(r.account_id) or "unknown",
+        "from": r.from_number,
+        "started": r.started_at.strftime("%b %-d %-I:%M %p")
+                   if r.started_at else "",
+        "seconds": r.duration_sec,
+        "verified": bool(r.verified),
+    } for r in rows]
+    db.close()
+    return out
+
+
+@app.get("/calls/{call_id}")
+def call_detail(call_id: int):
+    db = Session()
+    turns = (db.query(CallTurn).filter_by(call_id=call_id)
+               .order_by(CallTurn.id).all())
+    out = [{"who": t.who, "text": t.text, "tool": t.tool,
+            "latency_ms": t.latency_ms,
+            "at": t.at.strftime("%-I:%M:%S %p") if t.at else ""}
+           for t in turns]
+    db.close()
+    return out
+
+
+class SmsBody(BaseModel):
+    to: str
+    message: str
+
+
+@app.post("/sms/send")
+def sms_send(s: SmsBody):
+    return tool_send_sms(s.to, s.message)
+
+
+@app.post("/sms/link")
+def sms_link(account_id: int, to: str = ""):
+    """Text a customer their linking link. Uses their stored number if blank."""
+    if not to:
+        db = Session()
+        row = db.query(PhoneNumber).filter_by(account_id=account_id).first()
+        db.close()
+        if not row:
+            raise HTTPException(400, "No phone number on file.")
+        to = row.number
+    return tool_text_link(account_id, to)
+
+
 @app.get("/web/search")
 def web_search(q: str, near: str = ""):
     return tool_web_search(q, near)
@@ -686,6 +885,16 @@ ADMIN_HTML = """<!doctype html>
 </div>
 
 <div class="card">
+  <b>Recent calls</b>
+  <table><thead><tr><th>#</th><th>Who</th><th>From</th><th>When</th>
+  <th>Length</th><th>PIN</th><th></th></tr></thead>
+  <tbody id="calls"></tbody></table>
+  <pre id="tx" style="white-space:pre-wrap;background:#0f1115;padding:12px;
+    border-radius:6px;margin-top:12px;display:none;font-size:13px;
+    max-height:400px;overflow:auto"></pre>
+</div>
+
+<div class="card">
   <b>Customers</b>
   <table><thead><tr><th>ID</th><th>Name</th><th>Phone</th>
   <th>Gmail</th><th></th></tr></thead><tbody id="rows"></tbody></table>
@@ -704,7 +913,9 @@ async function load(){
      <td><a class="btn" target="_blank"
         href="/link/start?account_id=${a.account_id}">Link Gmail</a>
       <button class="sec" style="margin:0 0 0 6px;padding:6px 12px"
-        onclick="copyLink(${a.account_id})">Copy link</button></td></tr>`
+        onclick="copyLink(${a.account_id})">Copy link</button>
+      <button class="sec" style="margin:0 0 0 6px;padding:6px 12px"
+        onclick="textLink(${a.account_id})">Text link</button></td></tr>`
   ).join('') || '<tr><td colspan=5 style="color:#8b94a7">None yet.</td></tr>';
 }
 function copyLink(id){
@@ -712,6 +923,14 @@ function copyLink(id){
   navigator.clipboard.writeText(url);
   document.getElementById('msg').textContent =
     'Link copied — text it to the customer: ' + url;
+}
+async function textLink(id){
+  const m = document.getElementById('msg');
+  m.textContent = 'Sending...';
+  const r = await fetch('/sms/link?account_id=' + id, {method:'POST'});
+  const d = await r.json().catch(()=>({}));
+  m.textContent = d.sent ? 'Text sent.'
+                         : ('Not sent: ' + (d.error || 'check SMS settings'));
 }
 async function add(){
   const body = {name:document.getElementById('n').value,
@@ -725,7 +944,29 @@ async function add(){
             document.getElementById('p').value=''; load(); }
   else { m.textContent='Failed — that phone number may already exist.'; }
 }
-load();
+async function loadCalls(){
+  const r = await fetch('/calls?limit=25');
+  const d = await r.json();
+  document.getElementById('calls').innerHTML = d.map(c =>
+    `<tr><td>${c.call_id}</td><td>${c.who}</td><td>${c['from']||''}</td>
+     <td>${c.started}</td><td>${c.seconds}s</td>
+     <td>${c.verified?'<span class=ok>ok</span>':'<span class=no>no</span>'}</td>
+     <td><button class="sec" style="margin:0;padding:6px 12px"
+        onclick="showTx(${c.call_id})">Transcript</button></td></tr>`
+  ).join('') || '<tr><td colspan=7 style="color:#8b94a7">No calls yet.</td></tr>';
+}
+async function showTx(id){
+  const r = await fetch('/calls/' + id);
+  const d = await r.json();
+  const el = document.getElementById('tx');
+  el.style.display = 'block';
+  el.textContent = d.length
+    ? d.map(t => `[${t.at}] ${t.who}${t.tool?' ('+t.tool+')':''}` +
+        `${t.latency_ms?' '+t.latency_ms+'ms':''}: ${t.text}`).join('\n')
+    : 'No turns recorded for this call.';
+}
+load(); loadCalls();
+setInterval(loadCalls, 15000);
 </script></body></html>"""
 
 
