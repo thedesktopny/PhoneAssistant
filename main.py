@@ -923,6 +923,32 @@ def test_contact(request: Request, account_id: int, name: str):
     return tool_find_contact(account_id, name)
 
 
+@app.get("/sms/status")
+def sms_status(request: Request, message_id: str):
+    """Ask Telnyx what actually happened to a message."""
+    require_auth(request)
+    if SMS_PROVIDER != "telnyx" or not TELNYX_API_KEY:
+        return {"error": "Only available for Telnyx."}
+    req = urllib.request.Request(
+        f"https://api.telnyx.com/v2/messages/{message_id}",
+        headers={"Authorization": f"Bearer {TELNYX_API_KEY}"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            d = json.loads(r.read().decode()).get("data", {})
+    except urllib.error.HTTPError as e:
+        return {"error": f"HTTP {e.code}",
+                "detail": e.read().decode()[:400]}
+    tos = d.get("to") or []
+    return {
+        "id": d.get("id"),
+        "status": tos[0].get("status") if tos else d.get("type"),
+        "carrier": tos[0].get("carrier") if tos else "",
+        "errors": d.get("errors", []),
+        "sent_at": d.get("sent_at"),
+        "completed_at": d.get("completed_at"),
+    }
+
+
 @app.post("/sms/dlr")
 async def sms_dlr(request: Request):
     """Delivery receipt webhook. Records whatever the carrier reports."""
