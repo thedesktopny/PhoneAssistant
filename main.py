@@ -763,38 +763,78 @@ def _run_signin(sid: int, account_id: int, email: str):
 
     ws = (f"wss://connect.browserbase.com?apiKey={BROWSERBASE_API_KEY}"
           f"&projectId={BROWSERBASE_PROJECT_ID}")
+
+    EMAIL_SEL = ('input[type="email"], input#identifierId, '
+                 'input[name="identifier"]')
+    PW_SEL = ('input[type="password"], input[name="Passwd"], '
+              'input[name="password"]')
+    CODE_SEL = ('input[type="tel"], input[name="totpPin"], input#idvPin, '
+                'input[name="Pin"], input[autocomplete="one-time-code"]')
+
+    def where(page):
+        try:
+            body = (page.inner_text("body") or "")[:300].replace("\n", " ")
+            return f"url={page.url[:120]} | screen: {body}"
+        except Exception:
+            return f"url={page.url[:120]}"
+
+    page = None
+    browser = None
     try:
         with sync_playwright() as p:
             browser = p.chromium.connect_over_cdp(ws)
             ctx = browser.contexts[0] if browser.contexts \
                 else browser.new_context()
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            page.set_default_timeout(45000)
 
             _ob_set(sid, "signing_in", "Opening Google.")
             page.goto(f"{PUBLIC_URL}/link/start?account_id={account_id}",
                       wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(4000)
 
-            page.fill('input[type="email"]', email, timeout=30000)
+            # Google sometimes shows an account chooser first
+            try:
+                other = page.query_selector('text=/Use another account/i')
+                if other:
+                    other.click()
+                    page.wait_for_timeout(2500)
+            except Exception:
+                pass
+
+            try:
+                page.wait_for_selector(EMAIL_SEL, timeout=30000)
+            except Exception:
+                _ob_set(sid, "failed",
+                        "No email box. " + where(page))
+                browser.close()
+                return
+
+            page.fill(EMAIL_SEL, email)
             page.keyboard.press("Enter")
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(4000)
 
-            page.fill('input[type="password"]', password, timeout=30000)
+            try:
+                page.wait_for_selector(PW_SEL, timeout=30000)
+            except Exception:
+                _ob_set(sid, "failed", "No password box. " + where(page))
+                browser.close()
+                return
+
+            page.fill(PW_SEL, password)
             page.keyboard.press("Enter")
-            page.wait_for_timeout(5000)
+            page.wait_for_timeout(6000)
 
-            # Wrong password?
-            if page.query_selector('text=/Wrong password|incorrect/i'):
+            if page.query_selector('text=/Wrong password|incorrect|try again/i'):
                 _ob_set(sid, "failed", "Google says the password is wrong.")
                 browser.close()
                 return
 
-            # Two-step verification
-            if page.query_selector('input[type="tel"], '
-                                   'input[name="totpPin"], '
-                                   'input[id="idvPin"]'):
+            if page.query_selector(CODE_SEL):
                 _ob_set(sid, "needs_code",
-                        "Google sent a code. Ask the customer to read it out.")
+                        "Google sent a code. Ask them to read it out.")
                 waited = 0
+                got = False
                 while waited < 180:
                     time.sleep(3)
                     waited += 3
@@ -802,53 +842,62 @@ def _run_signin(sid: int, account_id: int, email: str):
                     if code:
                         _PENDING[sid]["code"] = None
                         try:
-                            page.fill('input[type="tel"], input[name="totpPin"],'
-                                      ' input[id="idvPin"]', code, timeout=8000)
+                            page.fill(CODE_SEL, code, timeout=10000)
                             page.keyboard.press("Enter")
-                            page.wait_for_timeout(5000)
+                            page.wait_for_timeout(6000)
+                            got = True
                         except Exception:
                             pass
                         break
-                else:
+                if not got:
                     _ob_set(sid, "failed", "Timed out waiting for the code.")
                     browser.close()
                     return
 
             _ob_set(sid, "consenting", "Approving access.")
-            for _ in range(6):
+            for _ in range(8):
                 page.wait_for_timeout(2500)
                 if "/link/callback" in page.url or "Linked" in page.content():
                     break
-                btn = (page.query_selector('button:has-text("Continue")')
-                       or page.query_selector('button:has-text("Allow")')
-                       or page.query_selector('text=/Go to .* \\(unsafe\\)/'))
-                if btn:
+                for sel in ('text=/^Advanced$/',
+                            'text=/Go to .*unsafe/i',
+                            'button:has-text("Continue")',
+                            'button:has-text("Allow")',
+                            'span:has-text("Continue")',
+                            'div[role="button"]:has-text("Continue")'):
                     try:
-                        btn.click()
-                    except Exception:
-                        pass
-                adv = page.query_selector('text=/^Advanced$/')
-                if adv:
-                    try:
-                        adv.click()
+                        el = page.query_selector(sel)
+                        if el:
+                            el.click()
+                            page.wait_for_timeout(2000)
                     except Exception:
                         pass
 
             db = Session()
             linked = (db.query(Connection)
                         .filter_by(account_id=account_id, provider="google")
-                        .first())
+                        .order_by(Connection.id.desc()).first())
             db.close()
+            final = where(page)
             browser.close()
 
             if linked:
                 _ob_set(sid, "done", f"Connected {linked.email or email}.")
             else:
-                _ob_set(sid, "failed",
-                        "Google didn't complete the sign-in. "
-                        "Try again or use the link method.")
+                _ob_set(sid, "failed", "Consent not completed. " + final)
     except Exception as e:
-        _ob_set(sid, "failed", f"Browser error: {str(e)[:200]}")
+        detail = ""
+        try:
+            if page:
+                detail = " " + where(page)
+        except Exception:
+            pass
+        _ob_set(sid, "failed", f"Browser error: {str(e)[:150]}{detail}")
+        try:
+            if browser:
+                browser.close()
+        except Exception:
+            pass
     finally:
         _PENDING.pop(sid, None)      # password gone from memory
 
