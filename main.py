@@ -18,11 +18,12 @@ import json
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 
+import time
 import urllib.request
 import urllib.parse
 import urllib.error
 import base64 as _b64
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import (RedirectResponse, HTMLResponse,
                                JSONResponse)
 from pydantic import BaseModel
@@ -56,6 +57,9 @@ BULKVS_USER = os.environ.get("BULKVS_API_USER", "")
 BULKVS_PASS = os.environ.get("BULKVS_API_PASSWORD", "")
 TELNYX_API_KEY = os.environ.get("TELNYX_API_KEY", "")
 TELNYX_PROFILE_ID = os.environ.get("TELNYX_MESSAGING_PROFILE_ID", "")
+
+BROWSERBASE_API_KEY = os.environ.get("BROWSERBASE_API_KEY", "")
+BROWSERBASE_PROJECT_ID = os.environ.get("BROWSERBASE_PROJECT_ID", "")
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
@@ -141,6 +145,17 @@ class Dlr(Base):
     to_number = Column(String(20), default="")
     status = Column(String(40), default="")
     raw = Column(Text, default="")
+
+
+class Onboard(Base):
+    """One assisted Gmail sign-in. The password is never stored here."""
+    __tablename__ = "onboard"
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"))
+    email = Column(String(200), default="")
+    state = Column(String(30), default="starting")
+    message = Column(Text, default="")
+    at = Column(DateTime, default=datetime.utcnow)
 
 
 Base.metadata.create_all(engine)
@@ -649,6 +664,126 @@ def account_for_number(number: str):
     db.close()
     return None
 
+
+
+
+# --------------------------------------------------- assisted Gmail sign-in
+# The customer's Google password lives in memory for the length of one
+# sign-in and is never written to the database or logged.
+
+_PENDING = {}          # session_id -> {"password": str, "code": str|None}
+
+
+def _ob_set(sid: int, state: str, message: str = ""):
+    db = Session()
+    row = db.query(Onboard).filter_by(id=sid).first()
+    if row:
+        row.state = state
+        row.message = message[:500]
+        db.commit()
+    db.close()
+
+
+def _run_signin(sid: int, account_id: int, email: str):
+    """Drive a hosted browser through Google sign-in and consent."""
+    from playwright.sync_api import sync_playwright
+
+    creds = _PENDING.get(sid) or {}
+    password = creds.get("password", "")
+    if not password:
+        _ob_set(sid, "failed", "No password supplied.")
+        return
+
+    ws = (f"wss://connect.browserbase.com?apiKey={BROWSERBASE_API_KEY}"
+          f"&projectId={BROWSERBASE_PROJECT_ID}")
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(ws)
+            ctx = browser.contexts[0] if browser.contexts \
+                else browser.new_context()
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+
+            _ob_set(sid, "signing_in", "Opening Google.")
+            page.goto(f"{PUBLIC_URL}/link/start?account_id={account_id}",
+                      wait_until="domcontentloaded", timeout=60000)
+
+            page.fill('input[type="email"]', email, timeout=30000)
+            page.keyboard.press("Enter")
+            page.wait_for_timeout(3000)
+
+            page.fill('input[type="password"]', password, timeout=30000)
+            page.keyboard.press("Enter")
+            page.wait_for_timeout(5000)
+
+            # Wrong password?
+            if page.query_selector('text=/Wrong password|incorrect/i'):
+                _ob_set(sid, "failed", "Google says the password is wrong.")
+                browser.close()
+                return
+
+            # Two-step verification
+            if page.query_selector('input[type="tel"], '
+                                   'input[name="totpPin"], '
+                                   'input[id="idvPin"]'):
+                _ob_set(sid, "needs_code",
+                        "Google sent a code. Ask the customer to read it out.")
+                waited = 0
+                while waited < 180:
+                    time.sleep(3)
+                    waited += 3
+                    code = (_PENDING.get(sid) or {}).get("code")
+                    if code:
+                        _PENDING[sid]["code"] = None
+                        try:
+                            page.fill('input[type="tel"], input[name="totpPin"],'
+                                      ' input[id="idvPin"]', code, timeout=8000)
+                            page.keyboard.press("Enter")
+                            page.wait_for_timeout(5000)
+                        except Exception:
+                            pass
+                        break
+                else:
+                    _ob_set(sid, "failed", "Timed out waiting for the code.")
+                    browser.close()
+                    return
+
+            _ob_set(sid, "consenting", "Approving access.")
+            for _ in range(6):
+                page.wait_for_timeout(2500)
+                if "/link/callback" in page.url or "Linked" in page.content():
+                    break
+                btn = (page.query_selector('button:has-text("Continue")')
+                       or page.query_selector('button:has-text("Allow")')
+                       or page.query_selector('text=/Go to .* \\(unsafe\\)/'))
+                if btn:
+                    try:
+                        btn.click()
+                    except Exception:
+                        pass
+                adv = page.query_selector('text=/^Advanced$/')
+                if adv:
+                    try:
+                        adv.click()
+                    except Exception:
+                        pass
+
+            db = Session()
+            linked = (db.query(Connection)
+                        .filter_by(account_id=account_id, provider="google")
+                        .first())
+            db.close()
+            browser.close()
+
+            if linked:
+                _ob_set(sid, "done", f"Connected {linked.email or email}.")
+            else:
+                _ob_set(sid, "failed",
+                        "Google didn't complete the sign-in. "
+                        "Try again or use the link method.")
+    except Exception as e:
+        _ob_set(sid, "failed", f"Browser error: {str(e)[:200]}")
+    finally:
+        _PENDING.pop(sid, None)      # password gone from memory
 
 
 # ------------------------------------------------------- text brain (SMS)
@@ -1425,6 +1560,26 @@ ADMIN_HTML = """<!doctype html>
 </div>
 
 <div class="card">
+  <b>Connect a customer's Gmail for them</b>
+  <div style="color:#8b94a7;font-size:13px;margin-top:6px">
+    For customers with no internet. Take their email and password on the
+    phone, type them here. The password is used once and never saved.
+  </div>
+  <label>Customer ID</label><input id="ob_id" placeholder="2">
+  <label>Their Gmail address</label>
+  <input id="ob_email" placeholder="name@gmail.com">
+  <label>Their Google password</label>
+  <input id="ob_pw" type="password">
+  <button onclick="obStart()">Start sign-in</button>
+  <div class="msg" id="ob_msg"></div>
+  <div id="ob_code" style="display:none;margin-top:12px">
+    <label>Google sent them a code &mdash; type it here</label>
+    <input id="ob_codeval" placeholder="123456">
+    <button onclick="obCode()">Submit code</button>
+  </div>
+</div>
+
+<div class="card">
   <b>Customers</b>
   <table><thead><tr><th>ID</th><th>Name</th><th>Phone</th>
   <th>Gmail</th><th></th></tr></thead>
@@ -1542,6 +1697,48 @@ async function textLink(id){
   }catch(e){ m.textContent = 'Not sent: ' + e.message; }
 }
 
+var obSid = null, obTimer = null;
+async function obStart(){
+  const m = document.getElementById('ob_msg');
+  m.textContent = 'Starting…';
+  document.getElementById('ob_code').style.display = 'none';
+  try{
+    const r = await fetch('/onboard/start', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        account_id: parseInt(document.getElementById('ob_id').value),
+        email: document.getElementById('ob_email').value,
+        password: document.getElementById('ob_pw').value})});
+    const d = await r.json();
+    if(!r.ok){ m.textContent = d.detail || 'Could not start.'; return; }
+    obSid = d.session_id;
+    document.getElementById('ob_pw').value = '';
+    if(obTimer) clearInterval(obTimer);
+    obTimer = setInterval(obPoll, 3000);
+    obPoll();
+  }catch(e){ m.textContent = 'Error: ' + e.message; }
+}
+async function obPoll(){
+  if(!obSid) return;
+  try{
+    const d = await (await fetch('/onboard/status?session_id='+obSid)).json();
+    document.getElementById('ob_msg').textContent =
+      d.state + (d.message ? ' — ' + d.message : '');
+    document.getElementById('ob_code').style.display =
+      (d.state === 'needs_code') ? 'block' : 'none';
+    if(d.state === 'done' || d.state === 'failed'){
+      clearInterval(obTimer); obTimer = null; load();
+    }
+  }catch(e){}
+}
+async function obCode(){
+  await fetch('/onboard/code', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({session_id: obSid,
+      code: document.getElementById('ob_codeval').value})});
+  document.getElementById('ob_codeval').value = '';
+  document.getElementById('ob_msg').textContent = 'Code submitted…';
+}
 async function add(){
   const body = {name:document.getElementById('n').value,
                 phone:document.getElementById('p').value,
@@ -1640,3 +1837,57 @@ def admin(request: Request):
                             headers={"Cache-Control": "no-store, max-age=0"})
     return HTMLResponse(ADMIN_HTML,
                         headers={"Cache-Control": "no-store, max-age=0"})
+
+
+class OnboardStart(BaseModel):
+    account_id: int
+    email: str
+    password: str
+
+
+@app.post("/onboard/start")
+def onboard_start(b: OnboardStart, request: Request,
+                  background: BackgroundTasks):
+    require_auth(request)
+    if not BROWSERBASE_API_KEY:
+        raise HTTPException(400, "Browserbase isn't configured.")
+
+    db = Session()
+    row = Onboard(account_id=b.account_id, email=b.email, state="starting")
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    sid = row.id
+    db.close()
+
+    _PENDING[sid] = {"password": b.password, "code": None}
+    background.add_task(_run_signin, sid, b.account_id, b.email)
+    return {"session_id": sid, "state": "starting"}
+
+
+class OnboardCode(BaseModel):
+    session_id: int
+    code: str
+
+
+@app.post("/onboard/code")
+def onboard_code(b: OnboardCode, request: Request):
+    require_auth(request)
+    if b.session_id in _PENDING:
+        _PENDING[b.session_id]["code"] = b.code.strip()
+        return {"ok": True}
+    raise HTTPException(400, "That sign-in is no longer running.")
+
+
+@app.get("/onboard/status")
+def onboard_status(request: Request, session_id: int):
+    require_auth(request)
+    db = Session()
+    row = db.query(Onboard).filter_by(id=session_id).first()
+    db.close()
+    if not row:
+        raise HTTPException(404, "Unknown session.")
+    return {"session_id": row.id, "state": row.state,
+            "message": row.message, "email": row.email}
+
+
