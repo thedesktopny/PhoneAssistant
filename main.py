@@ -252,12 +252,20 @@ def _ensure_columns():
             ("history", "TEXT DEFAULT ''"),
         ],
     }
-    with engine.begin() as c:
-        for table, cols in wanted.items():
-            for name, decl in cols:
-                try:
+    # Each ALTER gets its own transaction: in Postgres one failure aborts
+    # the whole transaction, so batching them means later ones never run.
+    for table, cols in wanted.items():
+        for name, decl in cols:
+            try:
+                with engine.begin() as c:
                     c.execute(_sql(
-                        f"ALTER TABLE {table} ADD COLUMN {name} {decl}"))
+                        f"ALTER TABLE {table} "
+                        f"ADD COLUMN IF NOT EXISTS {name} {decl}"))
+            except Exception:
+                try:
+                    with engine.begin() as c:      # SQLite has no IF NOT EXISTS
+                        c.execute(_sql(
+                            f"ALTER TABLE {table} ADD COLUMN {name} {decl}"))
                 except Exception:
                     pass          # already there
 
