@@ -69,6 +69,11 @@ TELNYX_PROFILE_ID = os.environ.get("TELNYX_MESSAGING_PROFILE_ID", "")
 
 BROWSERBASE_API_KEY = os.environ.get("BROWSERBASE_API_KEY", "")
 BROWSERBASE_PROJECT_ID = os.environ.get("BROWSERBASE_PROJECT_ID", "")
+# Browsers must look like they're in the customer's own country/state, or
+# Google and the banks flag every sign-in as suspicious.
+PROXY_COUNTRY = os.environ.get("PROXY_COUNTRY", "US")
+PROXY_STATE = os.environ.get("PROXY_STATE", "NY")
+PROXY_CITY = os.environ.get("PROXY_CITY", "")
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
@@ -997,6 +1002,172 @@ def account_for_number(number: str):
 
 
 
+
+
+_LAST_PROXY_FLAG = {"at": None}
+
+
+def _flag_proxy_fallback(reason: str):
+    """Loud: browsers are running outside the US until this is fixed."""
+    msg = (f"BROWSERS ARE NOT ON A US PROXY. Sign-ins will look foreign to "
+           f"Google and may be blocked. Reason: {reason}")
+    emit("browser", "PROXY FALLBACK", msg, "error")
+    now = datetime.utcnow()
+    last = _LAST_PROXY_FLAG.get("at")
+    if last and (now - last).total_seconds() < 1800:
+        return                      # don't spam the to-do list
+    _LAST_PROXY_FLAG["at"] = now
+    try:
+        db = Session()
+        db.add(Followup(reason="proxy_fallback", note=msg, channel="system"))
+        db.commit()
+        db.close()
+    except Exception:
+        pass
+
+
+def _bb_session(context_id: str = "") -> str:
+    """Create a Browserbase session pinned to a US residential proxy.
+    Returns the session id, or "" to fall back to a plain connection."""
+    if not BROWSERBASE_API_KEY:
+        return ""
+    geo = {"country": PROXY_COUNTRY}
+    if PROXY_STATE:
+        geo["state"] = PROXY_STATE
+    if PROXY_CITY:
+        geo["city"] = PROXY_CITY
+    body = {
+        "projectId": BROWSERBASE_PROJECT_ID,
+        "proxies": [{"type": "browserbase", "geolocation": geo}],
+    }
+    if context_id:
+        body["browserSettings"] = {"context": {"id": context_id,
+                                               "persist": True}}
+    try:
+        req = urllib.request.Request(
+            "https://api.browserbase.com/v1/sessions",
+            data=json.dumps(body).encode(),
+            headers={"X-BB-API-Key": BROWSERBASE_API_KEY,
+                     "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=25) as r:
+            return json.loads(r.read().decode()).get("id", "")
+    except Exception as e:
+        _flag_proxy_fallback(str(e)[:300])
+        return ""
+
+
+def _bb_connect_url(context_id: str = "") -> str:
+    """Prefer a geo-pinned session; fall back to a direct connection."""
+    sid = _bb_session(context_id)
+    if sid:
+        return (f"wss://connect.browserbase.com?apiKey={BROWSERBASE_API_KEY}"
+                f"&sessionId={sid}")
+    url = (f"wss://connect.browserbase.com?apiKey={BROWSERBASE_API_KEY}"
+           f"&projectId={BROWSERBASE_PROJECT_ID}")
+    if context_id:
+        url += f"&contextId={context_id}&persist=true"
+    return url
+
+
+# ---------------------------------------------------- safe page operations
+# Pages navigate under us constantly (Google, checkout flows). Every read of
+# a live page goes through these so a navigation is a retry, not a crash.
+
+def _is_nav_error(e) -> bool:
+    t = str(e).lower()
+    return ("context was destroyed" in t or "navigation" in t
+            or "target closed" in t or "frame was detached" in t)
+
+
+def settle(page, ms: int = 1200):
+    """Let any in-flight navigation finish."""
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=15000)
+    except Exception:
+        pass
+    try:
+        page.wait_for_timeout(ms)
+    except Exception:
+        pass
+
+
+def q(page, selector):
+    """query_selector that survives a navigation mid-check."""
+    for _ in range(3):
+        try:
+            return page.query_selector(selector)
+        except Exception as e:
+            if _is_nav_error(e):
+                settle(page)
+                continue
+            return None
+    return None
+
+
+def q_all(page, selector):
+    for _ in range(3):
+        try:
+            return page.query_selector_all(selector)
+        except Exception as e:
+            if _is_nav_error(e):
+                settle(page)
+                continue
+            return []
+    return []
+
+
+def page_text(page, limit: int = 4000) -> str:
+    for _ in range(3):
+        try:
+            return " ".join((page.inner_text("body") or "").split())[:limit]
+        except Exception as e:
+            if _is_nav_error(e):
+                settle(page)
+                continue
+            return ""
+    return ""
+
+
+def page_url(page) -> str:
+    try:
+        return page.url
+    except Exception:
+        return ""
+
+
+def do_click(page, el, wait_ms: int = 3500) -> bool:
+    try:
+        el.click()
+    except Exception as e:
+        if not _is_nav_error(e):
+            return False
+    settle(page, wait_ms)
+    return True
+
+
+def do_fill(page, el, value: str, press_enter: bool = False,
+            wait_ms: int = 3500) -> bool:
+    try:
+        el.fill(value)
+        if press_enter:
+            page.keyboard.press("Enter")
+    except Exception as e:
+        if not _is_nav_error(e):
+            return False
+    settle(page, wait_ms)
+    return True
+
+
+def do_goto(page, url: str, wait_ms: int = 3500) -> bool:
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    except Exception as e:
+        if not _is_nav_error(e):
+            return False
+    settle(page, wait_ms)
+    return True
+
+
 # --------------------------------------------------- assisted Gmail sign-in
 # The customer's Google password lives in memory for the length of one
 # sign-in and is never written to the database or logged.
@@ -1030,8 +1201,7 @@ def _run_signin(sid: int, account_id: int, email: str):
         _ob_set(sid, "failed", "No password supplied.")
         return
 
-    ws = (f"wss://connect.browserbase.com?apiKey={BROWSERBASE_API_KEY}"
-          f"&projectId={BROWSERBASE_PROJECT_ID}")
+    ws = _bb_connect_url()
 
     EMAIL_SEL = ('input[type="email"], input#identifierId, '
                  'input[name="identifier"]')
@@ -1043,18 +1213,14 @@ def _run_signin(sid: int, account_id: int, email: str):
                 'input[aria-label*="code" i]')
 
     def screen(page):
-        try:
-            return (page.inner_text("body") or "").replace("\n", " ")
-        except Exception:
-            return ""
+        return page_text(page, 6000)
 
     def where(page):
-        return f"url={page.url[:110]} | screen: {screen(page)[:260]}"
+        return f"url={page_url(page)[:110]} | screen: {screen(page)[:260]}"
 
     def wants_tap(page):
-        return page.query_selector(
-            'text=/Check your device|Tap Yes on the notification|'
-            'Open the Gmail app|notification to your/i')
+        return q(page, 'text=/Check your device|Tap Yes on the notification|'
+                       'Open the Gmail app|notification to your/i')
 
     def tap_number(page):
         body = screen(page)
@@ -1093,9 +1259,9 @@ def _run_signin(sid: int, account_id: int, email: str):
     def pick_another_method(page):
         """Open 'Try another way' and choose a text/call option if offered."""
         try:
-            alt = (page.query_selector('text=/Try another way/i')
-                   or page.query_selector('text=/More ways to verify/i')
-                   or page.query_selector('text=/Try another method/i'))
+            alt = (q(page, 'text=/Try another way/i')
+                   or q(page, 'text=/More ways to verify/i')
+                   or q(page, 'text=/Try another method/i'))
             if not alt:
                 return False
             alt.click()
@@ -1105,10 +1271,10 @@ def _run_signin(sid: int, account_id: int, email: str):
                         'text=/Send code/i',
                         'text=/Get a code|verification code/i',
                         'text=/Phone call/i'):
-                opt = page.query_selector(sel)
+                opt = q(page, sel)
                 if opt:
                     opt.click()
-                    page.wait_for_timeout(4000)
+                    settle(page, 3500)
                     return True
             return True          # menu is open; caller can be told options
         except Exception:
@@ -1136,11 +1302,10 @@ def _run_signin(sid: int, account_id: int, email: str):
                 try:
                     page.fill(CODE_SEL, code, timeout=10000)
                     page.keyboard.press("Enter")
-                    page.wait_for_timeout(6000)
+                    settle(page, 5000)
                 except Exception:
-                    pass
-                if page.query_selector(
-                        'text=/Wrong code|incorrect code|try again/i'):
+                    settle(page, 4000)
+                if q(page, 'text=/Wrong code|incorrect code|try again/i'):
                     _ob_set(sid, "needs_code",
                             "That code didn't work. Ask them to read it "
                             "again, or call try_another_way.")
@@ -1165,15 +1330,14 @@ def _run_signin(sid: int, account_id: int, email: str):
             db.close()
 
             _ob_set(sid, "signing_in", "Opening Google.")
-            page.goto(f"{PUBLIC_URL}/link/start?account_id={account_id}",
-                      wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(4000)
+            do_goto(page, f"{PUBLIC_URL}/link/start?account_id={account_id}",
+                    4000)
 
             try:
-                other = page.query_selector('text=/Use another account/i')
+                other = q(page, 'text=/Use another account/i')
                 if other:
                     other.click()
-                    page.wait_for_timeout(2500)
+                    settle(page, 2500)
             except Exception:
                 pass
 
@@ -1186,7 +1350,7 @@ def _run_signin(sid: int, account_id: int, email: str):
 
             page.fill(EMAIL_SEL, email)
             page.keyboard.press("Enter")
-            page.wait_for_timeout(4000)
+            settle(page, 3500)
 
             try:
                 page.wait_for_selector(PW_SEL, timeout=30000)
@@ -1197,18 +1361,17 @@ def _run_signin(sid: int, account_id: int, email: str):
 
             page.fill(PW_SEL, password)
             page.keyboard.press("Enter")
-            page.wait_for_timeout(6000)
+            settle(page, 5000)
 
-            if page.query_selector('text=/Wrong password/i'):
+            if q(page, 'text=/Wrong password/i'):
                 _ob_set(sid, "failed",
                         "Google says the password is wrong. Ask them to say "
                         "it again slowly, or have someone call them back.")
                 browser.close()
                 return
 
-            if page.query_selector(
-                    'text=/couldn.t sign you in|browser or app may not be '
-                    'secure|unusual activity/i'):
+            if q(page, 'text=/couldn.t sign you in|browser or app may not be '
+                       'secure|unusual activity/i'):
                 _ob_set(sid, "failed",
                         "Google blocked the automated sign-in. " + where(page))
                 browser.close()
@@ -1235,8 +1398,16 @@ def _run_signin(sid: int, account_id: int, email: str):
                             if pick_another_method(page):
                                 switched = True
                                 break
+                        # approving navigates the page — that's success
+                        try:
+                            if "/link/callback" in page.url:
+                                break
+                        except Exception:
+                            pass
                         if not wants_tap(page):
-                            break
+                            settle(page, 2000)
+                            if not wants_tap(page):
+                                break
                     if switched:
                         continue
                     if wants_tap(page):
@@ -1247,7 +1418,7 @@ def _run_signin(sid: int, account_id: int, email: str):
                     page.wait_for_timeout(3000)
                     continue
 
-                if page.query_selector(CODE_SEL):
+                if q(page, CODE_SEL):
                     res = wait_for_code(page, sid, describe_code_screen(page))
                     if res == "timeout":
                         _ob_set(sid, "failed", "Timed out waiting for a code.")
@@ -1260,23 +1431,24 @@ def _run_signin(sid: int, account_id: int, email: str):
                 break
 
             _ob_set(sid, "consenting", "Approving access.")
-            for _ in range(8):
-                page.wait_for_timeout(2500)
-                if "/link/callback" in page.url or "Linked" in page.content():
-                    break
+            for _ in range(10):
+                settle(page, 2500)
+                try:
+                    if "/link/callback" in page.url:
+                        break
+                    if "Linked" in (page.content() or ""):
+                        break
+                except Exception:
+                    continue
                 for sel in ('text=/^Advanced$/',
                             'text=/Go to .*unsafe/i',
                             'button:has-text("Continue")',
                             'button:has-text("Allow")',
                             'span:has-text("Continue")',
                             'div[role="button"]:has-text("Continue")'):
-                    try:
-                        el = page.query_selector(sel)
-                        if el:
-                            el.click()
-                            page.wait_for_timeout(2000)
-                    except Exception:
-                        pass
+                    el = q(page, sel)
+                    if el:
+                        do_click(page, el, 2000)
 
             db = Session()
             rows = (db.query(Connection)
@@ -1585,11 +1757,7 @@ def _run_site_login(jid: int, account_id: int, site: str):
 
     ctx_id = _get_context(account_id, site.lower()) or \
         _new_browserbase_context()
-
-    ws = (f"wss://connect.browserbase.com?apiKey={BROWSERBASE_API_KEY}"
-          f"&projectId={BROWSERBASE_PROJECT_ID}")
-    if ctx_id:
-        ws += f"&contextId={ctx_id}&persist=true"
+    ws = _bb_connect_url(ctx_id)
 
     page = browser = None
     try:
@@ -1601,12 +1769,10 @@ def _run_site_login(jid: int, account_id: int, site: str):
             page.set_default_timeout(45000)
 
             _job_set(jid, "opening", f"Opening {site}.")
-            page.goto(cfg["login_url"], wait_until="domcontentloaded",
-                      timeout=60000)
-            page.wait_for_timeout(4000)
+            do_goto(page, cfg["login_url"], 4000)
 
             # Already signed in from a previous session?
-            if page.query_selector(cfg["ok_sel"]):
+            if q(page, cfg["ok_sel"]):
                 if ctx_id:
                     _save_context(account_id, site.lower(), ctx_id)
                 _job_set(jid, "done", f"Already signed in to {site}.")
@@ -1614,42 +1780,42 @@ def _run_site_login(jid: int, account_id: int, site: str):
                 return
 
             _job_set(jid, "signing_in", "Entering their details.")
-            try:
-                page.fill(cfg["user_sel"], creds["username"], timeout=25000)
-            except Exception:
-                body = (page.inner_text("body") or "")[:220]
-                _job_set(jid, "failed", f"No username box. {body}")
+            user_el = q(page, cfg["user_sel"])
+            if not user_el:
+                _job_set(jid, "failed",
+                         f"No username box. {page_text(page, 220)}")
                 browser.close()
                 return
-            try:
-                nxt = page.query_selector(cfg["next_sel"])
-                if nxt:
-                    nxt.click()
-                else:
+            do_fill(page, user_el, creds["username"])
+            nxt = q(page, cfg["next_sel"])
+            if nxt:
+                do_click(page, nxt)
+            else:
+                try:
                     page.keyboard.press("Enter")
-            except Exception:
-                page.keyboard.press("Enter")
-            page.wait_for_timeout(4000)
+                except Exception:
+                    pass
+                settle(page, 3500)
 
-            try:
-                page.fill(cfg["pass_sel"], creds["password"], timeout=25000)
-            except Exception:
-                body = (page.inner_text("body") or "")[:220]
-                _job_set(jid, "failed", f"No password box. {body}")
+            pw_el = q(page, cfg["pass_sel"])
+            if not pw_el:
+                _job_set(jid, "failed",
+                         f"No password box. {page_text(page, 220)}")
                 browser.close()
                 return
-            try:
-                nxt = page.query_selector(cfg["next_sel"])
-                if nxt:
-                    nxt.click()
-                else:
+            do_fill(page, pw_el, creds["password"])
+            nxt = q(page, cfg["next_sel"])
+            if nxt:
+                do_click(page, nxt, 6000)
+            else:
+                try:
                     page.keyboard.press("Enter")
-            except Exception:
-                page.keyboard.press("Enter")
-            page.wait_for_timeout(7000)
+                except Exception:
+                    pass
+                settle(page, 6000)
 
             # One-time code?
-            if page.query_selector(cfg["otp_sel"]):
+            if q(page, cfg["otp_sel"]):
                 _job_set(jid, "needs_code",
                          f"{site.title()} sent them a code. Ask them to read "
                          f"it out.")
@@ -1661,29 +1827,26 @@ def _run_site_login(jid: int, account_id: int, site: str):
                     code = (_JOBS.get(jid) or {}).get("code")
                     if code:
                         _JOBS[jid]["code"] = None
-                        try:
-                            page.fill(cfg["otp_sel"], code, timeout=10000)
-                            page.keyboard.press("Enter")
-                            page.wait_for_timeout(7000)
+                        otp_el = q(page, cfg["otp_sel"])
+                        if otp_el:
+                            do_fill(page, otp_el, code, True, 6000)
                             got = True
-                        except Exception:
-                            pass
                         break
                 if not got:
                     _job_set(jid, "failed", "Timed out waiting for the code.")
                     browser.close()
                     return
 
-            page.wait_for_timeout(3000)
-            if page.query_selector(cfg["ok_sel"]):
+            settle(page, 3000)
+            if q(page, cfg["ok_sel"]):
                 if ctx_id:
                     _save_context(account_id, site.lower(), ctx_id)
                 _job_set(jid, "done",
                          f"Signed in to {site} and saved the session.")
             else:
-                body = (page.inner_text("body") or "")[:250].replace("\n", " ")
                 _job_set(jid, "failed",
-                         f"Sign-in didn't complete. screen: {body}")
+                         f"Sign-in didn't complete. "
+                         f"screen: {page_text(page, 250)}")
             browser.close()
     except Exception as e:
         detail = ""
@@ -1705,11 +1868,7 @@ def _run_site_login(jid: int, account_id: int, site: str):
 def _open_with_session(p, account_id: int, site: str):
     """Connect to Browserbase reusing this customer's saved session."""
     ctx_id = _get_context(account_id, site) or _new_browserbase_context()
-    ws = (f"wss://connect.browserbase.com?apiKey={BROWSERBASE_API_KEY}"
-          f"&projectId={BROWSERBASE_PROJECT_ID}")
-    if ctx_id:
-        ws += f"&contextId={ctx_id}&persist=true"
-    browser = p.chromium.connect_over_cdp(ws)
+    browser = p.chromium.connect_over_cdp(_bb_connect_url(ctx_id))
     bctx = browser.contexts[0] if browser.contexts else browser.new_context()
     page = bctx.pages[0] if bctx.pages else bctx.new_page()
     page.set_default_timeout(45000)
@@ -1742,18 +1901,16 @@ def _run_site_orders(jid: int, account_id: int, site: str):
         with sync_playwright() as p:
             browser, page, ctx_id = _open_with_session(p, account_id, site)
             _job_set(jid, "opening", f"Opening {site} orders.")
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(6000)
+            do_goto(page, url, 5000)
 
             cfg = SITES.get(site, {})
-            if cfg.get("user_sel") and page.query_selector(cfg["user_sel"]):
+            if cfg.get("user_sel") and q(page, cfg["user_sel"]):
                 _job_set(jid, "failed",
                          f"Signed out of {site}. Sign in again first.")
                 browser.close()
                 return
 
-            body = " ".join((page.inner_text("body") or "").split())
-            _job_set(jid, "done", body[:1800])
+            _job_set(jid, "done", page_text(page, 1800))
             if ctx_id:
                 _save_context(account_id, site, ctx_id)
             browser.close()
@@ -1786,11 +1943,8 @@ def _run_site_search(jid: int, account_id: int, site: str):
         with sync_playwright() as p:
             browser, page, ctx_id = _open_with_session(p, account_id, site)
             _job_set(jid, "opening", f"Searching {site} for {query}.")
-            page.goto(base + urllib.parse.quote_plus(query),
-                      wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(6000)
-            body = " ".join((page.inner_text("body") or "").split())
-            _job_set(jid, "done", body[:1800])
+            do_goto(page, base + urllib.parse.quote_plus(query), 5000)
+            _job_set(jid, "done", page_text(page, 1800))
             if ctx_id:
                 _save_context(account_id, site, ctx_id)
             browser.close()
@@ -1839,8 +1993,9 @@ Rules:
 
 def _page_snapshot(page, limit: int = 60):
     """Page text plus a numbered list of interactive elements."""
-    els = page.query_selector_all(
-        "a, button, input, textarea, select, [role=button], [role=link]")
+    els = q_all(page,
+                "a, button, input, textarea, select, [role=button], "
+                "[role=link]")
     items, seen = [], set()
     for el in els:
         if len(items) >= limit:
@@ -1866,11 +2021,7 @@ def _page_snapshot(page, limit: int = 60):
                           "desc": f"{tag}{'/' + typ if typ else ''}: {label}"})
         except Exception:
             continue
-    try:
-        text = " ".join((page.inner_text("body") or "").split())[:4000]
-    except Exception:
-        text = ""
-    return items, text
+    return items, page_text(page, 4000)
 
 
 def _decide(goal: str, url: str, text: str, items: list, history: list,
@@ -2011,35 +2162,26 @@ def _replay_recipe(page, steps: list, creds: dict, log_fn):
                            f"'{st.get('desc', '')}'")
                     return False, ""
                 if a == "click":
-                    el.click()
+                    do_click(page, el)
                 else:
                     val = st.get("text", "")
                     if val == "SAVED_PASSWORD":
                         val = creds.get("password", "")
                     elif val == "SAVED_USERNAME":
                         val = creds.get("username", "")
-                    el.fill(val)
-                    if st.get("enter"):
-                        page.keyboard.press("Enter")
-                page.wait_for_timeout(4000)
+                    do_fill(page, el, val, bool(st.get("enter")))
             elif a == "goto":
-                page.goto(st["url"], wait_until="domcontentloaded",
-                          timeout=60000)
-                page.wait_for_timeout(4000)
+                do_goto(page, st["url"])
             elif a == "scroll":
                 page.mouse.wheel(0, 1400)
-                page.wait_for_timeout(2000)
+                settle(page, 2000)
             elif a == "wait":
-                page.wait_for_timeout(3000)
+                settle(page, 3000)
             log_fn(f"replay step {i + 1}: {a} ok")
         except Exception as e:
             log_fn(f"replay step {i + 1}: {a} failed — {str(e)[:80]}")
             return False, ""
-    try:
-        text = " ".join((page.inner_text("body") or "").split())[:5000]
-    except Exception:
-        text = ""
-    return True, text
+    return True, page_text(page, 5000)
 
 
 def _run_browse(jid: int, account_id: int, site: str):
@@ -2079,8 +2221,7 @@ def _run_browse(jid: int, account_id: int, site: str):
         with sync_playwright() as p:
             browser, page, ctx_id = _open_with_session(p, account_id, site_key)
             _job_set(jid, "opening", f"Opening {start}")
-            page.goto(start, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(4000)
+            do_goto(page, start, 4000)
 
             # ---- 1. learned recipe first
             recipe = _find_recipe(site_key, task)
@@ -2104,14 +2245,14 @@ def _run_browse(jid: int, account_id: int, site: str):
                 path_used = "fallback"
                 _job_set(jid, "working",
                          "The saved steps didn't work — working it out fresh.")
-                page.goto(start, wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_timeout(4000)
+                do_goto(page, start, 4000)
 
             # ---- 2. step-by-step agent
             outcome = "failed"
             for step in range(max_steps):
                 items, text = _page_snapshot(page)
-                act = _decide(goal, page.url, text, items, history, hint)
+                act = _decide(goal, page_url(page), text, items, history,
+                              hint)
                 a = act.get("action")
                 why = act.get("why", "")[:120]
 
@@ -2145,10 +2286,9 @@ def _run_browse(jid: int, account_id: int, site: str):
                 try:
                     if a == "click":
                         it = items[int(act["index"])]
-                        it["el"].click()
+                        do_click(page, it["el"])
                         recorded.append({"action": "click",
                                          "desc": it["desc"]})
-                        page.wait_for_timeout(4000)
                     elif a == "type":
                         it = items[int(act["index"])]
                         val = act.get("text", "")
@@ -2157,24 +2297,20 @@ def _run_browse(jid: int, account_id: int, site: str):
                             real = creds.get("password", "")
                         elif val == "SAVED_USERNAME":
                             real = creds.get("username", "")
-                        it["el"].fill(real)
-                        if act.get("enter"):
-                            page.keyboard.press("Enter")
+                        do_fill(page, it["el"], real,
+                                bool(act.get("enter")))
                         recorded.append({"action": "type", "desc": it["desc"],
                                          "text": val,
                                          "enter": bool(act.get("enter"))})
-                        page.wait_for_timeout(4000)
                     elif a == "goto":
-                        page.goto(act["url"], wait_until="domcontentloaded",
-                                  timeout=60000)
+                        do_goto(page, act["url"])
                         recorded.append({"action": "goto", "url": act["url"]})
-                        page.wait_for_timeout(4000)
                     elif a == "scroll":
                         page.mouse.wheel(0, 1400)
                         recorded.append({"action": "scroll"})
-                        page.wait_for_timeout(2000)
+                        settle(page, 2000)
                     else:
-                        page.wait_for_timeout(3000)
+                        settle(page, 3000)
                 except Exception as e:
                     history.append(f"{a} failed: {str(e)[:90]}")
                     _job_set(jid, "working", f"Retrying after: {str(e)[:80]}")
@@ -2327,13 +2463,11 @@ def _run_checkout(jid: int, account_id: int, site: str):
             browser, page, ctx_id = _open_with_session(p, account_id, site)
             _job_set(jid, "opening", f"Opening {site}.")
             _order_set(oid, "placing", f"Opening {site}.")
-            page.goto(f"https://www.{site}.com", wait_until="domcontentloaded",
-                      timeout=60000)
-            page.wait_for_timeout(4000)
+            do_goto(page, f"https://www.{site}.com", 4000)
 
             for step in range(30):
                 items, text = _page_snapshot(page, limit=80)
-                act = decide(page.url, text, items, history)
+                act = decide(page_url(page), text, items, history)
                 a = act.get("action")
                 why = act.get("why", "")[:120]
 
@@ -2374,34 +2508,26 @@ def _run_checkout(jid: int, account_id: int, site: str):
                                f"On the review screen, total {total}. "
                                f"Placing now.")
                     history.append(f"place_order total {total} — {why}")
-                    try:
-                        items[int(act["index"])]["el"].click()
-                        page.wait_for_timeout(8000)
-                    except Exception as e:
-                        history.append(f"place_order click failed: "
-                                       f"{str(e)[:80]}")
+                    ok = do_click(page, items[int(act["index"])]["el"], 8000)
+                    if not ok:
+                        history.append("place_order click failed")
                     continue
 
                 try:
                     if a == "click":
-                        items[int(act["index"])]["el"].click()
-                        page.wait_for_timeout(4000)
+                        do_click(page, items[int(act["index"])]["el"])
                     elif a == "type":
                         val = act.get("text", "")
                         real = values.get(val, val)
-                        items[int(act["index"])]["el"].fill(real)
-                        if act.get("enter"):
-                            page.keyboard.press("Enter")
-                        page.wait_for_timeout(4000)
+                        do_fill(page, items[int(act["index"])]["el"], real,
+                                bool(act.get("enter")))
                     elif a == "goto":
-                        page.goto(act["url"], wait_until="domcontentloaded",
-                                  timeout=60000)
-                        page.wait_for_timeout(4000)
+                        do_goto(page, act["url"])
                     elif a == "scroll":
                         page.mouse.wheel(0, 1400)
-                        page.wait_for_timeout(2000)
+                        settle(page, 2000)
                     else:
-                        page.wait_for_timeout(3000)
+                        settle(page, 3000)
                 except Exception as e:
                     history.append(f"{a} failed: {str(e)[:90]}")
                     continue
@@ -3648,6 +3774,40 @@ def events_list(request: Request, after_id: int = 0, limit: int = 200,
     return out
 
 
+@app.get("/browser/where")
+def browser_where(request: Request):
+    """Open a browser and report the country it appears to be in."""
+    require_auth(request)
+    if not BROWSERBASE_API_KEY:
+        raise HTTPException(400, "Browserbase isn't configured.")
+    from playwright.sync_api import sync_playwright
+    out = {"configured": {"country": PROXY_COUNTRY, "state": PROXY_STATE,
+                          "city": PROXY_CITY}}
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(_bb_connect_url())
+            ctx = browser.contexts[0] if browser.contexts \
+                else browser.new_context()
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            do_goto(page, "https://ipinfo.io/json", 2000)
+            raw = page_text(page, 800)
+            browser.close()
+        try:
+            i = raw.index("{")
+            out["actual"] = json.loads(raw[i:raw.rindex("}") + 1])
+            got = (out["actual"].get("country") or "").upper()
+            out["ok"] = (got == PROXY_COUNTRY.upper())
+            if not out["ok"]:
+                _flag_proxy_fallback(
+                    f"browser is reporting country {got}, expected "
+                    f"{PROXY_COUNTRY}")
+        except Exception:
+            out["actual_raw"] = raw[:400]
+    except Exception as e:
+        out["error"] = str(e)[:300]
+    return out
+
+
 @app.get("/vault/status")
 def vault_status(request: Request):
     """Which key protects what."""
@@ -4192,6 +4352,11 @@ Waiting for events…</pre>
 </section>
 
 <section class="page on" id="p-overview">
+  <div class="card" id="alertcard" style="display:none;
+       border-color:#7f1d1d;background:#1b1113">
+    <h2 class="no">Needs attention</h2>
+    <div id="alerts"></div>
+  </div>
   <div class="card"><h2>Last 7 days</h2>
     <div class="nums" id="stats"><span class="hint">Loading&hellip;</span></div>
   </div>
@@ -4469,6 +4634,21 @@ async function load(){
 }
 
 var fuAll = false;
+async function loadAlerts(){
+  try{
+    const d = await (await fetch('/followups?include_done=0')).json();
+    const urgent = d.filter(function(f){
+      return f.reason==='proxy_fallback' || f.channel==='system'; });
+    const card = document.getElementById('alertcard');
+    if(!urgent.length){ card.style.display='none'; return; }
+    card.style.display='block';
+    document.getElementById('alerts').innerHTML = urgent.map(function(f){
+      return '<div class="err" style="margin-bottom:8px">'+esc(f.at)+
+        ' — '+esc(f.note)+
+        ' <button class="sec" onclick="fuDone('+f.id+',0)">Fixed</button>'+
+        '</div>'; }).join('');
+  }catch(e){}
+}
 async function loadFu(){
   const tb = document.getElementById('furows');
   try{
@@ -4737,11 +4917,11 @@ async function add(){
   else { m.textContent='Failed — that number may already exist.'; }
 }
 
-load(); loadCalls(); loadStats(); loadDlr(); loadOb(); loadFu(); loadJobs(); loadHealth(); loadSites(); loadOrders();
+load(); loadCalls(); loadStats(); loadDlr(); loadOb(); loadFu(); loadJobs(); loadHealth(); loadSites(); loadOrders(); loadAlerts();
 pollLive(); setInterval(pollLive, 2000);
 setInterval(function(){ loadCalls(); loadStats(); loadDlr(); loadOb();
                         loadFu(); loadJobs(); loadHealth(); loadSites();
-                        loadOrders(); }, 25000);
+                        loadOrders(); loadAlerts(); }, 25000);
 </script></body></html>"""
 
 
