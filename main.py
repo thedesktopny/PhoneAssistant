@@ -47,6 +47,11 @@ GOOGLE_CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"]
 PUBLIC_URL = os.environ["PUBLIC_URL"].rstrip("/")   # e.g. https://xxx.up.railway.app
 ENCRYPTION_KEY = os.environ["ENCRYPTION_KEY"]       # Fernet key, see setup notes
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
+
+# Envelope encryption. Set KMS_KEY_ID (and AWS creds) for production;
+# without it, falls back to the local Fernet key.
+KMS_KEY_ID = os.environ.get("KMS_KEY_ID", "")
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
 
 # SMS — set SMS_PROVIDER to "twilio" or "bulkvs"
@@ -177,6 +182,57 @@ class Followup(Base):
     done = Column(Integer, default=0)
 
 
+class SiteLogin(Base):
+    """A customer's login for a site that has no API. Encrypted at rest;
+    the password is never returned through the API."""
+    __tablename__ = "site_logins"
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"))
+    site = Column(String(80))                 # "amazon", "walmart"
+    username = Column(String(200), default="")
+    secret_blob = Column(Text)
+    at = Column(DateTime, default=datetime.utcnow)
+    last_used = Column(DateTime, nullable=True)
+    use_count = Column(Integer, default=0)
+
+
+class SiteSession(Base):
+    """A saved browser session per customer per site, so we stay logged in."""
+    __tablename__ = "site_sessions"
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"))
+    site = Column(String(80))
+    context_id = Column(String(120), default="")
+    at = Column(DateTime, default=datetime.utcnow)
+    last_ok = Column(DateTime, nullable=True)
+
+
+class Job(Base):
+    """Background browser work: log in, check, order."""
+    __tablename__ = "jobs"
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"), nullable=True)
+    call_id = Column(Integer, nullable=True)
+    kind = Column(String(40), default="")        # site_login, order
+    site = Column(String(80), default="")
+    payload = Column(Text, default="{}")
+    state = Column(String(30), default="queued")
+    message = Column(Text, default="")
+    history = Column(Text, default="")
+    at = Column(DateTime, default=datetime.utcnow)
+    done_at = Column(DateTime, nullable=True)
+
+
+class SecretAccess(Base):
+    """Every time a stored password is decrypted, and why."""
+    __tablename__ = "secret_access"
+    id = Column(Integer, primary_key=True)
+    at = Column(DateTime, default=datetime.utcnow)
+    account_id = Column(Integer, nullable=True)
+    site = Column(String(80), default="")
+    purpose = Column(String(120), default="")
+
+
 Base.metadata.create_all(engine)
 
 
@@ -209,11 +265,45 @@ _ensure_columns()
 # Swap the two functions below for AWS KMS before real customers.
 # Everything else in the app stays the same.
 
+_kms = None
+
+
+def _kms_client():
+    global _kms
+    if _kms is None and KMS_KEY_ID:
+        import boto3
+        _kms = boto3.client("kms", region_name=AWS_REGION)
+    return _kms
+
+
 def vault_put(data: dict) -> str:
-    return fernet.encrypt(json.dumps(data).encode()).decode()
+    """Encrypt. With KMS: a fresh data key per secret, itself wrapped by a
+    key that never leaves AWS. Without: the local Fernet key."""
+    raw = json.dumps(data).encode()
+    c = _kms_client()
+    if c:
+        from cryptography.fernet import Fernet as _F
+        dk = c.generate_data_key(KeyId=KMS_KEY_ID, KeySpec="AES_256")
+        key = _b64.urlsafe_b64encode(dk["Plaintext"])
+        sealed = _F(key).encrypt(raw)
+        del key
+        return "kms:" + _b64.b64encode(dk["CiphertextBlob"]).decode() \
+               + ":" + sealed.decode()
+    return fernet.encrypt(raw).decode()
 
 
 def vault_get(blob: str) -> dict:
+    if blob.startswith("kms:"):
+        c = _kms_client()
+        if not c:
+            raise HTTPException(500, "This secret needs KMS, which isn't set.")
+        from cryptography.fernet import Fernet as _F
+        _, wrapped, sealed = blob.split(":", 2)
+        dk = c.decrypt(CiphertextBlob=_b64.b64decode(wrapped))
+        key = _b64.urlsafe_b64encode(dk["Plaintext"])
+        out = _F(key).decrypt(sealed.encode())
+        del key
+        return json.loads(out.decode())
     return json.loads(fernet.decrypt(blob.encode()).decode())
 
 # ----------------------------------------------------------------- google
@@ -1138,7 +1228,8 @@ def delete_everything(account_id: int) -> dict:
         revoke_google(c.secret_blob)
         db.delete(c)
 
-    for model in (Memory, Onboard, PhoneNumber):
+    for model in (Memory, Onboard, PhoneNumber, SiteLogin,
+                  SiteSession, Job):
         for row in db.query(model).filter_by(account_id=account_id).all():
             db.delete(row)
 
@@ -1154,6 +1245,373 @@ def delete_everything(account_id: int) -> dict:
     db.commit()
     db.close()
     return {"deleted": True, "mailboxes": len(conns), "calls": len(calls)}
+
+
+
+def save_site_login(account_id: int, site: str, username: str,
+                    password: str) -> dict:
+    """Store or replace one site login."""
+    db = Session()
+    row = (db.query(SiteLogin)
+             .filter_by(account_id=account_id, site=site.lower()).first())
+    blob = vault_put({"password": password})
+    if row:
+        row.username = username
+        row.secret_blob = blob
+        row.at = datetime.utcnow()
+    else:
+        db.add(SiteLogin(account_id=account_id, site=site.lower(),
+                         username=username, secret_blob=blob))
+    db.commit()
+    db.close()
+    return {"saved": True, "site": site.lower(), "username": username}
+
+
+def use_site_login(account_id: int, site: str, purpose: str = "") -> dict:
+    """Decrypt for one use. Server-side only — never sent to a client."""
+    db = Session()
+    row = (db.query(SiteLogin)
+             .filter_by(account_id=account_id, site=site.lower()).first())
+    if not row:
+        db.close()
+        return {}
+    data = vault_get(row.secret_blob)
+    row.last_used = datetime.utcnow()
+    row.use_count = (row.use_count or 0) + 1
+    db.add(SecretAccess(account_id=account_id, site=site.lower(),
+                        purpose=purpose[:120]))
+    db.commit()
+    out = {"username": row.username, "password": data.get("password", "")}
+    db.close()
+    return out
+
+
+def list_site_logins(account_id: int) -> list:
+    db = Session()
+    rows = db.query(SiteLogin).filter_by(account_id=account_id).all()
+    out = [{"site": r.site, "username": r.username,
+            "saved": r.at.strftime("%b %-d") if r.at else "",
+            "used": r.use_count or 0} for r in rows]
+    db.close()
+    return out
+
+
+def forget_site_login(account_id: int, site: str) -> dict:
+    db = Session()
+    rows = (db.query(SiteLogin)
+              .filter_by(account_id=account_id, site=site.lower()).all())
+    for r in rows:
+        db.delete(r)
+    db.commit()
+    db.close()
+    return {"removed": len(rows), "site": site.lower()}
+
+
+
+# ------------------------------------------------------------ site logins
+# Per-site hints. Selectors are deliberately loose; Google/Amazon change
+# their pages often, so we try several and fail with the screen text.
+
+SITES = {
+    "amazon": {
+        "login_url": "https://www.amazon.com/ap/signin?openid.mode=checkid_setup"
+                     "&openid.identity=http://specs.openid.net/auth/2.0/"
+                     "identifier_select&openid.claimed_id=http://specs.openid"
+                     ".net/auth/2.0/identifier_select&openid.assoc_handle="
+                     "usflex&openid.ns=http://specs.openid.net/auth/2.0"
+                     "&openid.return_to=https://www.amazon.com/",
+        "user_sel": 'input[type="email"], input#ap_email, input[name="email"]',
+        "pass_sel": 'input[type="password"], input#ap_password',
+        "next_sel": 'input#continue, input#signInSubmit',
+        "ok_sel": '#nav-link-accountList, text=/Hello,/i',
+        "otp_sel": 'input#auth-mfa-otpcode, input[name="otpCode"], '
+                   'input[autocomplete="one-time-code"]',
+    },
+    "walmart": {
+        "login_url": "https://www.walmart.com/account/login",
+        "user_sel": 'input[type="email"], input#email',
+        "pass_sel": 'input[type="password"], input#password',
+        "next_sel": 'button[type="submit"]',
+        "ok_sel": 'text=/Account|Sign out/i',
+        "otp_sel": 'input[autocomplete="one-time-code"], input[name="code"]',
+    },
+    "temu": {
+        "login_url": "https://www.temu.com/login.html",
+        "user_sel": 'input[type="email"], input[name="email"], '
+                    'input[placeholder*="mail" i]',
+        "pass_sel": 'input[type="password"]',
+        "next_sel": 'button[type="submit"], div[role="button"]:has-text("Continue")',
+        "ok_sel": 'text=/Account|Sign out|Orders/i',
+        "otp_sel": 'input[autocomplete="one-time-code"], input[name="code"]',
+    },
+}
+
+_JOBS = {}          # job_id -> {"code": str|None}
+
+# How many browsers may run at once. Keep at or below your Browserbase plan's
+# concurrency limit; everything else waits in line.
+MAX_BROWSERS = int(os.environ.get("MAX_BROWSERS", "5"))
+_slots = threading.Semaphore(MAX_BROWSERS)
+_queue_lock = threading.Lock()
+_waiting = 0
+
+
+def _job_set(jid: int, state: str, message: str = ""):
+    db = Session()
+    row = db.query(Job).filter_by(id=jid).first()
+    if row:
+        row.state = state
+        row.message = message[:500]
+        stamp = datetime.utcnow().strftime("%H:%M:%S")
+        row.history = ((row.history or "") +
+                       f"[{stamp}] {state}: {message[:300]}\n")[-6000:]
+        if state in ("done", "failed"):
+            row.done_at = datetime.utcnow()
+        db.commit()
+    db.close()
+
+
+def _get_context(account_id: int, site: str):
+    """Reuse a saved browser context so cookies persist between runs."""
+    db = Session()
+    row = (db.query(SiteSession)
+             .filter_by(account_id=account_id, site=site).first())
+    ctx_id = row.context_id if row else ""
+    db.close()
+    return ctx_id
+
+
+def _save_context(account_id: int, site: str, ctx_id: str):
+    db = Session()
+    row = (db.query(SiteSession)
+             .filter_by(account_id=account_id, site=site).first())
+    if row:
+        row.context_id = ctx_id
+        row.last_ok = datetime.utcnow()
+    else:
+        db.add(SiteSession(account_id=account_id, site=site,
+                           context_id=ctx_id, last_ok=datetime.utcnow()))
+    db.commit()
+    db.close()
+
+
+def _new_browserbase_context() -> str:
+    """Ask Browserbase for a persistent context id."""
+    try:
+        req = urllib.request.Request(
+            "https://api.browserbase.com/v1/contexts",
+            data=json.dumps({"projectId": BROWSERBASE_PROJECT_ID}).encode(),
+            headers={"X-BB-API-Key": BROWSERBASE_API_KEY,
+                     "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read().decode()).get("id", "")
+    except Exception:
+        return ""
+
+
+def _run_site_login(jid: int, account_id: int, site: str):
+    """Log this customer into a site and keep the session for next time."""
+    from playwright.sync_api import sync_playwright
+
+    cfg = SITES.get(site.lower())
+    if not cfg:
+        _job_set(jid, "failed", f"No setup for '{site}' yet.")
+        return
+
+    creds = use_site_login(account_id, site, purpose=f"job {jid} login")
+    if not creds or not creds.get("password"):
+        _job_set(jid, "failed", "No saved login for that site.")
+        return
+
+    ctx_id = _get_context(account_id, site.lower()) or \
+        _new_browserbase_context()
+
+    ws = (f"wss://connect.browserbase.com?apiKey={BROWSERBASE_API_KEY}"
+          f"&projectId={BROWSERBASE_PROJECT_ID}")
+    if ctx_id:
+        ws += f"&contextId={ctx_id}&persist=true"
+
+    page = browser = None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(ws)
+            bctx = browser.contexts[0] if browser.contexts \
+                else browser.new_context()
+            page = bctx.pages[0] if bctx.pages else bctx.new_page()
+            page.set_default_timeout(45000)
+
+            _job_set(jid, "opening", f"Opening {site}.")
+            page.goto(cfg["login_url"], wait_until="domcontentloaded",
+                      timeout=60000)
+            page.wait_for_timeout(4000)
+
+            # Already signed in from a previous session?
+            if page.query_selector(cfg["ok_sel"]):
+                if ctx_id:
+                    _save_context(account_id, site.lower(), ctx_id)
+                _job_set(jid, "done", f"Already signed in to {site}.")
+                browser.close()
+                return
+
+            _job_set(jid, "signing_in", "Entering their details.")
+            try:
+                page.fill(cfg["user_sel"], creds["username"], timeout=25000)
+            except Exception:
+                body = (page.inner_text("body") or "")[:220]
+                _job_set(jid, "failed", f"No username box. {body}")
+                browser.close()
+                return
+            try:
+                nxt = page.query_selector(cfg["next_sel"])
+                if nxt:
+                    nxt.click()
+                else:
+                    page.keyboard.press("Enter")
+            except Exception:
+                page.keyboard.press("Enter")
+            page.wait_for_timeout(4000)
+
+            try:
+                page.fill(cfg["pass_sel"], creds["password"], timeout=25000)
+            except Exception:
+                body = (page.inner_text("body") or "")[:220]
+                _job_set(jid, "failed", f"No password box. {body}")
+                browser.close()
+                return
+            try:
+                nxt = page.query_selector(cfg["next_sel"])
+                if nxt:
+                    nxt.click()
+                else:
+                    page.keyboard.press("Enter")
+            except Exception:
+                page.keyboard.press("Enter")
+            page.wait_for_timeout(7000)
+
+            # One-time code?
+            if page.query_selector(cfg["otp_sel"]):
+                _job_set(jid, "needs_code",
+                         f"{site.title()} sent them a code. Ask them to read "
+                         f"it out.")
+                waited = 0
+                got = False
+                while waited < 240:
+                    time.sleep(3)
+                    waited += 3
+                    code = (_JOBS.get(jid) or {}).get("code")
+                    if code:
+                        _JOBS[jid]["code"] = None
+                        try:
+                            page.fill(cfg["otp_sel"], code, timeout=10000)
+                            page.keyboard.press("Enter")
+                            page.wait_for_timeout(7000)
+                            got = True
+                        except Exception:
+                            pass
+                        break
+                if not got:
+                    _job_set(jid, "failed", "Timed out waiting for the code.")
+                    browser.close()
+                    return
+
+            page.wait_for_timeout(3000)
+            if page.query_selector(cfg["ok_sel"]):
+                if ctx_id:
+                    _save_context(account_id, site.lower(), ctx_id)
+                _job_set(jid, "done",
+                         f"Signed in to {site} and saved the session.")
+            else:
+                body = (page.inner_text("body") or "")[:250].replace("\n", " ")
+                _job_set(jid, "failed",
+                         f"Sign-in didn't complete. screen: {body}")
+            browser.close()
+    except Exception as e:
+        detail = ""
+        try:
+            if page:
+                detail = " url=" + page.url[:100]
+        except Exception:
+            pass
+        _job_set(jid, "failed", f"Browser error: {str(e)[:150]}{detail}")
+        try:
+            if browser:
+                browser.close()
+        except Exception:
+            pass
+    finally:
+        _JOBS.pop(jid, None)
+
+
+RUNNERS = {"site_login": _run_site_login}
+
+
+def _queued_run(jid: int, kind: str, account_id: int, site: str):
+    """Wait for a free browser slot, then run. Keeps us inside the plan."""
+    global _waiting
+    with _queue_lock:
+        _waiting += 1
+        ahead = _waiting - 1
+    if ahead > 0:
+        _job_set(jid, "waiting",
+                 f"{ahead} ahead in the queue. Starting shortly.")
+    _slots.acquire()
+    with _queue_lock:
+        _waiting -= 1
+    try:
+        fn = RUNNERS.get(kind)
+        if not fn:
+            _job_set(jid, "failed", f"Unknown job type '{kind}'.")
+            return
+        fn(jid, account_id, site)
+    finally:
+        _slots.release()
+
+
+def start_job(account_id: int, kind: str, site: str = "",
+              call_id=None, payload=None) -> int:
+    # One live job per customer per site — no duplicate browsers.
+    db = Session()
+    live = (db.query(Job)
+              .filter(Job.account_id == account_id,
+                      Job.site == site.lower(),
+                      Job.kind == kind,
+                      Job.state.notin_(["done", "failed"]))
+              .order_by(Job.id.desc()).first())
+    if live:
+        jid = live.id
+        db.close()
+        return jid
+
+    row = Job(account_id=account_id, call_id=call_id, kind=kind,
+              site=site.lower(), payload=json.dumps(payload or {}))
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    jid = row.id
+    db.close()
+
+    _JOBS[jid] = {"code": None}
+    threading.Thread(target=_queued_run,
+                     args=(jid, kind, account_id, site.lower()),
+                     daemon=True).start()
+    return jid
+
+
+def queue_health() -> dict:
+    db = Session()
+    running = (db.query(Job)
+                 .filter(Job.state.notin_(["done", "failed", "waiting"]))
+                 .count())
+    waiting = db.query(Job).filter(Job.state == "waiting").count()
+    stale_cut = datetime.utcnow() - timedelta(minutes=20)
+    stale = (db.query(Job)
+               .filter(Job.state.notin_(["done", "failed"]),
+                       Job.at < stale_cut).count())
+    sessions = db.query(SiteSession).count()
+    db.close()
+    return {"max_browsers": MAX_BROWSERS, "running": running,
+            "waiting": waiting, "stuck_over_20min": stale,
+            "saved_sessions": sessions}
 
 
 # ------------------------------------------------------- text brain (SMS)
@@ -1970,6 +2428,121 @@ def call_detail(call_id: int, request: Request):
     return out
 
 
+class LoginBody2(BaseModel):
+    account_id: int
+    site: str
+    username: str
+    password: str
+
+
+@app.post("/logins")
+def logins_save(b: LoginBody2, request: Request):
+    require_auth(request)
+    return save_site_login(b.account_id, b.site, b.username, b.password)
+
+
+@app.get("/logins")
+def logins_list(request: Request, account_id: int):
+    """Which sites they've saved. Never returns passwords."""
+    require_auth(request)
+    return list_site_logins(account_id)
+
+
+@app.delete("/logins")
+def logins_forget(request: Request, account_id: int, site: str):
+    require_auth(request)
+    return forget_site_login(account_id, site)
+
+
+@app.get("/logins/audit")
+def logins_audit(request: Request, limit: int = 50):
+    require_auth(request)
+    db = Session()
+    rows = (db.query(SecretAccess).order_by(SecretAccess.id.desc())
+              .limit(limit).all())
+    names = {a.id: a.name for a in db.query(Account).all()}
+    out = [{"at": r.at.strftime("%b %-d %-I:%M %p") if r.at else "",
+            "who": names.get(r.account_id) or "?", "site": r.site,
+            "purpose": r.purpose} for r in rows]
+    db.close()
+    return out
+
+
+@app.post("/jobs/site-login")
+def job_site_login(request: Request, account_id: int, site: str,
+                   call_id: int = 0):
+    require_auth(request)
+    if not BROWSERBASE_API_KEY:
+        raise HTTPException(400, "Browserbase isn't configured.")
+    jid = start_job(account_id, "site_login", site,
+                    call_id=call_id or None)
+    return {"job_id": jid, "state": "queued"}
+
+
+class JobCode(BaseModel):
+    job_id: int
+    code: str
+
+
+@app.post("/jobs/code")
+def job_code(b: JobCode, request: Request):
+    require_auth(request)
+    if b.job_id in _JOBS:
+        _JOBS[b.job_id]["code"] = "".join(
+            ch for ch in b.code if ch.isalnum())
+        return {"ok": True}
+    raise HTTPException(400, "That job is no longer running.")
+
+
+@app.get("/jobs/status")
+def job_status(request: Request, job_id: int):
+    require_auth(request)
+    db = Session()
+    row = db.query(Job).filter_by(id=job_id).first()
+    db.close()
+    if not row:
+        raise HTTPException(404, "Unknown job.")
+    return {"job_id": row.id, "kind": row.kind, "site": row.site,
+            "state": row.state, "message": row.message,
+            "history": row.history or ""}
+
+
+@app.get("/jobs/health")
+def jobs_health(request: Request):
+    require_auth(request)
+    return queue_health()
+
+
+@app.get("/sessions")
+def sessions_list(request: Request, limit: int = 100):
+    """Which customers have a live session on which sites."""
+    require_auth(request)
+    db = Session()
+    rows = db.query(SiteSession).order_by(SiteSession.id.desc()).limit(
+        limit).all()
+    names = {a.id: a.name for a in db.query(Account).all()}
+    out = [{"who": names.get(r.account_id) or "?", "site": r.site,
+            "last_ok": r.last_ok.strftime("%b %-d %-I:%M %p")
+                       if r.last_ok else "never"} for r in rows]
+    db.close()
+    return out
+
+
+@app.get("/jobs")
+def jobs_list(request: Request, limit: int = 30):
+    require_auth(request)
+    db = Session()
+    rows = db.query(Job).order_by(Job.id.desc()).limit(limit).all()
+    names = {a.id: a.name for a in db.query(Account).all()}
+    out = [{"job_id": r.id, "who": names.get(r.account_id) or "?",
+            "kind": r.kind, "site": r.site, "state": r.state,
+            "message": r.message, "history": r.history or "",
+            "at": r.at.strftime("%b %-d %-I:%M %p") if r.at else ""}
+           for r in rows]
+    db.close()
+    return out
+
+
 class FollowupBody(BaseModel):
     account_id: int | None = None
     call_id: int | None = None
@@ -2187,6 +2760,7 @@ ADMIN_HTML = """<!doctype html>
     <a data-p="customers">Customers</a>
     <a data-p="followups">To do</a>
     <a data-p="signins">Sign-ins</a>
+    <a data-p="jobs">Site logins</a>
     <a data-p="texts">Texts</a>
   </nav>
   <button class="sec" onclick="fetch('/admin/logout',{method:'POST'})
@@ -2264,6 +2838,21 @@ ADMIN_HTML = """<!doctype html>
     <table><thead><tr><th>#</th><th>Who</th><th>Address</th><th>When</th>
     <th>Result</th><th></th></tr></thead>
     <tbody id="obrows"><tr><td colspan="6" class="hint">Loading&hellip;</td></tr>
+    </tbody></table>
+  </div>
+</section>
+
+<section class="page" id="p-jobs">
+  <div class="card"><h2>Browser queue</h2>
+    <div class="nums" id="qhealth"><span class="hint">Loading&hellip;</span></div>
+  </div>
+  <div class="card"><h2>Site sign-ins</h2>
+    <div class="hint">Amazon, Walmart, Temu. Sessions are kept so customers
+      aren't asked to sign in again each time.</div>
+    <button class="sec" onclick="loadJobs()">Refresh</button>
+    <table><thead><tr><th>#</th><th>Who</th><th>Site</th><th>When</th>
+    <th>Result</th><th></th></tr></thead>
+    <tbody id="jobrows"><tr><td colspan="6" class="hint">Loading&hellip;</td></tr>
     </tbody></table>
   </div>
 </section>
@@ -2470,6 +3059,48 @@ function showOb(id, btn){
   btn.textContent = open ? 'Steps' : 'Hide';
 }
 
+async function loadHealth(){
+  try{
+    const d = await (await fetch('/jobs/health')).json();
+    document.getElementById('qhealth').innerHTML =
+      '<div class="num"><b>'+d.running+'</b><span>running now</span></div>'+
+      '<div class="num"><b>'+d.waiting+'</b><span>waiting</span></div>'+
+      '<div class="num"><b>'+d.max_browsers+'</b><span>max at once</span></div>'+
+      '<div class="num"><b>'+d.saved_sessions+'</b><span>saved sessions</span></div>'+
+      (d.stuck_over_20min ? '<div class="num"><b class="no">'+
+        d.stuck_over_20min+'</b><span>stuck 20min+</span></div>' : '');
+  }catch(e){ document.getElementById('qhealth').innerHTML =
+    '<span class="no">'+esc(e.message)+'</span>'; }
+}
+async function loadJobs(){
+  const tb = document.getElementById('jobrows');
+  try{
+    const d = await (await fetch('/jobs?limit=25')).json();
+    if(!d.length){
+      tb.innerHTML='<tr><td colspan="6" class="hint">None yet.</td></tr>';
+      return; }
+    tb.innerHTML = d.map(function(j){
+      var cls = j.state==='done'?'ok':(j.state==='failed'?'no':'warn');
+      return '<tr><td>'+j.job_id+'</td><td>'+esc(j.who)+'</td>'+
+        '<td><span class="tag">'+esc(j.site)+'</span></td>'+
+        '<td>'+esc(j.at)+'</td>'+
+        '<td class="'+cls+'">'+esc(j.state)+
+        (j.message?'<span class="'+(cls==='no'?'err':'hint')+'">'+
+          esc(j.message)+'</span>':'')+'</td>'+
+        '<td><button class="sec" onclick="showJob('+j.job_id+',this)">'+
+        'Steps</button></td></tr>'+
+        '<tr class="det" id="jb'+j.job_id+'" style="display:none">'+
+        '<td colspan="6"><pre>'+esc(j.history||'No steps.')+'</pre></td></tr>';
+    }).join('');
+  }catch(e){
+    tb.innerHTML='<tr><td colspan="6" class="no">'+esc(e.message)+'</td></tr>'; }
+}
+function showJob(id, btn){
+  const row = document.getElementById('jb'+id);
+  const open = row.style.display === 'table-row';
+  row.style.display = open ? 'none' : 'table-row';
+  btn.textContent = open ? 'Steps' : 'Hide';
+}
 async function loadDlr(){
   const tb = document.getElementById('dlr');
   try{
@@ -2514,9 +3145,9 @@ async function add(){
   else { m.textContent='Failed — that number may already exist.'; }
 }
 
-load(); loadCalls(); loadStats(); loadDlr(); loadOb(); loadFu();
+load(); loadCalls(); loadStats(); loadDlr(); loadOb(); loadFu(); loadJobs(); loadHealth();
 setInterval(function(){ loadCalls(); loadStats(); loadDlr(); loadOb();
-                        loadFu(); }, 25000);
+                        loadFu(); loadJobs(); loadHealth(); }, 25000);
 </script></body></html>"""
 
 

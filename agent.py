@@ -139,6 +139,7 @@ class Assistant(Agent):
         self.last_list = []
         self.last_events = []
         self.onboard_sid = None
+        self.job_id = None
         self.mailbox = ""
 
         today = datetime.now(ZoneInfo("America/New_York")).strftime(
@@ -222,6 +223,22 @@ CALENDAR
 - Speak times naturally: "Tuesday at two thirty", never ISO timestamps.
 - Today is {today}. Work out relative dates like "tomorrow" or "next Tuesday"
   yourself before calling a tool.
+
+SAVED LOGINS FOR OTHER SITES
+If they want you to order from a site that needs their account, you can save
+that login. Ask for the site, their username, and the password — spelled
+slowly, same as before. Read it back, get a yes, then save_site_login.
+- list_site_logins tells you which sites they've saved. It never shows
+  passwords, and neither do you: once saved, never say a password out loud
+  again, not even to confirm.
+- "Forget my Amazon login" -> forget_site_login.
+- Tell them plainly it's stored encrypted and they can have it deleted any
+  time by asking.
+- Right after saving, offer to check it works: sign_in_to_site. It takes a
+  minute. Poll check_site_login. If it says needs_code, the site texted or
+  emailed them a code — ask for it and call submit_site_code.
+- Once a site is signed in, we stay signed in, so they won't be asked again
+  every time.
 
 DISCONNECTING AND DELETING
 The caller can undo anything they've set up.
@@ -446,6 +463,116 @@ FINDING EMAIL
         await log_turn(self.call_id, "tool", f"note: {reason}",
                        "leave_note_for_office")
         return "Noted for the office. Tell them it's been passed on."
+
+    @function_tool
+    @auto_report("site_login")
+    async def sign_in_to_site(self, context: RunContext, site: str):
+        """Sign the caller into a saved site (amazon, walmart, temu) and
+        keep the session for future orders."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            async with httpx.AsyncClient(timeout=25) as c:
+                r = await c.post(f"{BACKEND}/jobs/site-login", headers=AUTH,
+                                 params={"account_id": self.account_id,
+                                         "site": site,
+                                         "call_id": self.call_id or 0})
+                d = r.json()
+        except Exception as e:
+            log.error(f"site login failed: {e}")
+            return "Couldn't start that."
+        self.job_id = d.get("job_id")
+        return (f"Signing in to {site}. Tell them it takes about a minute, "
+                f"then call check_site_login.")
+
+    @function_tool
+    @auto_report("site_login")
+    async def check_site_login(self, context: RunContext):
+        """How the site sign-in is going. Call every 15 seconds or so."""
+        if not getattr(self, "job_id", None):
+            return "No sign-in running."
+        try:
+            d = await backend_get("/jobs/status", job_id=self.job_id)
+        except Exception:
+            return "Couldn't check just now."
+        state, msg = d.get("state", ""), d.get("message", "")
+        if state == "needs_code":
+            return msg + " Ask for it, then call submit_site_code."
+        if state == "done":
+            return f"Done. {msg}"
+        if state == "failed":
+            return f"It didn't work: {msg}"
+        if state == "waiting":
+            return (msg + " Tell them it's queued and will start in a moment.")
+        return f"Still working ({state}). Check again shortly."
+
+    @function_tool
+    @auto_report("site_login")
+    async def submit_site_code(self, context: RunContext, code: str):
+        """Give the site the one-time code the caller read out."""
+        if not getattr(self, "job_id", None):
+            return "No sign-in running."
+        try:
+            await backend_post("/jobs/code",
+                               {"job_id": self.job_id, "code": code})
+        except Exception as e:
+            log.error(f"job code failed: {e}")
+            return "That code didn't go through."
+        return "Code sent. Check again in a few seconds."
+
+    @function_tool
+    @auto_report("logins")
+    async def save_site_login(self, context: RunContext, site: str,
+                              username: str, password: str):
+        """Save a login for a site with no API, e.g. Amazon. Only after
+        reading the details back and getting a yes."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            await backend_post("/logins", {
+                "account_id": self.account_id, "site": site,
+                "username": username, "password": password})
+        except Exception as e:
+            log.error(f"save login failed: {e}")
+            return "That didn't save."
+        await log_turn(self.call_id, "tool", f"saved login for {site}",
+                       "save_site_login")
+        return (f"Saved their {site} login. Do not say the password again. "
+                f"Tell them it's stored encrypted and they can have it "
+                f"deleted whenever they want.")
+
+    @function_tool
+    @auto_report("logins")
+    async def list_site_logins(self, context: RunContext):
+        """Which sites they've saved a login for. Never shows passwords."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            rows = await backend_get("/logins", account_id=self.account_id)
+        except Exception:
+            return "Couldn't check."
+        if not rows:
+            return "No site logins saved."
+        return "; ".join(f"{r['site']} as {r['username']}" for r in rows)
+
+    @function_tool
+    @auto_report("logins")
+    async def forget_site_login(self, context: RunContext, site: str):
+        """Delete a saved site login."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            async with httpx.AsyncClient(timeout=20) as c:
+                r = await c.request("DELETE", f"{BACKEND}/logins",
+                                    headers=AUTH,
+                                    params={"account_id": self.account_id,
+                                            "site": site})
+                d = r.json()
+        except Exception as e:
+            log.error(f"forget login failed: {e}")
+            return "That didn't go through."
+        return (f"Deleted their {site} login." if d.get("removed")
+                else f"Nothing saved for {site}.")
 
     @function_tool
     @auto_report("account")
