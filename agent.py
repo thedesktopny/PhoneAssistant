@@ -122,6 +122,12 @@ anything on those topics, even if it appears in their own email.
 One exception: if a caller sounds like they are in danger or in a medical
 emergency, help them get to emergency services. Safety comes before this list.
 
+LANGUAGE
+Speak English. Start every call in English and stay in English unless the
+caller clearly speaks to you in another language first — then answer in
+theirs and keep to it for the rest of the call. Never switch languages on
+your own, and never switch back mid-call unless they do.
+
 HOW YOU TALK
 - You are on a phone call. Keep every reply to one or two short sentences.
 - NEVER go silent. Every single turn you take must end with either a question
@@ -730,10 +736,11 @@ async def entrypoint(ctx: JobContext):
 
     if not account:
         await session.start(room=ctx.room, agent=Agent(
-            instructions="Say this number isn't set up yet, then say goodbye."))
+            instructions=("Speak English. Say this number isn't set up yet, "
+                          "then say goodbye.")))
         await session.generate_reply(
-            instructions="Tell them this number isn't registered and to call "
-                         "the office. Keep it to one sentence.")
+            instructions=("In English: tell them this number isn't registered "
+                          "and to call the office. One sentence."))
         return
 
     history = ""
@@ -779,8 +786,9 @@ async def entrypoint(ctx: JobContext):
 
     await session.start(room=ctx.room, agent=agent_obj)
     await session.generate_reply(
-        instructions=f"Greet {account.get('name')} by name in one short "
-                     f"sentence and ask for their PIN.")
+        instructions=(f"In English: greet {account.get('name')} by name in "
+                      f"one short sentence and ask for their PIN. "
+                      f"Speak English."))
 
 
 if __name__ == "__main__":

@@ -160,6 +160,7 @@ class Onboard(Base):
     email = Column(String(200), default="")
     state = Column(String(30), default="starting")
     message = Column(Text, default="")
+    history = Column(Text, default="")
     at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -174,6 +175,9 @@ def _ensure_columns():
             ("label", "VARCHAR(60) DEFAULT ''"),
             ("is_default", "INTEGER DEFAULT 0"),
             ("use_count", "INTEGER DEFAULT 0"),
+        ],
+        "onboard": [
+            ("history", "TEXT DEFAULT ''"),
         ],
     }
     with engine.begin() as c:
@@ -747,6 +751,9 @@ def _ob_set(sid: int, state: str, message: str = ""):
     if row:
         row.state = state
         row.message = message[:500]
+        stamp = datetime.utcnow().strftime("%H:%M:%S")
+        line = f"[{stamp}] {state}: {message[:300]}"
+        row.history = ((row.history or "") + line + "\n")[-6000:]
         db.commit()
     db.close()
 
@@ -799,6 +806,11 @@ def _run_signin(sid: int, account_id: int, email: str):
         """Say where the code went, so the caller knows what to look for."""
         body = screen(page)
         m = _re.search(r"\(?\s*[•\*\u2022]{0,3}\s*(\d{2,4})\s*\)?\s*$", "")
+        if _re.search(r"enter your (device |phone )?(pin|passcode)|"
+                      r"screen lock|unlock your (phone|device)", body, _re.I):
+            return ("Google wants the PIN or passcode they use to unlock "
+                    "their own phone. If they don't want to give that, "
+                    "offer try_another_way.")
         if _re.search(r"authenticator|Google Authenticator", body, _re.I):
             return ("Google wants the 6-digit code from their authenticator "
                     "app. Ask them to open it and read the current code.")
@@ -1420,7 +1432,7 @@ def create_account(a: NewAccount, request: Request):
 
 
 @app.get("/accounts")
-def list_accounts(request: Request):
+def list_accounts(request: Request, q: str = ""):
     require_auth(request)
     db = Session()
     rows = []
@@ -1438,6 +1450,14 @@ def list_accounts(request: Request):
                            "default": bool(c.is_default),
                            "used": c.use_count or 0} for c in conns],
         })
+    if q:
+        w = q.strip().lower()
+        rows = [r for r in rows
+                if w in (r["name"] or "").lower()
+                or any(w in p for p in r["phones"])
+                or any(w in (m["email"] or "").lower()
+                       for m in r["mailboxes"])
+                or str(r["account_id"]) == w]
     db.close()
     return rows
 
@@ -1811,10 +1831,10 @@ def call_end(request: Request, call_id: int, verified: int = 0):
 
 
 @app.get("/calls")
-def calls_list(request: Request, limit: int = 50):
+def calls_list(request: Request, limit: int = 50, q: str = ""):
     require_auth(request)
     db = Session()
-    rows = db.query(Call).order_by(Call.id.desc()).limit(limit).all()
+    rows = db.query(Call).order_by(Call.id.desc()).limit(400).all()
     names = {a.id: a.name for a in db.query(Account).all()}
     ids = [r.id for r in rows]
     turns = (db.query(CallTurn).filter(CallTurn.call_id.in_(ids)).all()
@@ -1839,8 +1859,9 @@ def calls_list(request: Request, limit: int = 50):
             if any(p in low for p in (
                     "didn't go", "couldn't", "not verified", "failed",
                     "nothing matched", "no address found", "didn't get added",
-                    "did not go through", "i'm sorry", "not allowed")):
-                problems.append((t.text or "")[:120])
+                    "did not go through", "i'm sorry", "error",
+                    "didn't work", "not allowed")):
+                problems.append(t.text or "")
         out.append({
             "call_id": r.id,
             "who": names.get(r.account_id) or "unknown",
@@ -1852,9 +1873,17 @@ def calls_list(request: Request, limit: int = 50):
             "tasks": tools,
             "turns": len(ts),
             "slowest_ms": slowest,
-            "problems": problems[:3],
+            "problems": problems[:5],
         })
-    return out
+
+    if q:
+        w = q.strip().lower()
+        out = [c for c in out
+               if w in (c["who"] or "").lower()
+               or w in (c["from"] or "").lower()
+               or w in " ".join(c["tasks"]).lower()
+               or str(c["call_id"]) == w]
+    return out[:limit]
 
 
 @app.get("/stats")
@@ -2009,114 +2038,168 @@ ADMIN_HTML = """<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Phone Assistant &mdash; Admin</title>
 <style>
+ *{box-sizing:border-box}
  body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#0f1115;
-      color:#e6e6e6;margin:0;padding:24px;}
- h1{font-size:20px;margin:0 0 6px;}
- .sub{color:#8b94a7;font-size:13px;margin-bottom:20px;}
+      color:#e6e6e6;margin:0;padding:0;}
+ header{display:flex;align-items:center;gap:18px;padding:16px 24px;
+        border-bottom:1px solid #262b36;background:#141821;
+        position:sticky;top:0;z-index:5;}
+ header h1{font-size:17px;margin:0;}
+ nav{display:flex;gap:4px;margin-left:auto;flex-wrap:wrap;}
+ nav a{padding:8px 14px;border-radius:6px;color:#8b94a7;text-decoration:none;
+       font-size:14px;cursor:pointer;}
+ nav a.on{background:#232936;color:#fff;}
+ main{padding:22px 24px;max-width:1150px;}
  .card{background:#171a21;border:1px solid #262b36;border-radius:10px;
-       padding:18px;margin-bottom:18px;max-width:1000px;}
- .card b{font-size:15px;}
+       padding:18px;margin-bottom:18px;}
+ .card h2{font-size:15px;margin:0 0 4px;}
+ .hint{color:#8b94a7;font-size:13px;margin-bottom:10px;}
  label{display:block;font-size:12px;color:#8b94a7;margin:10px 0 4px;}
  input{width:100%;padding:9px 10px;background:#0f1115;border:1px solid #2c3240;
-       border-radius:6px;color:#e6e6e6;font-size:14px;box-sizing:border-box;}
- button{margin-top:14px;padding:9px 16px;background:#3b82f6;border:0;
-        border-radius:6px;color:#fff;font-size:14px;cursor:pointer;}
- button.sec{background:#2c3240;margin:0 0 0 6px;padding:6px 12px;}
- table{width:100%;border-collapse:collapse;margin-top:10px;font-size:14px;}
+       border-radius:6px;color:#e6e6e6;font-size:14px;}
+ .search{max-width:340px;display:inline-block;margin-right:8px;}
+ button{padding:9px 15px;background:#3b82f6;border:0;border-radius:6px;
+        color:#fff;font-size:14px;cursor:pointer;}
+ button.sec{background:#2c3240;padding:6px 12px;}
+ table{width:100%;border-collapse:collapse;margin-top:12px;font-size:14px;}
  th{text-align:left;color:#8b94a7;font-weight:500;font-size:12px;
     padding:8px 6px;border-bottom:1px solid #262b36;}
  td{padding:10px 6px;border-bottom:1px solid #1c212b;vertical-align:top;}
+ tr.det td{background:#12151c;}
  .ok{color:#4ade80;} .no{color:#f87171;} .warn{color:#fbbf24;}
  .tag{display:inline-block;background:#232936;border-radius:4px;
       padding:2px 7px;margin:2px 3px 2px 0;font-size:12px;color:#c3cad8;}
- .prob{color:#f87171;font-size:12px;display:block;margin-top:4px;}
+ .err{color:#f87171;font-size:13px;display:block;margin-top:5px;
+      white-space:pre-wrap;line-height:1.5;}
  a.btn{display:inline-block;padding:6px 12px;background:#2c3240;color:#e6e6e6;
        border-radius:6px;text-decoration:none;font-size:13px;}
  .msg{margin-top:10px;font-size:13px;color:#8b94a7;}
- .nums{display:flex;gap:26px;flex-wrap:wrap;margin-top:12px;}
+ .nums{display:flex;gap:26px;flex-wrap:wrap;}
  .num b{display:block;font-size:24px;color:#fff;}
  .num span{font-size:12px;color:#8b94a7;}
  pre{white-space:pre-wrap;background:#0f1115;padding:14px;border-radius:6px;
-     margin-top:12px;display:none;font-size:13px;max-height:420px;
-     overflow:auto;line-height:1.6;}
+     font-size:13px;line-height:1.65;max-height:460px;overflow:auto;
+     margin:10px 0 0;}
+ .page{display:none;} .page.on{display:block;}
 </style></head><body>
-<h1>Phone Assistant
-  <button class="sec" style="float:right;margin:0"
-    onclick="fetch('/admin/logout',{method:'POST'}).then(()=>location.reload())">
-    Sign out</button></h1>
-<div class="sub" id="clock"></div>
+<header>
+  <h1>Phone Assistant</h1>
+  <nav>
+    <a data-p="overview" class="on">Overview</a>
+    <a data-p="calls">Calls</a>
+    <a data-p="customers">Customers</a>
+    <a data-p="signins">Sign-ins</a>
+    <a data-p="texts">Texts</a>
+  </nav>
+  <button class="sec" onclick="fetch('/admin/logout',{method:'POST'})
+    .then(()=>location.reload())">Sign out</button>
+</header>
+<main>
 
-<div class="card">
-  <b>Last 7 days</b>
-  <div class="nums" id="stats"><span style="color:#8b94a7">Loading…</span></div>
-</div>
-
-<div class="card">
-  <b>Recent calls</b>
-  <button class="sec" onclick="loadCalls()">Refresh</button>
-  <table><thead><tr><th>#</th><th>Who</th><th>When</th><th>Length</th>
-  <th>PIN</th><th>What they wanted</th><th></th></tr></thead>
-  <tbody id="calls"><tr><td colspan="7" style="color:#8b94a7">Loading…</td></tr>
-  </tbody></table>
-  <pre id="tx"></pre>
-</div>
-
-<div class="card">
-  <b>Text delivery</b>
-  <button class="sec" onclick="loadDlr()">Refresh</button>
-  <table><thead><tr><th>When</th><th>To</th><th>Status</th>
-  <th>Detail</th></tr></thead>
-  <tbody id="dlr"><tr><td colspan="4" style="color:#8b94a7">
-  Nothing yet.</td></tr></tbody></table>
-</div>
-
-<div class="card">
-  <b>Add a customer</b>
-  <label>Name</label><input id="n" placeholder="Chaim Weiss">
-  <label>Their phone number (the one they'll call from)</label>
-  <input id="p" placeholder="+18455551234">
-  <label>PIN</label><input id="k" value="1234">
-  <button onclick="add()">Create</button>
-  <div class="msg" id="msg"></div>
-</div>
-
-<div class="card">
-  <b>Connect a customer's Gmail for them</b>
-  <div style="color:#8b94a7;font-size:13px;margin-top:6px">
-    For customers with no internet. Take their email and password on the
-    phone, type them here. The password is used once and never saved.
+<section class="page on" id="p-overview">
+  <div class="card"><h2>Last 7 days</h2>
+    <div class="nums" id="stats"><span class="hint">Loading&hellip;</span></div>
   </div>
-  <label>Customer ID</label><input id="ob_id" placeholder="2">
-  <label>Their Gmail address</label>
-  <input id="ob_email" placeholder="name@gmail.com">
-  <label>Their Google password</label>
-  <input id="ob_pw" type="password">
-  <button onclick="obStart()">Start sign-in</button>
-  <div class="msg" id="ob_msg"></div>
-  <div id="ob_code" style="display:none;margin-top:12px">
-    <label>Google sent them a code &mdash; type it here</label>
-    <input id="ob_codeval" placeholder="123456">
-    <button onclick="obCode()">Submit code</button>
+  <div class="card"><h2>Latest calls</h2>
+    <table><thead><tr><th>#</th><th>Who</th><th>When</th><th>Length</th>
+    <th>What they wanted</th></tr></thead>
+    <tbody id="mini"><tr><td colspan="5" class="hint">Loading&hellip;</td></tr>
+    </tbody></table>
   </div>
-</div>
+</section>
 
-<div class="card">
-  <b>Customers</b>
-  <table><thead><tr><th>ID</th><th>Name</th><th>Phone</th>
-  <th>Gmail</th><th></th></tr></thead>
-  <tbody id="rows"><tr><td colspan="5" style="color:#8b94a7">Loading…</td></tr>
-  </tbody></table>
-</div>
+<section class="page" id="p-calls">
+  <div class="card"><h2>Calls</h2>
+    <div class="hint">Search by name, number, call id, or what they asked for.</div>
+    <div class="search"><input id="q_calls" placeholder="e.g. David, 3476, send_email"
+      onkeydown="if(event.key==='Enter')loadCalls()"></div>
+    <button onclick="loadCalls()">Search</button>
+    <button class="sec" onclick="document.getElementById('q_calls').value='';loadCalls()">
+      Clear</button>
+    <table><thead><tr><th>#</th><th>Who</th><th>When</th><th>Length</th>
+    <th>PIN</th><th>What they wanted</th><th></th></tr></thead>
+    <tbody id="calls"><tr><td colspan="7" class="hint">Loading&hellip;</td></tr>
+    </tbody></table>
+  </div>
+</section>
 
+<section class="page" id="p-customers">
+  <div class="card"><h2>Customers</h2>
+    <div class="search"><input id="q_cust" placeholder="name, number or email"
+      onkeydown="if(event.key==='Enter')load()"></div>
+    <button onclick="load()">Search</button>
+    <button class="sec" onclick="document.getElementById('q_cust').value='';load()">
+      Clear</button>
+    <table><thead><tr><th>ID</th><th>Name</th><th>Phone</th>
+    <th>Mailboxes</th><th></th></tr></thead>
+    <tbody id="rows"><tr><td colspan="5" class="hint">Loading&hellip;</td></tr>
+    </tbody></table>
+  </div>
+  <div class="card"><h2>Add a customer</h2>
+    <div class="hint">Customers normally set themselves up by phone. This is
+      for when you need to add someone by hand.</div>
+    <label>Name</label><input id="n">
+    <label>Their phone number</label><input id="p" placeholder="+18455551234">
+    <label>PIN</label><input id="k" value="1234">
+    <button onclick="add()">Create</button>
+    <div class="msg" id="msg"></div>
+  </div>
+</section>
+
+<section class="page" id="p-signins">
+  <div class="card"><h2>Email sign-in attempts</h2>
+    <div class="hint">Every step of each attempt, with the reason it stopped.</div>
+    <button class="sec" onclick="loadOb()">Refresh</button>
+    <table><thead><tr><th>#</th><th>Who</th><th>Address</th><th>When</th>
+    <th>Result</th><th></th></tr></thead>
+    <tbody id="obrows"><tr><td colspan="6" class="hint">Loading&hellip;</td></tr>
+    </tbody></table>
+  </div>
+</section>
+
+<section class="page" id="p-texts">
+  <div class="card"><h2>Text delivery</h2>
+    <div class="hint">What the carrier reported for each message.</div>
+    <button class="sec" onclick="loadDlr()">Refresh</button>
+    <table><thead><tr><th>When</th><th>To</th><th>Status</th>
+    <th>Detail</th></tr></thead>
+    <tbody id="dlr"><tr><td colspan="4" class="hint">Loading&hellip;</td></tr>
+    </tbody></table>
+  </div>
+</section>
+
+</main>
 <script>
 function esc(x){ return String(x==null?'':x)
   .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
+document.querySelectorAll('nav a').forEach(function(a){
+  a.onclick = function(){
+    document.querySelectorAll('nav a').forEach(function(b){
+      b.classList.remove('on'); });
+    a.classList.add('on');
+    document.querySelectorAll('.page').forEach(function(s){
+      s.classList.remove('on'); });
+    document.getElementById('p-'+a.dataset.p).classList.add('on');
+  };
+});
+
+function taskCell(c){
+  var t = (c.tasks||[]).map(function(x){
+    return '<span class="tag">'+esc(x)+'</span>'; }).join('');
+  if(!t) t = '<span class="hint">just talking</span>';
+  if(c.slowest_ms > 2500) t += '<span class="warn"> slow '+c.slowest_ms+'ms</span>';
+  (c.problems||[]).forEach(function(p){
+    t += '<span class="err">'+esc(p)+'</span>'; });
+  return t;
+}
+
 async function loadStats(){
   try{
     const d = await (await fetch('/stats?days=7')).json();
-    const tasks = (d.top_tasks||[]).map(t =>
-      '<span class="tag">'+esc(t[0])+' '+t[1]+'</span>').join('') || '&mdash;';
+    const tasks = (d.top_tasks||[]).map(function(t){
+      return '<span class="tag">'+esc(t[0])+' '+t[1]+'</span>'; }).join('')
+      || '&mdash;';
     document.getElementById('stats').innerHTML =
       '<div class="num"><b>'+d.calls+'</b><span>calls</span></div>'+
       '<div class="num"><b>'+d.verified+'</b><span>passed PIN</span></div>'+
@@ -2126,114 +2209,149 @@ async function loadStats(){
       '<div style="margin-top:6px">'+tasks+'</div></div>';
   }catch(e){
     document.getElementById('stats').innerHTML =
-      '<span class="no">Could not load stats.</span>';
-  }
+      '<span class="no">'+esc(e.message)+'</span>'; }
 }
 
 async function loadCalls(){
+  const q = (document.getElementById('q_calls')||{}).value || '';
   const tb = document.getElementById('calls');
+  const mini = document.getElementById('mini');
   try{
-    const d = await (await fetch('/calls?limit=25')).json();
+    const d = await (await fetch('/calls?limit=50&q='+
+      encodeURIComponent(q))).json();
     if(!d.length){
-      tb.innerHTML = '<tr><td colspan="7" style="color:#8b94a7">'+
-        'No calls yet.</td></tr>'; return;
+      tb.innerHTML = '<tr><td colspan="7" class="hint">No calls found.</td></tr>';
+      mini.innerHTML = '<tr><td colspan="5" class="hint">No calls yet.</td></tr>';
+      return;
     }
     tb.innerHTML = d.map(function(c){
-      var tasks = (c.tasks||[]).map(function(t){
-        return '<span class="tag">'+esc(t)+'</span>'; }).join('');
-      if(!tasks) tasks = '<span style="color:#8b94a7">just talking</span>';
-      var probs = (c.problems||[]).map(function(p){
-        return '<span class="prob">stuck: '+esc(p)+'</span>'; }).join('');
-      var slow = c.slowest_ms > 2500
-        ? '<span class="warn"> slow '+c.slowest_ms+'ms</span>' : '';
-      return '<tr><td>'+c.call_id+'</td><td>'+esc(c.who)+'<br>'+
-        '<span style="color:#8b94a7;font-size:12px">'+esc(c.from)+'</span></td>'+
-        '<td>'+esc(c.started)+'</td><td>'+c.seconds+'s<br>'+
-        '<span style="color:#8b94a7;font-size:12px">'+c.turns+' turns</span></td>'+
-        '<td>'+(c.verified?'<span class="ok">ok</span>':'<span class="no">no</span>')+
-        '</td><td>'+tasks+slow+probs+'</td>'+
-        '<td><button class="sec" onclick="showTx('+c.call_id+')">'+
-        'Transcript</button></td></tr>';
+      return '<tr><td>'+c.call_id+'</td>'+
+        '<td>'+esc(c.who)+'<br><span class="hint">'+esc(c.from)+'</span></td>'+
+        '<td>'+esc(c.started)+'</td>'+
+        '<td>'+c.seconds+'s<br><span class="hint">'+c.turns+' turns</span></td>'+
+        '<td>'+(c.verified?'<span class="ok">ok</span>'
+                          :'<span class="no">no</span>')+'</td>'+
+        '<td>'+taskCell(c)+'</td>'+
+        '<td><button class="sec" onclick="showTx('+c.call_id+',this)">'+
+        'Transcript</button></td></tr>'+
+        '<tr class="det" id="det'+c.call_id+'" style="display:none">'+
+        '<td colspan="7"><pre id="tx'+c.call_id+'"></pre></td></tr>';
     }).join('');
+    mini.innerHTML = d.slice(0,6).map(function(c){
+      return '<tr><td>'+c.call_id+'</td><td>'+esc(c.who)+'</td>'+
+        '<td>'+esc(c.started)+'</td><td>'+c.seconds+'s</td>'+
+        '<td>'+taskCell(c)+'</td></tr>'; }).join('');
   }catch(e){
-    tb.innerHTML = '<tr><td colspan="7" class="no">Error loading calls: '+
-      esc(e.message)+'</td></tr>';
-  }
+    tb.innerHTML = '<tr><td colspan="7" class="no">'+esc(e.message)+'</td></tr>'; }
 }
 
-async function showTx(id){
-  const el = document.getElementById('tx');
-  el.style.display = 'block';
-  el.textContent = 'Loading…';
+async function showTx(id, btn){
+  const row = document.getElementById('det'+id);
+  const pre = document.getElementById('tx'+id);
+  if(row.style.display === 'table-row'){
+    row.style.display = 'none'; btn.textContent = 'Transcript'; return; }
+  row.style.display = 'table-row';
+  btn.textContent = 'Hide';
+  pre.textContent = 'Loading…';
   try{
-    const d = await (await fetch('/calls/'+id)).json();
-    el.textContent = d.length
-      ? d.map(function(t){
-          return '['+t.at+'] '+t.who+(t.tool?' ('+t.tool+')':'')+
-                 (t.latency_ms?' '+t.latency_ms+'ms':'')+': '+t.text;
-        }).join(String.fromCharCode(10))
-      : 'No transcript recorded for this call.';
-  }catch(e){ el.textContent = 'Could not load transcript.'; }
+    const r = await fetch('/calls/'+id);
+    if(!r.ok){ pre.innerHTML = '<span class="no">Server said '+r.status+
+      '. '+esc(await r.text())+'</span>'; return; }
+    const d = await r.json();
+    if(!d.length){
+      pre.innerHTML = '<span class="warn">Nothing was recorded for this '+
+        'call. If this keeps happening, SERVICE_TOKEN may be missing on '+
+        'the agent service.</span>'; return; }
+    pre.textContent = d.map(function(t){
+      return '['+t.at+'] '+t.who+(t.tool?' ('+t.tool+')':'')+
+             (t.latency_ms?' '+t.latency_ms+'ms':'')+': '+t.text;
+    }).join(String.fromCharCode(10));
+  }catch(e){ pre.innerHTML = '<span class="no">'+esc(e.message)+'</span>'; }
+}
+
+function mboxes(a){
+  var m = a.mailboxes || [];
+  if(!m.length) return '<span class="no">none connected</span>';
+  return m.map(function(b){
+    return '<div style="margin-bottom:4px"><span class="ok">'+
+      esc(b.email)+'</span>'+
+      (b.label?' <span class="tag">'+esc(b.label)+'</span>':'')+
+      (b.default?' <span class="tag">main</span>':'')+
+      ' <span class="hint">'+b.used+' uses</span></div>'; }).join('');
 }
 
 async function load(){
+  const q = (document.getElementById('q_cust')||{}).value || '';
   const tb = document.getElementById('rows');
   try{
-    const d = await (await fetch('/accounts')).json();
+    const d = await (await fetch('/accounts?q='+
+      encodeURIComponent(q))).json();
     if(!d.length){
-      tb.innerHTML = '<tr><td colspan="5" style="color:#8b94a7">'+
-        'No customers yet.</td></tr>'; return;
-    }
+      tb.innerHTML='<tr><td colspan="5" class="hint">None found.</td></tr>';
+      return; }
     tb.innerHTML = d.map(function(a){
       return '<tr><td>'+a.account_id+'</td><td>'+esc(a.name)+'</td>'+
         '<td>'+esc((a.phones||[]).join(', '))+'</td>'+
         '<td>'+mboxes(a)+'</td>'+
         '<td><a class="btn" target="_blank" href="/link/start?account_id='+
-        a.account_id+'">Link Gmail</a>'+
-        '<button class="sec" onclick="copyLink('+a.account_id+')">Copy</button>'+
+        a.account_id+'">Link</a> '+
+        '<button class="sec" onclick="copyLink('+a.account_id+')">Copy</button> '+
         '<button class="sec" onclick="textLink('+a.account_id+')">Text</button>'+
-        '</td></tr>';
-    }).join('');
+        '</td></tr>'; }).join('');
   }catch(e){
-    tb.innerHTML = '<tr><td colspan="5" class="no">Error: '+
-      esc(e.message)+'</td></tr>';
-  }
+    tb.innerHTML='<tr><td colspan="5" class="no">'+esc(e.message)+'</td></tr>'; }
 }
 
-function mboxes(a){
-  var m = a.mailboxes || [];
-  if(!m.length) return '<span class="no">not linked</span>';
-  return m.map(function(b){
-    return '<div style="margin-bottom:4px">'+
-      '<span class="ok">'+esc(b.email)+'</span>'+
-      (b.label?' <span class="tag">'+esc(b.label)+'</span>':'')+
-      (b.default?' <span class="tag">main</span>':'')+
-      ' <span style="color:#8b94a7;font-size:11px">'+b.used+' uses</span>'+
-      ' <a href="#" style="font-size:11px;color:#8b94a7" '+
-      'onclick="labelBox('+b.id+');return false">rename</a>'+
-      (b.default?'':' <a href="#" style="font-size:11px;color:#8b94a7" '+
-      'onclick="defaultBox('+b.id+');return false">make main</a>')+
-      '</div>';
-  }).join('');
+async function loadOb(){
+  const tb = document.getElementById('obrows');
+  try{
+    const d = await (await fetch('/onboard/sessions?limit=20')).json();
+    if(!d.length){
+      tb.innerHTML='<tr><td colspan="6" class="hint">None yet.</td></tr>';
+      return; }
+    tb.innerHTML = d.map(function(o){
+      var cls = o.state==='done'?'ok':(o.state==='failed'?'no':'warn');
+      return '<tr><td>'+o.session_id+'</td><td>'+esc(o.who)+'</td>'+
+        '<td>'+esc(o.email)+'</td><td>'+esc(o.at)+'</td>'+
+        '<td class="'+cls+'">'+esc(o.state)+
+        (o.message?'<span class="'+(cls==='no'?'err':'hint')+'">'+
+          esc(o.message)+'</span>':'')+'</td>'+
+        '<td><button class="sec" onclick="showOb('+o.session_id+',this)">'+
+        'Steps</button></td></tr>'+
+        '<tr class="det" id="ob'+o.session_id+'" style="display:none">'+
+        '<td colspan="6"><pre>'+esc(o.history||'No steps recorded.')+
+        '</pre></td></tr>'; }).join('');
+  }catch(e){
+    tb.innerHTML='<tr><td colspan="6" class="no">'+esc(e.message)+'</td></tr>'; }
 }
-async function labelBox(id){
-  var l = prompt('Short name for this mailbox (work, personal, shul):');
-  if(l === null) return;
-  await fetch('/mailboxes/label?connection_id='+id+
-              '&label='+encodeURIComponent(l), {method:'POST'});
-  load();
+function showOb(id, btn){
+  const row = document.getElementById('ob'+id);
+  const open = row.style.display === 'table-row';
+  row.style.display = open ? 'none' : 'table-row';
+  btn.textContent = open ? 'Steps' : 'Hide';
 }
-async function defaultBox(id){
-  await fetch('/mailboxes/label?connection_id='+id+'&make_default=1',
-              {method:'POST'});
-  load();
+
+async function loadDlr(){
+  const tb = document.getElementById('dlr');
+  try{
+    const d = await (await fetch('/sms/dlr?limit=25')).json();
+    if(!d.length){
+      tb.innerHTML='<tr><td colspan="4" class="hint">'+
+        'No delivery receipts yet.</td></tr>'; return; }
+    tb.innerHTML = d.map(function(x){
+      var good = /deliver|success|ok/i.test(x.status||'');
+      return '<tr><td>'+esc(x.at)+'</td><td>'+esc(x.to)+'</td>'+
+        '<td class="'+(good?'ok':'no')+'">'+esc(x.status||'?')+'</td>'+
+        '<td class="hint">'+esc(x.raw||'')+'</td></tr>'; }).join('');
+  }catch(e){
+    tb.innerHTML='<tr><td colspan="4" class="no">'+esc(e.message)+'</td></tr>'; }
 }
+
 function copyLink(id){
   const url = location.origin + '/link/start?account_id=' + id;
   navigator.clipboard.writeText(url);
-  document.getElementById('msg').textContent = 'Link copied: ' + url;
+  document.getElementById('msg').textContent = 'Copied: ' + url;
 }
-
 async function textLink(id){
   const m = document.getElementById('msg');
   m.textContent = 'Sending…';
@@ -2244,82 +2362,22 @@ async function textLink(id){
       : ('Not sent: ' + (d.detail || d.error || 'check SMS settings'));
   }catch(e){ m.textContent = 'Not sent: ' + e.message; }
 }
-
-var obSid = null, obTimer = null;
-async function obStart(){
-  const m = document.getElementById('ob_msg');
-  m.textContent = 'Starting…';
-  document.getElementById('ob_code').style.display = 'none';
-  try{
-    const r = await fetch('/onboard/start', {method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({
-        account_id: parseInt(document.getElementById('ob_id').value),
-        email: document.getElementById('ob_email').value,
-        password: document.getElementById('ob_pw').value})});
-    const d = await r.json();
-    if(!r.ok){ m.textContent = d.detail || 'Could not start.'; return; }
-    obSid = d.session_id;
-    document.getElementById('ob_pw').value = '';
-    if(obTimer) clearInterval(obTimer);
-    obTimer = setInterval(obPoll, 3000);
-    obPoll();
-  }catch(e){ m.textContent = 'Error: ' + e.message; }
-}
-async function obPoll(){
-  if(!obSid) return;
-  try{
-    const d = await (await fetch('/onboard/status?session_id='+obSid)).json();
-    document.getElementById('ob_msg').textContent =
-      d.state + (d.message ? ' — ' + d.message : '');
-    document.getElementById('ob_code').style.display =
-      (d.state === 'needs_code') ? 'block' : 'none';
-    if(d.state === 'done' || d.state === 'failed'){
-      clearInterval(obTimer); obTimer = null; load();
-    }
-  }catch(e){}
-}
-async function obCode(){
-  await fetch('/onboard/code', {method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({session_id: obSid,
-      code: document.getElementById('ob_codeval').value})});
-  document.getElementById('ob_codeval').value = '';
-  document.getElementById('ob_msg').textContent = 'Code submitted…';
-}
 async function add(){
-  const body = {name:document.getElementById('n').value,
-                phone:document.getElementById('p').value,
-                pin:document.getElementById('k').value};
   const m = document.getElementById('msg');
   const r = await fetch('/accounts',{method:'POST',
-      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  if(r.ok){ m.textContent='Created. Now click Link Gmail or Text on their row.';
-            document.getElementById('n').value='';
-            document.getElementById('p').value=''; load(); }
-  else { m.textContent='Failed &mdash; that phone number may already exist.'; }
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name:document.getElementById('n').value,
+      phone:document.getElementById('p').value,
+      pin:document.getElementById('k').value})});
+  if(r.ok){ m.textContent='Created.';
+    document.getElementById('n').value='';
+    document.getElementById('p').value=''; load(); }
+  else { m.textContent='Failed — that number may already exist.'; }
 }
 
-document.getElementById('clock').textContent =
-  'Updated ' + new Date().toLocaleTimeString();
-async function loadDlr(){
-  const tb = document.getElementById('dlr');
-  try{
-    const d = await (await fetch('/sms/dlr?limit=20')).json();
-    if(!d.length){ tb.innerHTML='<tr><td colspan="4" style="color:#8b94a7">'+
-      'No delivery receipts yet.</td></tr>'; return; }
-    tb.innerHTML = d.map(function(x){
-      var good = /deliver|success|ok/i.test(x.status||'');
-      return '<tr><td>'+esc(x.at)+'</td><td>'+esc(x.to)+'</td>'+
-        '<td class="'+(good?'ok':'no')+'">'+esc(x.status||'?')+'</td>'+
-        '<td style="font-size:12px;color:#8b94a7">'+esc((x.raw||'').slice(0,180))+
-        '</td></tr>';
-    }).join('');
-  }catch(e){ tb.innerHTML='<tr><td colspan="4" class="no">'+esc(e.message)+
-    '</td></tr>'; }
-}
-load(); loadCalls(); loadStats(); loadDlr();
-setInterval(function(){ loadCalls(); loadStats(); loadDlr(); }, 20000);
+load(); loadCalls(); loadStats(); loadDlr(); loadOb();
+setInterval(function(){ loadCalls(); loadStats(); loadDlr(); loadOb(); },
+            25000);
 </script></body></html>"""
 
 
@@ -2447,6 +2505,22 @@ def onboard_status(request: Request, session_id: int):
     if not row:
         raise HTTPException(404, "Unknown session.")
     return {"session_id": row.id, "state": row.state,
-            "message": row.message, "email": row.email}
+            "message": row.message, "email": row.email,
+            "history": row.history or ""}
+
+
+@app.get("/onboard/sessions")
+def onboard_sessions(request: Request, limit: int = 20):
+    require_auth(request)
+    db = Session()
+    rows = db.query(Onboard).order_by(Onboard.id.desc()).limit(limit).all()
+    names = {a.id: a.name for a in db.query(Account).all()}
+    out = [{"session_id": r.id, "who": names.get(r.account_id) or "?",
+            "email": r.email, "state": r.state, "message": r.message,
+            "history": r.history or "",
+            "at": r.at.strftime("%b %-d %-I:%M %p") if r.at else ""}
+           for r in rows]
+    db.close()
+    return out
 
 
