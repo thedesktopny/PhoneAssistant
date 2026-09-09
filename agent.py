@@ -413,6 +413,67 @@ FINDING EMAIL
 - To get somebody's address, use find_contact with their name.
 """.strip())
 
+    async def _watch(self, kind, fetch, describe):
+        """Poll a background job and make the agent speak when it changes."""
+        last = None
+        for _ in range(100):                     # about five minutes
+            await asyncio.sleep(3)
+            try:
+                d = await fetch()
+            except Exception:
+                continue
+            state = d.get("state", "")
+            key = (state, (d.get("message") or "")[:80])
+            if key == last:
+                continue
+            last = key
+            line = describe(d)
+            if line:
+                try:
+                    sess = getattr(self, "session", None)
+                    if sess:
+                        await sess.generate_reply(
+                            instructions=(f"Update the caller now, in one "
+                                          f"short sentence, in English: "
+                                          f"{line}"))
+                except Exception as e:
+                    log.warning(f"watch speak failed: {e}")
+            if state in ("done", "failed", "placed", "cancelled"):
+                break
+
+    def _start_watch(self, kind, fetch, describe):
+        try:
+            t = asyncio.create_task(self._watch(kind, fetch, describe))
+            self._watchers = getattr(self, "_watchers", [])
+            self._watchers.append(t)
+        except Exception as e:
+            log.warning(f"could not start watcher: {e}")
+
+    def _watch_job(self, label: str):
+        jid = getattr(self, "job_id", None)
+        if not jid:
+            return
+
+        async def fetch():
+            return await backend_get("/jobs/status", job_id=jid)
+
+        def describe(d):
+            st, msg = d.get("state", ""), d.get("message", "")
+            if st == "needs_code":
+                return f"{msg} Ask them for it."
+            if st == "needs_input":
+                return f"It needs to know: {msg}. Ask them."
+            if st == "waiting":
+                return "Say it's queued and will start in a moment."
+            if st == "done":
+                return ("Say it's done, then get the details with "
+                        "get_site_result or check_site_login.")
+            if st == "failed":
+                return f"Say it didn't work: {msg}."
+            return None
+
+        self._start_watch("job", fetch, describe)
+
     @function_tool
     async def verify_pin(self, context: RunContext, pin: str):
         """Check the caller's PIN. Must be called before any email action."""
