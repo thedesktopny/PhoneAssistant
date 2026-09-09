@@ -1004,13 +1004,187 @@ def account_for_number(number: str):
 
 
 
+
+# Phone country code -> (proxy country, preferred region). Longest prefix
+# wins, so +1876 Jamaica beats the generic +1.
+DIAL_MAP = {
+    "1876": ("JM", ""), "1809": ("DO", ""), "1829": ("DO", ""),
+    "1849": ("DO", ""), "1868": ("TT", ""), "1246": ("BB", ""),
+    "1242": ("BS", ""), "1441": ("BM", ""), "1345": ("KY", ""),
+    "1264": ("AI", ""), "1721": ("SX", ""), "1758": ("LC", ""),
+    "1473": ("GD", ""), "1784": ("VC", ""), "1268": ("AG", ""),
+    "1670": ("MP", ""), "1671": ("GU", ""), "1787": ("PR", ""),
+    "1939": ("PR", ""), "1340": ("VI", ""), "1684": ("AS", ""),
+    "1204": ("CA", ""), "1226": ("CA", ""), "1236": ("CA", ""),
+    "1249": ("CA", ""), "1250": ("CA", ""), "1289": ("CA", ""),
+    "1306": ("CA", ""), "1343": ("CA", ""), "1365": ("CA", ""),
+    "1367": ("CA", ""), "1403": ("CA", ""), "1416": ("CA", ""),
+    "1418": ("CA", ""), "1431": ("CA", ""), "1437": ("CA", ""),
+    "1438": ("CA", ""), "1450": ("CA", ""), "1506": ("CA", ""),
+    "1514": ("CA", ""), "1519": ("CA", ""), "1548": ("CA", ""),
+    "1579": ("CA", ""), "1581": ("CA", ""), "1587": ("CA", ""),
+    "1604": ("CA", ""), "1613": ("CA", ""), "1639": ("CA", ""),
+    "1647": ("CA", ""), "1672": ("CA", ""), "1705": ("CA", ""),
+    "1709": ("CA", ""), "1778": ("CA", ""), "1780": ("CA", ""),
+    "1782": ("CA", ""), "1807": ("CA", ""), "1819": ("CA", ""),
+    "1825": ("CA", ""), "1867": ("CA", ""), "1873": ("CA", ""),
+    "1902": ("CA", ""), "1905": ("CA", ""),
+    "44": ("GB", ""), "353": ("IE", ""), "972": ("IL", ""),
+    "61": ("AU", ""), "64": ("NZ", ""), "27": ("ZA", ""),
+    "33": ("FR", ""), "49": ("DE", ""), "34": ("ES", ""),
+    "39": ("IT", ""), "31": ("NL", ""), "32": ("BE", ""),
+    "41": ("CH", ""), "43": ("AT", ""), "351": ("PT", ""),
+    "46": ("SE", ""), "47": ("NO", ""), "45": ("DK", ""),
+    "358": ("FI", ""), "48": ("PL", ""), "420": ("CZ", ""),
+    "36": ("HU", ""), "30": ("GR", ""), "40": ("RO", ""),
+    "380": ("UA", ""), "52": ("MX", ""), "55": ("BR", ""),
+    "54": ("AR", ""), "56": ("CL", ""), "57": ("CO", ""),
+    "51": ("PE", ""), "91": ("IN", ""), "63": ("PH", ""),
+    "65": ("SG", ""), "60": ("MY", ""), "66": ("TH", ""),
+    "62": ("ID", ""), "84": ("VN", ""), "81": ("JP", ""),
+    "82": ("KR", ""), "852": ("HK", ""), "886": ("TW", ""),
+    "971": ("AE", ""), "966": ("SA", ""), "90": ("TR", ""),
+    "20": ("EG", ""), "234": ("NG", ""), "254": ("KE", ""),
+    "1": ("US", PROXY_STATE),
+}
+
+# US area code -> state, so a New York caller browses from New York.
+US_AREA_STATE = {
+    "212": "NY", "315": "NY", "332": "NY", "347": "NY", "516": "NY",
+    "518": "NY", "585": "NY", "607": "NY", "631": "NY", "646": "NY",
+    "680": "NY", "716": "NY", "718": "NY", "838": "NY", "845": "NY",
+    "914": "NY", "917": "NY", "929": "NY", "934": "NY",
+    "201": "NJ", "551": "NJ", "609": "NJ", "640": "NJ", "732": "NJ",
+    "848": "NJ", "856": "NJ", "862": "NJ", "908": "NJ", "973": "NJ",
+    "203": "CT", "475": "CT", "860": "CT", "959": "CT",
+    "215": "PA", "267": "PA", "412": "PA", "445": "PA", "484": "PA",
+    "570": "PA", "610": "PA", "717": "PA", "724": "PA", "814": "PA",
+    "878": "PA",
+    "305": "FL", "321": "FL", "352": "FL", "386": "FL", "407": "FL",
+    "561": "FL", "689": "FL", "727": "FL", "754": "FL", "772": "FL",
+    "786": "FL", "813": "FL", "850": "FL", "863": "FL", "904": "FL",
+    "941": "FL", "954": "FL",
+    "213": "CA", "310": "CA", "323": "CA", "408": "CA", "415": "CA",
+    "424": "CA", "510": "CA", "530": "CA", "559": "CA", "562": "CA",
+    "619": "CA", "626": "CA", "650": "CA", "657": "CA", "661": "CA",
+    "707": "CA", "714": "CA", "747": "CA", "760": "CA", "805": "CA",
+    "818": "CA", "831": "CA", "858": "CA", "909": "CA", "916": "CA",
+    "925": "CA", "949": "CA", "951": "CA",
+    "312": "IL", "224": "IL", "331": "IL", "630": "IL", "708": "IL",
+    "773": "IL", "779": "IL", "815": "IL", "847": "IL", "872": "IL",
+    "214": "TX", "210": "TX", "281": "TX", "409": "TX", "469": "TX",
+    "512": "TX", "682": "TX", "713": "TX", "737": "TX", "817": "TX",
+    "832": "TX", "915": "TX", "936": "TX", "972": "TX",
+    "404": "GA", "470": "GA", "678": "GA", "770": "GA", "706": "GA",
+    "202": "DC", "410": "MD", "240": "MD", "301": "MD", "443": "MD",
+    "617": "MA", "339": "MA", "351": "MA", "508": "MA", "774": "MA",
+    "781": "MA", "857": "MA", "978": "MA",
+    "216": "OH", "234": "OH", "330": "OH", "419": "OH", "440": "OH",
+    "513": "OH", "614": "OH", "740": "OH", "937": "OH",
+    "206": "WA", "253": "WA", "360": "WA", "425": "WA", "509": "WA",
+    "303": "CO", "720": "CO", "970": "CO",
+    "602": "AZ", "480": "AZ", "520": "AZ", "623": "AZ", "928": "AZ",
+    "702": "NV", "725": "NV", "775": "NV",
+    "704": "NC", "336": "NC", "252": "NC", "743": "NC", "910": "NC",
+    "919": "NC", "980": "NC", "984": "NC",
+    "313": "MI", "248": "MI", "269": "MI", "517": "MI", "586": "MI",
+    "616": "MI", "734": "MI", "810": "MI", "947": "MI", "989": "MI",
+}
+
+
+def _where_for_phone(number: str):
+    """Which country and state a browser should appear to be in for this
+    caller. Falls back to the configured default."""
+    digits = "".join(ch for ch in (number or "") if ch.isdigit())
+    if not digits:
+        return PROXY_COUNTRY, PROXY_STATE, ""
+    for length in (4, 3, 2, 1):
+        pre = digits[:length]
+        if pre in DIAL_MAP:
+            country, state = DIAL_MAP[pre]
+            if country == "US":
+                area = digits[1:4]
+                state = US_AREA_STATE.get(area, PROXY_STATE)
+            return country, state, ""
+    return PROXY_COUNTRY, PROXY_STATE, ""
+
+
+def _where_for_account(account_id):
+    """Use the account's own phone number to decide where to browse from."""
+    if not account_id:
+        return PROXY_COUNTRY, PROXY_STATE, ""
+    try:
+        db = Session()
+        pn = db.query(PhoneNumber).filter_by(account_id=account_id).first()
+        db.close()
+        if pn and pn.number:
+            return _where_for_phone(pn.number)
+    except Exception:
+        pass
+    return PROXY_COUNTRY, PROXY_STATE, ""
+
+
 _LAST_PROXY_FLAG = {"at": None}
+
+
+
+def _shape(secret: str) -> str:
+    """Describe a password without revealing it: length and the pattern of
+    character types. Lets us see a misheard password without storing one."""
+    if not secret:
+        return "(empty)"
+    out = []
+    for ch in secret:
+        if ch.isupper():
+            out.append("A")
+        elif ch.islower():
+            out.append("a")
+        elif ch.isdigit():
+            out.append("9")
+        elif ch.isspace():
+            out.append("_")
+        else:
+            out.append("#")
+    return f"{len(secret)} chars, pattern {''.join(out)}"
+
+
+PROXY_STATUS = {"proxies_enabled": None, "checked": None, "note": ""}
+
+
+def _flag_proxy_unavailable(wanted: str):
+    """Browserbase proxies aren't on this plan. Sessions still run from
+    Browserbase's own datacenter, which is in the US."""
+    PROXY_STATUS.update({"proxies_enabled": False,
+                         "checked": datetime.utcnow(),
+                         "note": "Browserbase returned 402 Payment Required"})
+    emit("browser", "proxy", f"Proxies not enabled on the Browserbase plan. "
+                             f"Wanted {wanted}; running from Browserbase's "
+                             f"own US datacenter instead.", "warn")
+    if wanted.upper() == "US":
+        return              # US customers are unaffected, no alert needed
+    now = datetime.utcnow()
+    last = _LAST_PROXY_FLAG.get("at")
+    if last and (now - last).total_seconds() < 3600:
+        return
+    _LAST_PROXY_FLAG["at"] = now
+    msg = (f"A customer in {wanted} was browsed from a US address, because "
+           f"proxies are not enabled on the Browserbase plan. Their sign-ins "
+           f"will look foreign to Google. Turn on proxies in Browserbase to "
+           f"fix this. US customers are not affected.")
+    try:
+        db = Session()
+        db.add(Followup(reason="proxy_not_enabled", note=msg,
+                        channel="system"))
+        db.commit()
+        db.close()
+    except Exception:
+        pass
 
 
 def _flag_proxy_fallback(reason: str):
     """Loud: browsers are running outside the US until this is fixed."""
-    msg = (f"BROWSERS ARE NOT ON A US PROXY. Sign-ins will look foreign to "
-           f"Google and may be blocked. Reason: {reason}")
+    msg = (f"Browser is not in the expected country. Sign-ins may look "
+           f"foreign to Google and get blocked. Reason: {reason}")
     emit("browser", "PROXY FALLBACK", msg, "error")
     now = datetime.utcnow()
     last = _LAST_PROXY_FLAG.get("at")
@@ -1026,16 +1200,18 @@ def _flag_proxy_fallback(reason: str):
         pass
 
 
-def _bb_session(context_id: str = "") -> str:
-    """Create a Browserbase session pinned to a US residential proxy.
+def _bb_session(context_id: str = "", country: str = "",
+                state: str = "", city: str = "") -> str:
+    """Create a Browserbase session pinned to the caller's own country.
     Returns the session id, or "" to fall back to a plain connection."""
     if not BROWSERBASE_API_KEY:
         return ""
-    geo = {"country": PROXY_COUNTRY}
-    if PROXY_STATE:
-        geo["state"] = PROXY_STATE
-    if PROXY_CITY:
-        geo["city"] = PROXY_CITY
+    country = country or PROXY_COUNTRY
+    geo = {"country": country}
+    if state and country == "US":
+        geo["state"] = state
+    if city:
+        geo["city"] = city
     body = {
         "projectId": BROWSERBASE_PROJECT_ID,
         "proxies": [{"type": "browserbase", "geolocation": geo}],
@@ -1052,14 +1228,29 @@ def _bb_session(context_id: str = "") -> str:
         with urllib.request.urlopen(req, timeout=25) as r:
             return json.loads(r.read().decode()).get("id", "")
     except Exception as e:
-        _flag_proxy_fallback(str(e)[:300])
+        detail = str(e)[:300]
+        if "402" in detail or "Payment Required" in detail:
+            _flag_proxy_unavailable(country)
+        else:
+            _flag_proxy_fallback(f"{detail} (wanted {country})")
         return ""
 
 
-def _bb_connect_url(context_id: str = "") -> str:
-    """Prefer a geo-pinned session; fall back to a direct connection."""
-    sid = _bb_session(context_id)
+def _bb_connect_url(context_id: str = "", account_id=None,
+                    phone: str = "") -> str:
+    """Prefer a session pinned to the caller's country; fall back to a
+    direct connection."""
+    if phone:
+        country, state, city = _where_for_phone(phone)
+    else:
+        country, state, city = _where_for_account(account_id)
+    sid = _bb_session(context_id, country, state, city)
     if sid:
+        PROXY_STATUS.update({"proxies_enabled": True,
+                             "checked": datetime.utcnow(), "note": ""})
+        emit("browser", "proxy", f"browsing from {country}"
+                                 f"{'/' + state if state else ''}",
+             "info", account_id)
         return (f"wss://connect.browserbase.com?apiKey={BROWSERBASE_API_KEY}"
                 f"&sessionId={sid}")
     url = (f"wss://connect.browserbase.com?apiKey={BROWSERBASE_API_KEY}"
@@ -1201,7 +1392,7 @@ def _run_signin(sid: int, account_id: int, email: str):
         _ob_set(sid, "failed", "No password supplied.")
         return
 
-    ws = _bb_connect_url()
+    ws = _bb_connect_url(account_id=account_id)
 
     EMAIL_SEL = ('input[type="email"], input#identifierId, '
                  'input[name="identifier"]')
@@ -1359,11 +1550,18 @@ def _run_signin(sid: int, account_id: int, email: str):
                 browser.close()
                 return
 
+            emit("signin", f"signin {sid}",
+                 f"typing password: {_shape(password)}")
             page.fill(PW_SEL, password)
             page.keyboard.press("Enter")
             settle(page, 5000)
 
             if q(page, 'text=/Wrong password/i'):
+                emit("signin", f"signin {sid}",
+                     f"Google rejected the password ({_shape(password)}). "
+                     f"Compare that pattern with the real one - A is a "
+                     f"capital, a is lowercase, 9 is a digit, # is a symbol.",
+                     "warn")
                 _ob_set(sid, "failed",
                         "Google says the password is wrong. Ask them to say "
                         "it again slowly, or have someone call them back.")
@@ -1757,7 +1955,7 @@ def _run_site_login(jid: int, account_id: int, site: str):
 
     ctx_id = _get_context(account_id, site.lower()) or \
         _new_browserbase_context()
-    ws = _bb_connect_url(ctx_id)
+    ws = _bb_connect_url(ctx_id, account_id)
 
     page = browser = None
     try:
@@ -1868,7 +2066,8 @@ def _run_site_login(jid: int, account_id: int, site: str):
 def _open_with_session(p, account_id: int, site: str):
     """Connect to Browserbase reusing this customer's saved session."""
     ctx_id = _get_context(account_id, site) or _new_browserbase_context()
-    browser = p.chromium.connect_over_cdp(_bb_connect_url(ctx_id))
+    browser = p.chromium.connect_over_cdp(
+        _bb_connect_url(ctx_id, account_id))
     bctx = browser.contexts[0] if browser.contexts else browser.new_context()
     page = bctx.pages[0] if bctx.pages else bctx.new_page()
     page.set_default_timeout(45000)
@@ -3775,17 +3974,22 @@ def events_list(request: Request, after_id: int = 0, limit: int = 200,
 
 
 @app.get("/browser/where")
-def browser_where(request: Request):
-    """Open a browser and report the country it appears to be in."""
+def browser_where(request: Request, phone: str = ""):
+    """Open a browser and report where it appears to be. Pass a phone
+    number to test what a caller from there would get."""
     require_auth(request)
     if not BROWSERBASE_API_KEY:
         raise HTTPException(400, "Browserbase isn't configured.")
     from playwright.sync_api import sync_playwright
-    out = {"configured": {"country": PROXY_COUNTRY, "state": PROXY_STATE,
-                          "city": PROXY_CITY}}
+    want_c, want_s, want_city = _where_for_phone(phone) if phone else \
+        (PROXY_COUNTRY, PROXY_STATE, PROXY_CITY)
+    out = {"for_phone": phone or "(default)",
+           "wanted": {"country": want_c, "state": want_s, "city": want_city}}
+    PROXY_STATUS["proxies_enabled"] = None
     try:
         with sync_playwright() as p:
-            browser = p.chromium.connect_over_cdp(_bb_connect_url())
+            browser = p.chromium.connect_over_cdp(
+                _bb_connect_url(phone=phone) if phone else _bb_connect_url())
             ctx = browser.contexts[0] if browser.contexts \
                 else browser.new_context()
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
@@ -3796,16 +4000,34 @@ def browser_where(request: Request):
             i = raw.index("{")
             out["actual"] = json.loads(raw[i:raw.rindex("}") + 1])
             got = (out["actual"].get("country") or "").upper()
-            out["ok"] = (got == PROXY_COUNTRY.upper())
-            if not out["ok"]:
+            used = PROXY_STATUS.get("proxies_enabled")
+            out["proxy_used"] = bool(used)
+            if used is False:
+                out["warning"] = (
+                    "Proxies are not enabled on your Browserbase plan. This "
+                    "IP is Browserbase's own datacenter, which happens to be "
+                    "in the US. Non-US customers cannot be matched to their "
+                    "country until you enable proxies.")
+            out["ok"] = (got == want_c.upper())
+            if not out["ok"] and used is not False:
                 _flag_proxy_fallback(
                     f"browser is reporting country {got}, expected "
-                    f"{PROXY_COUNTRY}")
+                    f"{want_c}")
         except Exception:
             out["actual_raw"] = raw[:400]
     except Exception as e:
         out["error"] = str(e)[:300]
     return out
+
+
+@app.get("/browser/proxy_status")
+def proxy_status(request: Request):
+    require_auth(request)
+    st = dict(PROXY_STATUS)
+    if st.get("checked"):
+        st["checked"] = st["checked"].strftime("%b %-d %-I:%M %p")
+    st["default"] = {"country": PROXY_COUNTRY, "state": PROXY_STATE}
+    return st
 
 
 @app.get("/vault/status")

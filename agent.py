@@ -151,6 +151,7 @@ class Assistant(Agent):
         self.last_list = []
         self.last_events = []
         self.onboard_sid = None
+        self.password_confirmed = False
         self.job_id = None
         self.pw_attempts = 0
         self.job_question = ""
@@ -1140,9 +1141,22 @@ FINDING EMAIL
     async def connect_email(self, context: RunContext, email: str,
                             password: str):
         """Connect the caller's Gmail using the address and password they
-        just gave you. Only call after reading both back and getting a yes."""
+        just gave you. Only call after spelling both back character by
+        character and getting a clear yes."""
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
+        if not self.password_confirmed:
+            self.password_confirmed = True
+            spelled = " ".join(
+                ("capital " + ch) if ch.isupper() else
+                ("the digit " + ch) if ch.isdigit() else
+                ch for ch in password)
+            return (f"Before signing in, spell the password back to them "
+                    f"exactly like this, slowly: {spelled}. That is "
+                    f"{len(password)} characters. Ask if every character is "
+                    f"right. If they say yes, call connect_email again with "
+                    f"the same values. If they correct anything, call it "
+                    f"again with the corrected password.")
         try:
             data = await backend_post("/onboard/start", {
                 "account_id": self.account_id,
@@ -1175,6 +1189,11 @@ FINDING EMAIL
                 return (f"Say their email is now connected ({msg}) and "
                         f"offer to read new messages.")
             if st == "failed":
+                self.password_confirmed = False
+                if "password is wrong" in msg.lower():
+                    return ("Tell them Google didn't accept the password, "
+                            "and offer to try once more, spelling it out "
+                            "one character at a time.")
                 return (f"Say it didn't work — {msg} — and that you've "
                         f"left a note for the office.")
             return None
