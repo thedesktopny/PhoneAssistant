@@ -304,6 +304,18 @@ class Order(Base):
     placed_at = Column(DateTime, nullable=True)
 
 
+class Event(Base):
+    """Live log: every step of every job, sign-in, order and failure."""
+    __tablename__ = "events"
+    id = Column(Integer, primary_key=True)
+    at = Column(DateTime, default=datetime.utcnow)
+    kind = Column(String(20), default="")      # signin/job/order/call/error
+    ref = Column(String(40), default="")       # e.g. signin 12, order 3
+    account_id = Column(Integer, nullable=True)
+    level = Column(String(10), default="info")  # info/warn/error
+    text = Column(Text, default="")
+
+
 class SecretAccess(Base):
     """Every time a stored password is decrypted, and why."""
     __tablename__ = "secret_access"
@@ -349,6 +361,20 @@ def _ensure_columns():
 
 
 _ensure_columns()
+
+
+def emit(kind: str, ref: str, text: str, level: str = "info",
+         account_id=None):
+    """Write to the live log. Never raises."""
+    try:
+        db = Session()
+        db.add(Event(kind=kind, ref=ref[:40], account_id=account_id,
+                     level=level, text=text[:2000]))
+        db.commit()
+        db.close()
+    except Exception:
+        pass
+
 
 # ----------------------------------------------------------------- vault
 # Swap the two functions below for AWS KMS before real customers.
@@ -979,6 +1005,8 @@ _PENDING = {}          # session_id -> {"password": str, "code": str|None}
 
 
 def _ob_set(sid: int, state: str, message: str = ""):
+    emit("signin", f"signin {sid}", f"{state}: {message}",
+         "error" if state == "failed" else "info")
     db = Session()
     row = db.query(Onboard).filter_by(id=sid).first()
     if row:
@@ -1487,6 +1515,8 @@ _waiting = 0
 
 
 def _job_set(jid: int, state: str, message: str = ""):
+    emit("job", f"job {jid}", f"{state}: {message}",
+         "error" if state == "failed" else "info")
     db = Session()
     row = db.query(Job).filter_by(id=jid).first()
     if row:
@@ -2503,6 +2533,8 @@ def queue_health() -> dict:
 # ------------------------------------------------------------- ordering
 
 def _order_set(oid: int, state: str, message: str = "", **fields):
+    emit("order", f"order {oid}", f"{state}: {message}",
+         "error" if state == "failed" else "info")
     db = Session()
     row = db.query(Order).filter_by(id=oid).first()
     if row:
@@ -3241,6 +3273,10 @@ class TurnBody(BaseModel):
 @app.post("/calls/turn")
 def call_turn(t: TurnBody, request: Request):
     require_auth(request)
+    if t.who in ("tool", "problem"):
+        emit("call", f"call {t.call_id}",
+             f"{t.tool or t.who}: {t.text}",
+             "error" if t.who == "problem" else "info")
     db = Session()
     db.add(CallTurn(call_id=t.call_id, who=t.who, text=t.text[:4000],
                     tool=t.tool, latency_ms=t.latency_ms))
@@ -3587,6 +3623,28 @@ def jobs_list(request: Request, limit: int = 30):
     return out
 
 
+@app.get("/events")
+def events_list(request: Request, after_id: int = 0, limit: int = 200,
+                kind: str = ""):
+    """Live log. Pass after_id to get only what's new."""
+    require_auth(request)
+    db = Session()
+    q = db.query(Event)
+    if after_id:
+        q = q.filter(Event.id > after_id)
+    if kind:
+        q = q.filter(Event.kind == kind)
+    rows = q.order_by(Event.id.desc()).limit(limit).all()
+    names = {a.id: a.name for a in db.query(Account).all()}
+    out = [{"id": r.id,
+            "at": r.at.strftime("%-I:%M:%S %p") if r.at else "",
+            "kind": r.kind, "ref": r.ref, "level": r.level,
+            "who": names.get(r.account_id, "") if r.account_id else "",
+            "text": r.text} for r in reversed(rows)]
+    db.close()
+    return out
+
+
 @app.get("/vault/status")
 def vault_status(request: Request):
     """Which key protects what."""
@@ -3897,6 +3955,7 @@ class FollowupBody(BaseModel):
 @app.post("/followups")
 def followup_add(b: FollowupBody, request: Request):
     require_auth(request)
+    emit("followup", b.reason or "note", b.note, "warn", b.account_id)
     db = Session()
     row = Followup(account_id=b.account_id, call_id=b.call_id,
                    reason=b.reason[:60], note=b.note[:2000],
@@ -4098,6 +4157,7 @@ ADMIN_HTML = """<!doctype html>
 <header>
   <h1>Phone Assistant</h1>
   <nav>
+    <a data-p="live">Live</a>
     <a data-p="overview" class="on">Overview</a>
     <a data-p="calls">Calls</a>
     <a data-p="customers">Customers</a>
@@ -4112,6 +4172,21 @@ ADMIN_HTML = """<!doctype html>
     .then(()=>location.reload())">Sign out</button>
 </header>
 <main>
+
+<section class="page" id="p-live">
+  <div class="card"><h2>Live log</h2>
+    <div class="hint">Everything as it happens: sign-in steps, what Google
+      says, browser jobs, orders, tool errors. Updates every 2 seconds.
+      Errors in red, notes for the office in amber.</div>
+    <label style="display:inline-block;margin-right:14px">
+      <input type="checkbox" id="live_pause" style="width:auto"> pause</label>
+    <label style="display:inline-block;margin-right:14px">
+      <input type="checkbox" id="live_err" style="width:auto"> errors only</label>
+    <button class="sec" onclick="liveClear()">Clear view</button>
+    <pre id="livelog" style="max-height:70vh;min-height:300px;margin-top:12px">
+Waiting for events…</pre>
+  </div>
+</section>
 
 <section class="page on" id="p-overview">
   <div class="card"><h2>Last 7 days</h2>
@@ -4447,6 +4522,33 @@ function showOb(id, btn){
   btn.textContent = open ? 'Steps' : 'Hide';
 }
 
+var liveLast = 0, liveLines = [];
+function liveClear(){ liveLines = []; render(); }
+function render(){
+  const errOnly = document.getElementById('live_err').checked;
+  const el = document.getElementById('livelog');
+  const shown = liveLines.filter(function(l){ return !errOnly || l.level!=='info'; });
+  el.innerHTML = shown.length ? shown.map(function(l){
+    var color = l.level==='error' ? '#f87171' : (l.level==='warn' ? '#fbbf24' : '#c3cad8');
+    return '<span style="color:#8b94a7">'+esc(l.at)+'</span> '+
+      '<span style="color:#60a5fa">'+esc(l.ref)+'</span>'+
+      (l.who?' <span style="color:#8b94a7">'+esc(l.who)+'</span>':'')+
+      ' <span style="color:'+color+'">'+esc(l.text)+'</span>';
+  }).join(String.fromCharCode(10)) : 'Nothing yet.';
+  el.scrollTop = el.scrollHeight;
+}
+async function pollLive(){
+  if(document.getElementById('live_pause').checked) return;
+  try{
+    const d = await (await fetch('/events?after_id='+liveLast+'&limit=200')).json();
+    if(d.length){
+      liveLines = liveLines.concat(d).slice(-800);
+      liveLast = d[d.length-1].id;
+      render();
+    }
+  }catch(e){}
+}
+document.getElementById('live_err').addEventListener('change', render);
 async function loadOrders(){
   const tb = document.getElementById('orderrows');
   try{
@@ -4633,6 +4735,7 @@ async function add(){
 }
 
 load(); loadCalls(); loadStats(); loadDlr(); loadOb(); loadFu(); loadJobs(); loadHealth(); loadSites(); loadOrders();
+pollLive(); setInterval(pollLive, 2000);
 setInterval(function(){ loadCalls(); loadStats(); loadDlr(); loadOb();
                         loadFu(); loadJobs(); loadHealth(); loadSites();
                         loadOrders(); }, 25000);

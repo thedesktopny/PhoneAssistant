@@ -653,6 +653,26 @@ FINDING EMAIL
         self.job_id = d.get("job_id")
         await log_turn(self.call_id, "tool", f"order {self.order_id} placing",
                        "confirm_order")
+        oid = self.order_id
+
+        async def fetch():
+            return await backend_get("/orders/status", order_id=oid)
+
+        def describe(d):
+            st, msg = d.get("state", ""), d.get("message", "")
+            if st == "placed":
+                return (f"Say the order is placed, confirmation "
+                        f"{d.get('confirmation') or 'not shown'}, total "
+                        f"{d.get('final_total') or 'not shown'}.")
+            if st == "failed":
+                return f"Say it didn't go through: {msg}. Nothing charged."
+            if "Needs the customer" in msg:
+                return f"{msg} Ask them and pass the answer on."
+            if st == "placing" and msg.startswith("Step"):
+                return None            # don't narrate every click
+            return None
+
+        self._start_watch("order", fetch, describe)
         return ("Placing it now. Tell them it takes a minute or two, stay "
                 "with them, and call check_order.")
 
@@ -711,6 +731,7 @@ FINDING EMAIL
             return "Couldn't start that."
         self.job_id = d.get("job_id")
         self.job_question = goal
+        self._watch_job(goal)
         return ("On it. Tell them it takes up to a minute and stay with "
                 "them, then call get_site_result.")
 
@@ -813,6 +834,7 @@ FINDING EMAIL
             log.error(f"site login failed: {e}")
             return "Couldn't start that."
         self.job_id = d.get("job_id")
+        self._watch_job(f"signing in to {site}")
         return (f"Signing in to {site}. Tell them it takes about a minute, "
                 f"then call check_site_login.")
 
@@ -1073,6 +1095,30 @@ FINDING EMAIL
         self.onboard_sid = data.get("session_id")
         await log_turn(self.call_id, "tool", f"signin started for {email}",
                        "connect_email")
+
+        sid = self.onboard_sid
+
+        async def fetch():
+            return await backend_get("/onboard/status", session_id=sid)
+
+        def describe(d):
+            st, msg = d.get("state", ""), d.get("message", "")
+            if st == "needs_tap":
+                return (f"Google just sent a prompt to their phone. Tell "
+                        f"them exactly: {msg} Then wait for them.")
+            if st == "needs_code":
+                return f"{msg} Ask them for the code."
+            if st == "consenting":
+                return "Say: almost done, just approving access."
+            if st == "done":
+                return (f"Say their email is now connected ({msg}) and "
+                        f"offer to read new messages.")
+            if st == "failed":
+                return (f"Say it didn't work — {msg} — and that you've "
+                        f"left a note for the office.")
+            return None
+
+        self._start_watch("signin", fetch, describe)
         return ("Sign-in started. Tell them it takes about a minute, then "
                 "call check_connect.")
 
