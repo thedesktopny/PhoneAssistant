@@ -1594,7 +1594,112 @@ def _run_site_login(jid: int, account_id: int, site: str):
         _JOBS.pop(jid, None)
 
 
-RUNNERS = {"site_login": _run_site_login}
+def _open_with_session(p, account_id: int, site: str):
+    """Connect to Browserbase reusing this customer's saved session."""
+    ctx_id = _get_context(account_id, site) or _new_browserbase_context()
+    ws = (f"wss://connect.browserbase.com?apiKey={BROWSERBASE_API_KEY}"
+          f"&projectId={BROWSERBASE_PROJECT_ID}")
+    if ctx_id:
+        ws += f"&contextId={ctx_id}&persist=true"
+    browser = p.chromium.connect_over_cdp(ws)
+    bctx = browser.contexts[0] if browser.contexts else browser.new_context()
+    page = bctx.pages[0] if bctx.pages else bctx.new_page()
+    page.set_default_timeout(45000)
+    return browser, page, ctx_id
+
+
+ORDER_PAGES = {
+    "walmart": "https://www.walmart.com/orders",
+    "amazon": "https://www.amazon.com/gp/css/order-history",
+    "temu": "https://www.temu.com/orders.html",
+}
+
+SEARCH_PAGES = {
+    "walmart": "https://www.walmart.com/search?q=",
+    "amazon": "https://www.amazon.com/s?k=",
+    "temu": "https://www.temu.com/search_result.html?search_key=",
+}
+
+
+def _run_site_orders(jid: int, account_id: int, site: str):
+    """Read the customer's recent orders from a site they're signed into."""
+    from playwright.sync_api import sync_playwright
+    url = ORDER_PAGES.get(site)
+    if not url:
+        _job_set(jid, "failed", f"No order page known for {site}.")
+        return
+
+    browser = page = None
+    try:
+        with sync_playwright() as p:
+            browser, page, ctx_id = _open_with_session(p, account_id, site)
+            _job_set(jid, "opening", f"Opening {site} orders.")
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(6000)
+
+            cfg = SITES.get(site, {})
+            if cfg.get("user_sel") and page.query_selector(cfg["user_sel"]):
+                _job_set(jid, "failed",
+                         f"Signed out of {site}. Sign in again first.")
+                browser.close()
+                return
+
+            body = " ".join((page.inner_text("body") or "").split())
+            _job_set(jid, "done", body[:1800])
+            if ctx_id:
+                _save_context(account_id, site, ctx_id)
+            browser.close()
+    except Exception as e:
+        _job_set(jid, "failed", f"Browser error: {str(e)[:200]}")
+        try:
+            if browser:
+                browser.close()
+        except Exception:
+            pass
+    finally:
+        _JOBS.pop(jid, None)
+
+
+def _run_site_search(jid: int, account_id: int, site: str):
+    """Search a site for a product, using the customer's session."""
+    from playwright.sync_api import sync_playwright
+    db = Session()
+    row = db.query(Job).filter_by(id=jid).first()
+    payload = json.loads(row.payload or "{}") if row else {}
+    db.close()
+    query = (payload.get("query") or "").strip()
+    base = SEARCH_PAGES.get(site)
+    if not base or not query:
+        _job_set(jid, "failed", "Nothing to search for.")
+        return
+
+    browser = page = None
+    try:
+        with sync_playwright() as p:
+            browser, page, ctx_id = _open_with_session(p, account_id, site)
+            _job_set(jid, "opening", f"Searching {site} for {query}.")
+            page.goto(base + urllib.parse.quote_plus(query),
+                      wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(6000)
+            body = " ".join((page.inner_text("body") or "").split())
+            _job_set(jid, "done", body[:1800])
+            if ctx_id:
+                _save_context(account_id, site, ctx_id)
+            browser.close()
+    except Exception as e:
+        _job_set(jid, "failed", f"Browser error: {str(e)[:200]}")
+        try:
+            if browser:
+                browser.close()
+        except Exception:
+            pass
+    finally:
+        _JOBS.pop(jid, None)
+
+
+RUNNERS = {"site_login": _run_site_login,
+           "site_orders": _run_site_orders,
+           "site_search": _run_site_search}
 
 
 def _queued_run(jid: int, kind: str, account_id: int, site: str):
@@ -1629,7 +1734,7 @@ def start_job(account_id: int, kind: str, site: str = "",
                       Job.kind == kind,
                       Job.state.notin_(["done", "failed"]))
               .order_by(Job.id.desc()).first())
-    if live:
+    if live and kind == "site_login":
         jid = live.id
         db.close()
         return jid
@@ -1647,6 +1752,26 @@ def start_job(account_id: int, kind: str, site: str = "",
                      args=(jid, kind, account_id, site.lower()),
                      daemon=True).start()
     return jid
+
+
+def _summarise_page(text: str, question: str) -> str:
+    """Turn a scraped page into a short spoken answer."""
+    if not OPENAI_API_KEY:
+        return text[:600]
+    try:
+        d = _openai_chat([
+            {"role": "system",
+             "content": ("You turn a scraped web page into a short answer to "
+                         "be read aloud on a phone call. Two or three "
+                         "sentences. Give names, prices and dates plainly. "
+                         "No URLs. If the page shows nothing relevant, say "
+                         "so.")},
+            {"role": "user",
+             "content": f"Question: {question}\n\nPage text:\n{text[:6000]}"},
+        ])
+        return (d["choices"][0]["message"].get("content") or "")[:900]
+    except Exception:
+        return text[:600]
 
 
 def queue_health() -> dict:
@@ -2529,6 +2654,44 @@ def job_site_login(request: Request, account_id: int, site: str,
     jid = start_job(account_id, "site_login", site,
                     call_id=call_id or None)
     return {"job_id": jid, "state": "queued"}
+
+
+@app.post("/jobs/site-orders")
+def job_site_orders(request: Request, account_id: int, site: str,
+                    call_id: int = 0):
+    require_auth(request)
+    if not BROWSERBASE_API_KEY:
+        raise HTTPException(400, "Browserbase isn't configured.")
+    return {"job_id": start_job(account_id, "site_orders", site,
+                                call_id=call_id or None)}
+
+
+@app.post("/jobs/site-search")
+def job_site_search(request: Request, account_id: int, site: str,
+                    query: str, call_id: int = 0):
+    require_auth(request)
+    if not BROWSERBASE_API_KEY:
+        raise HTTPException(400, "Browserbase isn't configured.")
+    return {"job_id": start_job(account_id, "site_search", site,
+                                call_id=call_id or None,
+                                payload={"query": query})}
+
+
+@app.get("/jobs/answer")
+def job_answer(request: Request, job_id: int, question: str = ""):
+    """A spoken-length summary of what a finished job found."""
+    require_auth(request)
+    db = Session()
+    row = db.query(Job).filter_by(id=job_id).first()
+    db.close()
+    if not row:
+        raise HTTPException(404, "Unknown job.")
+    if row.state != "done":
+        return {"state": row.state, "message": row.message}
+    q = question or ("their recent orders" if row.kind == "site_orders"
+                     else "the search results")
+    return {"state": "done",
+            "answer": _summarise_page(row.message or "", q)}
 
 
 class JobCode(BaseModel):

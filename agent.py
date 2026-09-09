@@ -153,6 +153,7 @@ class Assistant(Agent):
         self.onboard_sid = None
         self.job_id = None
         self.pw_attempts = 0
+        self.job_question = ""
         self.mailbox = ""
 
         today = datetime.now(ZoneInfo("America/New_York")).strftime(
@@ -252,6 +253,15 @@ slowly, same as before. Read it back, get a yes, then save_site_login.
   emailed them a code — ask for it and call submit_site_code.
 - Once a site is signed in, we stay signed in, so they won't be asked again
   every time.
+
+USING A SIGNED-IN SITE
+- "What did I order from Walmart?" / "where's my order?" ->
+  check_site_orders, then poll get_site_result until it has an answer.
+  It takes 20 to 40 seconds — say you're looking it up and stay with them.
+- "Does Walmart have paper towels?" / "how much is X?" ->
+  search_site with the site and what they want, then get_site_result.
+- Read prices and dates plainly. Never read a URL out loud.
+- If it says they're signed out, offer sign_in_to_site again.
 
 DISCONNECTING AND DELETING
 The caller can undo anything they've set up.
@@ -490,6 +500,67 @@ FINDING EMAIL
         await log_turn(self.call_id, "tool", f"note: {reason}",
                        "leave_note_for_office")
         return "Noted for the office. Tell them it's been passed on."
+
+    @function_tool
+    @auto_report("site_read")
+    async def check_site_orders(self, context: RunContext, site: str):
+        """Look up the caller's recent orders on a site they're signed into."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            async with httpx.AsyncClient(timeout=25) as c:
+                r = await c.post(f"{BACKEND}/jobs/site-orders", headers=AUTH,
+                                 params={"account_id": self.account_id,
+                                         "site": site,
+                                         "call_id": self.call_id or 0})
+                d = r.json()
+        except Exception as e:
+            log.error(f"site orders failed: {e}")
+            return "Couldn't start that."
+        self.job_id = d.get("job_id")
+        self.job_question = f"their recent orders on {site}"
+        return ("Looking that up. Tell them it takes about half a minute, "
+                "then call get_site_result.")
+
+    @function_tool
+    @auto_report("site_read")
+    async def search_site(self, context: RunContext, site: str, query: str):
+        """Search a site for a product on the caller's behalf."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            async with httpx.AsyncClient(timeout=25) as c:
+                r = await c.post(f"{BACKEND}/jobs/site-search", headers=AUTH,
+                                 params={"account_id": self.account_id,
+                                         "site": site, "query": query,
+                                         "call_id": self.call_id or 0})
+                d = r.json()
+        except Exception as e:
+            log.error(f"site search failed: {e}")
+            return "Couldn't start that."
+        self.job_id = d.get("job_id")
+        self.job_question = f"{query} on {site}"
+        return ("Searching. Tell them it takes about half a minute, then "
+                "call get_site_result.")
+
+    @function_tool
+    @auto_report("site_read")
+    async def get_site_result(self, context: RunContext):
+        """What the site lookup found. Call every 15 seconds until it answers."""
+        if not getattr(self, "job_id", None):
+            return "Nothing running."
+        try:
+            d = await backend_get("/jobs/answer", job_id=self.job_id,
+                                  question=getattr(self, "job_question", ""))
+        except Exception:
+            return "Couldn't check just now."
+        if d.get("state") == "done":
+            return d.get("answer") or "Nothing came back."
+        if d.get("state") == "failed":
+            return f"It didn't work: {d.get('message', '')}"
+        if d.get("state") == "waiting":
+            return "Queued behind another job. A moment longer."
+        return "Still loading the page. Check again shortly."
 
     @function_tool
     @auto_report("site_login")
