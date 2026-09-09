@@ -51,10 +51,16 @@ async def backend_get(path: str, **params):
 backend_get.last_ms = 0
 
 
+class BackendError(Exception):
+    pass
+
+
 async def backend_post(path: str, payload: dict):
     async with httpx.AsyncClient(timeout=20) as c:
         r = await c.post(f"{BACKEND}{path}", json=payload, headers=AUTH)
-        r.raise_for_status()
+        if r.status_code >= 400:
+            raise BackendError(f"{path} -> {r.status_code} "
+                               f"{r.text[:300]}")
         return r.json()
 
 
@@ -721,8 +727,8 @@ FINDING EMAIL
             })
         except Exception as e:
             log.error(f"onboard start failed: {e}")
-            return "I couldn't start the sign-in. Tell them you'll have "\
-                   "someone call back."
+            return (f"Couldn't start the sign-in: {str(e)[:300]}. Tell them "
+                    f"you'll have someone call back.")
         self.onboard_sid = data.get("session_id")
         await log_turn(self.call_id, "tool", f"signin started for {email}",
                        "connect_email")
