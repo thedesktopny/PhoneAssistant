@@ -226,6 +226,84 @@ class Job(Base):
     done_at = Column(DateTime, nullable=True)
 
 
+class Recipe(Base):
+    """Steps that worked for a task on a site, recorded automatically."""
+    __tablename__ = "recipes"
+    id = Column(Integer, primary_key=True)
+    site = Column(String(80))
+    task = Column(String(80))               # short label, e.g. order_status
+    example_goal = Column(Text, default="")
+    steps = Column(Text, default="[]")      # json list of actions
+    times_ok = Column(Integer, default=0)
+    times_failed = Column(Integer, default=0)
+    at = Column(DateTime, default=datetime.utcnow)
+    last_ok = Column(DateTime, nullable=True)
+    retired = Column(Integer, default=0)
+
+
+class SiteRequest(Base):
+    """Every request against a site, so you can see what's popular."""
+    __tablename__ = "site_requests"
+    id = Column(Integer, primary_key=True)
+    at = Column(DateTime, default=datetime.utcnow)
+    site = Column(String(80))
+    task = Column(String(80), default="")
+    goal = Column(Text, default="")
+    path = Column(String(20), default="")   # recipe / agent / fallback
+    outcome = Column(String(20), default="")  # ok / failed
+    seconds = Column(Integer, default=0)
+    job_id = Column(Integer, nullable=True)
+
+
+class Address(Base):
+    __tablename__ = "addresses"
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"))
+    label = Column(String(40), default="home")
+    line1 = Column(String(200), default="")
+    line2 = Column(String(200), default="")
+    city = Column(String(100), default="")
+    state = Column(String(40), default="")
+    zip = Column(String(20), default="")
+    is_default = Column(Integer, default=0)
+
+
+class PaymentCard(Base):
+    """Card number encrypted in the vault; only last four in the clear."""
+    __tablename__ = "payment_cards"
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"))
+    label = Column(String(40), default="")
+    last4 = Column(String(4), default="")
+    brand = Column(String(20), default="")
+    exp = Column(String(7), default="")             # MM/YY
+    name_on_card = Column(String(120), default="")
+    secret_blob = Column(Text)
+    is_default = Column(Integer, default=0)
+    at = Column(DateTime, default=datetime.utcnow)
+
+
+class Order(Base):
+    __tablename__ = "orders"
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"))
+    call_id = Column(Integer, nullable=True)
+    site = Column(String(80), default="")
+    item = Column(Text, default="")
+    quantity = Column(Integer, default=1)
+    expected_price = Column(String(20), default="")
+    address_id = Column(Integer, nullable=True)
+    card_id = Column(Integer, nullable=True)
+    state = Column(String(30), default="draft")   # draft/confirmed/placing/placed/failed/cancelled
+    confirmation = Column(String(120), default="")
+    final_total = Column(String(20), default="")
+    message = Column(Text, default="")
+    history = Column(Text, default="")
+    job_id = Column(Integer, nullable=True)
+    at = Column(DateTime, default=datetime.utcnow)
+    placed_at = Column(DateTime, nullable=True)
+
+
 class SecretAccess(Base):
     """Every time a stored password is decrypted, and why."""
     __tablename__ = "secret_access"
@@ -1281,7 +1359,7 @@ def delete_everything(account_id: int) -> dict:
         db.delete(c)
 
     for model in (Memory, Onboard, PhoneNumber, SiteLogin,
-                  SiteSession, Job):
+                  SiteSession, Job, Address, PaymentCard, Order):
         for row in db.query(model).filter_by(account_id=account_id).all():
             db.delete(row)
 
@@ -1697,7 +1775,637 @@ def _run_site_search(jid: int, account_id: int, site: str):
         _JOBS.pop(jid, None)
 
 
+
+# --------------------------------------------------- general browser agent
+# Give it a goal and a starting URL. It reads the page, decides the next
+# action, and repeats. No per-site configuration.
+
+BROWSE_SYSTEM = """You are operating a web browser for someone on a phone
+call. You get the page's text and a numbered list of things you can interact
+with. Reply with ONE action as JSON and nothing else.
+
+Actions:
+{"action":"click","index":N,"why":"..."}
+{"action":"type","index":N,"text":"...","enter":true,"why":"..."}
+{"action":"goto","url":"https://...","why":"..."}
+{"action":"scroll","why":"..."}
+{"action":"wait","why":"..."}
+{"action":"ask_user","question":"...","why":"..."}   when you need a code,
+                                                      a choice, or anything
+                                                      only they can answer
+{"action":"done","answer":"what to say out loud","why":"..."}
+{"action":"give_up","answer":"why it can't be done","why":"..."}
+
+Rules:
+- Work towards the goal in as few steps as possible.
+- Never buy, pay, submit an order, or send anything irreversible. If the goal
+  needs that, stop with ask_user and describe exactly what you would do.
+- If the page wants a login and there are saved details, use them; if it
+  wants a one-time code, use ask_user.
+- If you can already answer the goal from the page, use done.
+- The answer field is read aloud, so keep it to two or three sentences with
+  plain names, prices and dates. Never include a URL."""
+
+
+def _page_snapshot(page, limit: int = 60):
+    """Page text plus a numbered list of interactive elements."""
+    els = page.query_selector_all(
+        "a, button, input, textarea, select, [role=button], [role=link]")
+    items, seen = [], set()
+    for el in els:
+        if len(items) >= limit:
+            break
+        try:
+            if not el.is_visible():
+                continue
+            tag = el.evaluate("e => e.tagName.toLowerCase()")
+            label = (el.get_attribute("aria-label")
+                     or el.get_attribute("placeholder")
+                     or (el.inner_text() or "").strip()
+                     or el.get_attribute("name")
+                     or el.get_attribute("value") or "")
+            label = " ".join(label.split())[:70]
+            typ = el.get_attribute("type") or ""
+            key = f"{tag}|{typ}|{label}"
+            if not label and tag not in ("input", "textarea", "select"):
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append({"el": el,
+                          "desc": f"{tag}{'/' + typ if typ else ''}: {label}"})
+        except Exception:
+            continue
+    try:
+        text = " ".join((page.inner_text("body") or "").split())[:4000]
+    except Exception:
+        text = ""
+    return items, text
+
+
+def _decide(goal: str, url: str, text: str, items: list, history: list,
+            answer_hint: str = ""):
+    listing = "\n".join(f"[{i}] {it['desc']}" for i, it in enumerate(items))
+    steps = "\n".join(history[-8:]) or "(none yet)"
+    msg = (f"GOAL: {goal}\n"
+           f"URL: {url}\n"
+           f"STEPS SO FAR:\n{steps}\n"
+           f"{answer_hint}\n"
+           f"ELEMENTS:\n{listing}\n\n"
+           f"PAGE TEXT:\n{text}")
+    d = _openai_chat([{"role": "system", "content": BROWSE_SYSTEM},
+                      {"role": "user", "content": msg}])
+    raw = (d["choices"][0]["message"].get("content") or "").strip()
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"action": "give_up",
+                "answer": "I couldn't work out what to do next."}
+
+
+_TASK_CACHE = {}
+
+
+def _task_label(goal: str) -> str:
+    """Short stable label for a goal, so 'where's my order' and 'check my
+    order status' land on the same recipe."""
+    key = goal.strip().lower()
+    if key in _TASK_CACHE:
+        return _TASK_CACHE[key]
+    label = "misc"
+    if OPENAI_API_KEY:
+        try:
+            d = _openai_chat([
+                {"role": "system",
+                 "content": ("Reduce the task to a short snake_case label of "
+                             "1-3 words describing the kind of task, not the "
+                             "specifics. Examples: order_status, "
+                             "product_price, account_balance, store_hours, "
+                             "prescription_ready, track_package. Reply with "
+                             "the label only.")},
+                {"role": "user", "content": goal[:300]}])
+            raw = (d["choices"][0]["message"].get("content") or "").strip()
+            raw = "".join(ch if ch.isalnum() or ch == "_" else "_"
+                          for ch in raw.lower()).strip("_")[:60]
+            if raw:
+                label = raw
+        except Exception:
+            pass
+    _TASK_CACHE[key] = label
+    return label
+
+
+def _record_request(site, task, goal, path, outcome, seconds, jid):
+    db = Session()
+    db.add(SiteRequest(site=site or "generic", task=task, goal=goal[:500],
+                       path=path, outcome=outcome, seconds=int(seconds),
+                       job_id=jid))
+    db.commit()
+    db.close()
+
+
+def _find_recipe(site: str, task: str):
+    db = Session()
+    row = (db.query(Recipe)
+             .filter_by(site=site or "generic", task=task, retired=0)
+             .order_by(Recipe.times_ok.desc()).first())
+    out = None
+    if row:
+        out = {"id": row.id, "steps": json.loads(row.steps or "[]")}
+    db.close()
+    return out
+
+
+def _save_recipe(site: str, task: str, goal: str, steps: list):
+    """Store the steps that worked. Existing recipe -> refresh it."""
+    db = Session()
+    row = (db.query(Recipe)
+             .filter_by(site=site or "generic", task=task).first())
+    if row:
+        row.steps = json.dumps(steps)
+        row.retired = 0
+        row.times_ok = (row.times_ok or 0) + 1
+        row.last_ok = datetime.utcnow()
+    else:
+        db.add(Recipe(site=site or "generic", task=task,
+                      example_goal=goal[:500], steps=json.dumps(steps),
+                      times_ok=1, last_ok=datetime.utcnow()))
+    db.commit()
+    db.close()
+
+
+def _recipe_result(rid: int, ok: bool):
+    db = Session()
+    row = db.query(Recipe).filter_by(id=rid).first()
+    if row:
+        if ok:
+            row.times_ok = (row.times_ok or 0) + 1
+            row.last_ok = datetime.utcnow()
+        else:
+            row.times_failed = (row.times_failed or 0) + 1
+            # three failures in a row with few successes -> retire it
+            if (row.times_failed or 0) >= 3 and \
+                    (row.times_failed or 0) > (row.times_ok or 0):
+                row.retired = 1
+        db.commit()
+    db.close()
+
+
+def _match_element(items: list, desc: str):
+    """Find today's version of an element recorded by description."""
+    if not desc:
+        return None
+    want = desc.lower()
+    for it in items:
+        if it["desc"].lower() == want:
+            return it["el"]
+    tail = want.split(":", 1)[-1].strip()
+    if tail:
+        for it in items:
+            if tail in it["desc"].lower():
+                return it["el"]
+    return None
+
+
+def _replay_recipe(page, steps: list, creds: dict, log_fn):
+    """Run recorded steps without the model. Returns (ok, answer_text)."""
+    for i, st in enumerate(steps):
+        a = st.get("action")
+        try:
+            if a in ("click", "type"):
+                items, _ = _page_snapshot(page)
+                el = _match_element(items, st.get("desc", ""))
+                if not el:
+                    log_fn(f"replay step {i + 1}: couldn't find "
+                           f"'{st.get('desc', '')}'")
+                    return False, ""
+                if a == "click":
+                    el.click()
+                else:
+                    val = st.get("text", "")
+                    if val == "SAVED_PASSWORD":
+                        val = creds.get("password", "")
+                    elif val == "SAVED_USERNAME":
+                        val = creds.get("username", "")
+                    el.fill(val)
+                    if st.get("enter"):
+                        page.keyboard.press("Enter")
+                page.wait_for_timeout(4000)
+            elif a == "goto":
+                page.goto(st["url"], wait_until="domcontentloaded",
+                          timeout=60000)
+                page.wait_for_timeout(4000)
+            elif a == "scroll":
+                page.mouse.wheel(0, 1400)
+                page.wait_for_timeout(2000)
+            elif a == "wait":
+                page.wait_for_timeout(3000)
+            log_fn(f"replay step {i + 1}: {a} ok")
+        except Exception as e:
+            log_fn(f"replay step {i + 1}: {a} failed — {str(e)[:80]}")
+            return False, ""
+    try:
+        text = " ".join((page.inner_text("body") or "").split())[:5000]
+    except Exception:
+        text = ""
+    return True, text
+
+
+def _run_browse(jid: int, account_id: int, site: str):
+    """Pursue a goal on any site. Try the learned recipe first; fall back to
+    the step-by-step agent; record what worked."""
+    from playwright.sync_api import sync_playwright
+
+    db = Session()
+    row = db.query(Job).filter_by(id=jid).first()
+    payload = json.loads(row.payload or "{}") if row else {}
+    db.close()
+    goal = payload.get("goal", "")
+    start = payload.get("url") or (f"https://www.{site}.com"
+                                   if site else "https://www.google.com")
+    max_steps = int(payload.get("max_steps", 12))
+    site_key = site or "generic"
+    task = _task_label(goal)
+    t0 = time.time()
+
+    creds = use_site_login(account_id, site, purpose=f"job {jid} browse") \
+        if site else {}
+    hint = ""
+    if creds.get("username"):
+        hint = (f"Saved login for this site: username {creds['username']}. "
+                f"To fill the username field type SAVED_USERNAME; to fill "
+                f"the password field type SAVED_PASSWORD. Both get replaced "
+                f"with the real values.")
+
+    def log_fn(msg):
+        _job_set(jid, "working", msg)
+
+    browser = page = None
+    recorded = []          # steps with element descriptions, for the recipe
+    history = []
+    path_used = "agent"
+    try:
+        with sync_playwright() as p:
+            browser, page, ctx_id = _open_with_session(p, account_id, site_key)
+            _job_set(jid, "opening", f"Opening {start}")
+            page.goto(start, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(4000)
+
+            # ---- 1. learned recipe first
+            recipe = _find_recipe(site_key, task)
+            if recipe and recipe["steps"]:
+                _job_set(jid, "working",
+                         f"Using what worked before for {task}.")
+                ok, text = _replay_recipe(page, recipe["steps"], creds,
+                                          log_fn)
+                if ok and text:
+                    answer = _summarise_page(text, goal)
+                    if answer and "nothing relevant" not in answer.lower():
+                        _recipe_result(recipe["id"], True)
+                        _job_set(jid, "done", answer[:1500])
+                        _record_request(site_key, task, goal, "recipe", "ok",
+                                        time.time() - t0, jid)
+                        if ctx_id:
+                            _save_context(account_id, site_key, ctx_id)
+                        browser.close()
+                        return
+                _recipe_result(recipe["id"], False)
+                path_used = "fallback"
+                _job_set(jid, "working",
+                         "The saved steps didn't work — working it out fresh.")
+                page.goto(start, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(4000)
+
+            # ---- 2. step-by-step agent
+            outcome = "failed"
+            for step in range(max_steps):
+                items, text = _page_snapshot(page)
+                act = _decide(goal, page.url, text, items, history, hint)
+                a = act.get("action")
+                why = act.get("why", "")[:120]
+
+                if a == "done":
+                    _job_set(jid, "done", act.get("answer", "")[:1500])
+                    outcome = "ok"
+                    if recorded:
+                        _save_recipe(site_key, task, goal, recorded)
+                    break
+                if a == "give_up":
+                    _job_set(jid, "failed", act.get("answer", "")[:600])
+                    break
+                if a == "ask_user":
+                    q = act.get("question", "")[:300]
+                    _job_set(jid, "needs_input", q)
+                    waited, reply = 0, None
+                    while waited < 240:
+                        time.sleep(3)
+                        waited += 3
+                        reply = (_JOBS.get(jid) or {}).get("code")
+                        if reply:
+                            _JOBS[jid]["code"] = None
+                            break
+                    if not reply:
+                        _job_set(jid, "failed", "No answer from the caller.")
+                        break
+                    history.append(f"asked: {q} -> they said: {reply}")
+                    _job_set(jid, "working", "Carrying on.")
+                    continue
+
+                try:
+                    if a == "click":
+                        it = items[int(act["index"])]
+                        it["el"].click()
+                        recorded.append({"action": "click",
+                                         "desc": it["desc"]})
+                        page.wait_for_timeout(4000)
+                    elif a == "type":
+                        it = items[int(act["index"])]
+                        val = act.get("text", "")
+                        real = val
+                        if val == "SAVED_PASSWORD":
+                            real = creds.get("password", "")
+                        elif val == "SAVED_USERNAME":
+                            real = creds.get("username", "")
+                        it["el"].fill(real)
+                        if act.get("enter"):
+                            page.keyboard.press("Enter")
+                        recorded.append({"action": "type", "desc": it["desc"],
+                                         "text": val,
+                                         "enter": bool(act.get("enter"))})
+                        page.wait_for_timeout(4000)
+                    elif a == "goto":
+                        page.goto(act["url"], wait_until="domcontentloaded",
+                                  timeout=60000)
+                        recorded.append({"action": "goto", "url": act["url"]})
+                        page.wait_for_timeout(4000)
+                    elif a == "scroll":
+                        page.mouse.wheel(0, 1400)
+                        recorded.append({"action": "scroll"})
+                        page.wait_for_timeout(2000)
+                    else:
+                        page.wait_for_timeout(3000)
+                except Exception as e:
+                    history.append(f"{a} failed: {str(e)[:90]}")
+                    _job_set(jid, "working", f"Retrying after: {str(e)[:80]}")
+                    continue
+
+                shown = act.get("text", "")
+                if shown in ("SAVED_PASSWORD",):
+                    shown = "(password)"
+                history.append(f"{a} {act.get('index', act.get('url', ''))}"
+                               f" {shown} — {why}")
+                _job_set(jid, "working", f"Step {step + 1}: {why}")
+            else:
+                _job_set(jid, "failed", "Ran out of steps before finishing.")
+
+            _record_request(site_key, task, goal, path_used, outcome,
+                            time.time() - t0, jid)
+            if ctx_id:
+                _save_context(account_id, site_key, ctx_id)
+            browser.close()
+    except Exception as e:
+        _job_set(jid, "failed", f"Browser error: {str(e)[:200]}")
+        _record_request(site_key, task, goal, path_used, "failed",
+                        time.time() - t0, jid)
+        try:
+            if browser:
+                browser.close()
+        except Exception:
+            pass
+    finally:
+        _JOBS.pop(jid, None)
+
+
+
+CHECKOUT_SYSTEM = """You are placing an order on a website for a customer
+who has already confirmed every detail on the phone. You get the page text
+and numbered interactive elements. Reply with ONE JSON action and nothing
+else.
+
+Actions:
+{"action":"click","index":N,"why":"..."}
+{"action":"type","index":N,"text":"...","enter":false,"why":"..."}
+{"action":"goto","url":"https://...","why":"..."}
+{"action":"scroll","why":"..."}
+{"action":"wait","why":"..."}
+{"action":"ask_user","question":"...","why":"..."}
+{"action":"place_order","index":N,"total":"12.34","why":"..."}
+{"action":"done","confirmation":"...","total":"12.34","answer":"...","why":"..."}
+{"action":"give_up","answer":"...","why":"..."}
+
+THE ORDER (already confirmed by the customer — use exactly these):
+{spec}
+
+Placeholders you may type: SHIP_LINE1, SHIP_LINE2, SHIP_CITY, SHIP_STATE,
+SHIP_ZIP, SHIP_NAME, CARD_NUMBER, CARD_EXP_MM, CARD_EXP_YY, CARD_CVV,
+CARD_NAME, SAVED_USERNAME, SAVED_PASSWORD. They are swapped for real values.
+
+Rules, in order of importance:
+1. Add ONLY the item described, in the quantity given. If you cannot find a
+   product that clearly matches, give_up — do not substitute.
+2. If the site already has a saved address or card that matches the
+   customer's, use it. Otherwise enter the customer's details.
+3. Before the final purchase, you must be on a review/summary screen. Read
+   the item, quantity, shipping address, and total. Then use place_order
+   with the index of the final purchase button and the total shown.
+   If the total is more than 20% above the expected price, use ask_user
+   instead, stating the total.
+4. After purchasing, find the confirmation/order number and use done.
+5. If anything asks for a code or a choice only the customer can make,
+   use ask_user.
+6. Never buy anything else, never add extras, never change quantity."""
+
+
+def _run_checkout(jid: int, account_id: int, site: str):
+    """Place a confirmed order. Every value comes from the confirmed spec."""
+    from playwright.sync_api import sync_playwright
+
+    db = Session()
+    job = db.query(Job).filter_by(id=jid).first()
+    payload = json.loads(job.payload or "{}") if job else {}
+    oid = payload.get("order_id")
+    order = db.query(Order).filter_by(id=oid).first() if oid else None
+    if not order:
+        db.close()
+        _job_set(jid, "failed", "No order attached.")
+        return
+    addr = (db.query(Address).filter_by(id=order.address_id).first()
+            if order.address_id else None)
+    card = (db.query(PaymentCard).filter_by(id=order.card_id).first()
+            if order.card_id else None)
+    acct = db.query(Account).filter_by(id=account_id).first()
+    spec = {
+        "site": order.site, "item": order.item, "quantity": order.quantity,
+        "expected_price": order.expected_price,
+        "ship_to": _fmt_address(addr) if addr else "(use the site's saved address)",
+        "pay_with": (f"{card.brand} ending {card.last4}" if card
+                     else "(use the site's saved payment method)"),
+    }
+    values = {
+        "SHIP_LINE1": addr.line1 if addr else "",
+        "SHIP_LINE2": addr.line2 if addr else "",
+        "SHIP_CITY": addr.city if addr else "",
+        "SHIP_STATE": addr.state if addr else "",
+        "SHIP_ZIP": addr.zip if addr else "",
+        "SHIP_NAME": (card.name_on_card if card and card.name_on_card
+                      else (acct.name if acct else "")),
+        "CARD_NAME": (card.name_on_card if card and card.name_on_card
+                      else (acct.name if acct else "")),
+    }
+    db.close()
+
+    if card:
+        secret = vault_get(card.secret_blob)
+        values["CARD_NUMBER"] = secret.get("number", "")
+        values["CARD_CVV"] = secret.get("cvv", "")
+        mm, _, yy = (card.exp or "").partition("/")
+        values["CARD_EXP_MM"] = mm.strip()
+        values["CARD_EXP_YY"] = yy.strip()[-2:]
+        db = Session()
+        db.add(SecretAccess(account_id=account_id, site="card",
+                            purpose=f"order {oid} checkout"))
+        db.commit()
+        db.close()
+
+    creds = use_site_login(account_id, site, purpose=f"order {oid} checkout") \
+        if site else {}
+    values["SAVED_USERNAME"] = creds.get("username", "")
+    values["SAVED_PASSWORD"] = creds.get("password", "")
+
+    system = CHECKOUT_SYSTEM.replace("{spec}", json.dumps(spec, indent=1))
+
+    def decide(url, text, items, history):
+        listing = "\n".join(f"[{i}] {it['desc']}"
+                             for i, it in enumerate(items))
+        msg = (f"URL: {url}\nSTEPS SO FAR:\n" +
+               ("\n".join(history[-10:]) or "(none)") +
+               f"\n\nELEMENTS:\n{listing}\n\nPAGE TEXT:\n{text}")
+        d = _openai_chat([{"role": "system", "content": system},
+                          {"role": "user", "content": msg}])
+        raw = (d["choices"][0]["message"].get("content") or "").strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {"action": "give_up", "answer": "Lost track of the page."}
+
+    browser = page = None
+    history = []
+    try:
+        with sync_playwright() as p:
+            browser, page, ctx_id = _open_with_session(p, account_id, site)
+            _job_set(jid, "opening", f"Opening {site}.")
+            _order_set(oid, "placing", f"Opening {site}.")
+            page.goto(f"https://www.{site}.com", wait_until="domcontentloaded",
+                      timeout=60000)
+            page.wait_for_timeout(4000)
+
+            for step in range(30):
+                items, text = _page_snapshot(page, limit=80)
+                act = decide(page.url, text, items, history)
+                a = act.get("action")
+                why = act.get("why", "")[:120]
+
+                if a == "done":
+                    conf = act.get("confirmation", "")[:120]
+                    total = act.get("total", "")[:20]
+                    _order_set(oid, "placed",
+                               act.get("answer", "Order placed.")[:400],
+                               confirmation=conf, final_total=total)
+                    _job_set(jid, "done", f"Placed. Confirmation {conf}, "
+                                          f"total {total}.")
+                    break
+                if a == "give_up":
+                    _order_set(oid, "failed", act.get("answer", "")[:400])
+                    _job_set(jid, "failed", act.get("answer", "")[:400])
+                    break
+                if a == "ask_user":
+                    q = act.get("question", "")[:300]
+                    _job_set(jid, "needs_input", q)
+                    _order_set(oid, "placing", f"Needs the customer: {q}")
+                    waited, reply = 0, None
+                    while waited < 240:
+                        time.sleep(3)
+                        waited += 3
+                        reply = (_JOBS.get(jid) or {}).get("code")
+                        if reply:
+                            _JOBS[jid]["code"] = None
+                            break
+                    if not reply:
+                        _order_set(oid, "failed", "No answer from the customer.")
+                        _job_set(jid, "failed", "No answer from the caller.")
+                        break
+                    history.append(f"asked: {q} -> they said: {reply}")
+                    continue
+                if a == "place_order":
+                    total = str(act.get("total", ""))[:20]
+                    _order_set(oid, "placing",
+                               f"On the review screen, total {total}. "
+                               f"Placing now.")
+                    history.append(f"place_order total {total} — {why}")
+                    try:
+                        items[int(act["index"])]["el"].click()
+                        page.wait_for_timeout(8000)
+                    except Exception as e:
+                        history.append(f"place_order click failed: "
+                                       f"{str(e)[:80]}")
+                    continue
+
+                try:
+                    if a == "click":
+                        items[int(act["index"])]["el"].click()
+                        page.wait_for_timeout(4000)
+                    elif a == "type":
+                        val = act.get("text", "")
+                        real = values.get(val, val)
+                        items[int(act["index"])]["el"].fill(real)
+                        if act.get("enter"):
+                            page.keyboard.press("Enter")
+                        page.wait_for_timeout(4000)
+                    elif a == "goto":
+                        page.goto(act["url"], wait_until="domcontentloaded",
+                                  timeout=60000)
+                        page.wait_for_timeout(4000)
+                    elif a == "scroll":
+                        page.mouse.wheel(0, 1400)
+                        page.wait_for_timeout(2000)
+                    else:
+                        page.wait_for_timeout(3000)
+                except Exception as e:
+                    history.append(f"{a} failed: {str(e)[:90]}")
+                    continue
+
+                shown = act.get("text", "")
+                if shown in values and shown.startswith(("CARD", "SAVED_P")):
+                    shown = f"({shown.lower()})"
+                history.append(f"{a} {act.get('index', act.get('url', ''))}"
+                               f" {shown} — {why}")
+                _job_set(jid, "working", f"Step {step + 1}: {why}")
+                _order_set(oid, "placing", f"Step {step + 1}: {why}")
+            else:
+                _order_set(oid, "failed", "Ran out of steps.")
+                _job_set(jid, "failed", "Ran out of steps.")
+
+            if ctx_id:
+                _save_context(account_id, site, ctx_id)
+            browser.close()
+    except Exception as e:
+        _order_set(oid, "failed", f"Browser error: {str(e)[:200]}")
+        _job_set(jid, "failed", f"Browser error: {str(e)[:200]}")
+        try:
+            if browser:
+                browser.close()
+        except Exception:
+            pass
+    finally:
+        values.clear()
+        _JOBS.pop(jid, None)
+
+
 RUNNERS = {"site_login": _run_site_login,
+           "browse": _run_browse,
+           "checkout": _run_checkout,
            "site_orders": _run_site_orders,
            "site_search": _run_site_search}
 
@@ -1789,6 +2497,58 @@ def queue_health() -> dict:
     return {"max_browsers": MAX_BROWSERS, "running": running,
             "waiting": waiting, "stuck_over_20min": stale,
             "saved_sessions": sessions}
+
+
+
+# ------------------------------------------------------------- ordering
+
+def _order_set(oid: int, state: str, message: str = "", **fields):
+    db = Session()
+    row = db.query(Order).filter_by(id=oid).first()
+    if row:
+        row.state = state
+        row.message = message[:600]
+        for k, v in fields.items():
+            setattr(row, k, v)
+        stamp = datetime.utcnow().strftime("%H:%M:%S")
+        row.history = ((row.history or "") +
+                       f"[{stamp}] {state}: {message[:300]}\n")[-6000:]
+        if state == "placed":
+            row.placed_at = datetime.utcnow()
+        db.commit()
+    db.close()
+
+
+def _fmt_address(a) -> str:
+    parts = [a.line1, a.line2, f"{a.city}, {a.state} {a.zip}".strip(", ")]
+    return ", ".join(p for p in parts if p)
+
+
+def _luhn_ok(num: str) -> bool:
+    d = [int(c) for c in num if c.isdigit()]
+    if len(d) < 13:
+        return False
+    total, alt = 0, False
+    for x in reversed(d):
+        if alt:
+            x *= 2
+            if x > 9:
+                x -= 9
+        total += x
+        alt = not alt
+    return total % 10 == 0
+
+
+def _card_brand(num: str) -> str:
+    if num.startswith("4"):
+        return "Visa"
+    if num[:2] in ("51", "52", "53", "54", "55") or 2221 <= int(num[:4] or 0) <= 2720:
+        return "Mastercard"
+    if num[:2] in ("34", "37"):
+        return "Amex"
+    if num.startswith("6"):
+        return "Discover"
+    return "Card"
 
 
 # ------------------------------------------------------- text brain (SMS)
@@ -2677,6 +3437,73 @@ def job_site_search(request: Request, account_id: int, site: str,
                                 payload={"query": query})}
 
 
+@app.post("/jobs/browse")
+def job_browse(request: Request, account_id: int, goal: str,
+               site: str = "", url: str = "", call_id: int = 0):
+    """Pursue any goal on any site. No per-site setup."""
+    require_auth(request)
+    if not BROWSERBASE_API_KEY:
+        raise HTTPException(400, "Browserbase isn't configured.")
+    return {"job_id": start_job(account_id, "browse", site,
+                                call_id=call_id or None,
+                                payload={"goal": goal, "url": url})}
+
+
+@app.get("/sites/report")
+def sites_report(request: Request, days: int = 30):
+    """What's being asked for, per site, and how it's going."""
+    require_auth(request)
+    since = datetime.utcnow() - timedelta(days=days)
+    db = Session()
+    reqs = db.query(SiteRequest).filter(SiteRequest.at >= since).all()
+    recipes = db.query(Recipe).all()
+    db.close()
+
+    by_site = {}
+    for r in reqs:
+        b = by_site.setdefault(r.site, {"site": r.site, "requests": 0,
+                                        "ok": 0, "failed": 0,
+                                        "via_recipe": 0, "fallbacks": 0,
+                                        "avg_seconds": 0, "tasks": {}})
+        b["requests"] += 1
+        b["ok" if r.outcome == "ok" else "failed"] += 1
+        if r.path == "recipe":
+            b["via_recipe"] += 1
+        if r.path == "fallback":
+            b["fallbacks"] += 1
+        b["avg_seconds"] += r.seconds or 0
+        t = b["tasks"].setdefault(r.task or "misc", 0)
+        b["tasks"][r.task or "misc"] = t + 1
+    for b in by_site.values():
+        if b["requests"]:
+            b["avg_seconds"] = int(b["avg_seconds"] / b["requests"])
+        b["tasks"] = sorted(b["tasks"].items(), key=lambda x: -x[1])[:6]
+
+    rec_out = [{"id": r.id, "site": r.site, "task": r.task,
+                "example": r.example_goal, "steps": json.loads(r.steps or "[]"),
+                "ok": r.times_ok or 0, "failed": r.times_failed or 0,
+                "retired": bool(r.retired),
+                "last_ok": r.last_ok.strftime("%b %-d %-I:%M %p")
+                           if r.last_ok else ""} for r in recipes]
+    return {"sites": sorted(by_site.values(), key=lambda x: -x["requests"]),
+            "recipes": rec_out}
+
+
+@app.get("/sites/events")
+def sites_events(request: Request, limit: int = 60):
+    """Recent requests, including every fallback and failure."""
+    require_auth(request)
+    db = Session()
+    rows = (db.query(SiteRequest).order_by(SiteRequest.id.desc())
+              .limit(limit).all())
+    out = [{"at": r.at.strftime("%b %-d %-I:%M %p") if r.at else "",
+            "site": r.site, "task": r.task, "goal": r.goal,
+            "path": r.path, "outcome": r.outcome, "seconds": r.seconds,
+            "job_id": r.job_id} for r in rows]
+    db.close()
+    return out
+
+
 @app.get("/jobs/answer")
 def job_answer(request: Request, job_id: int, question: str = ""):
     """A spoken-length summary of what a finished job found."""
@@ -2688,6 +3515,8 @@ def job_answer(request: Request, job_id: int, question: str = ""):
         raise HTTPException(404, "Unknown job.")
     if row.state != "done":
         return {"state": row.state, "message": row.message}
+    if row.kind == "browse":
+        return {"state": "done", "answer": row.message}
     q = question or ("their recent orders" if row.kind == "site_orders"
                      else "the search results")
     return {"state": "done",
@@ -2834,6 +3663,227 @@ def vault_migrate(request: Request, confirm: str = ""):
     db.commit()
     db.close()
     return {"re_encrypted": moved, "failed": failed}
+
+
+
+class AddressBody(BaseModel):
+    account_id: int
+    label: str = "home"
+    line1: str
+    line2: str = ""
+    city: str
+    state: str
+    zip: str
+    make_default: bool = True
+
+
+@app.post("/addresses")
+def address_add(b: AddressBody, request: Request):
+    require_auth(request)
+    db = Session()
+    if b.make_default:
+        for a in db.query(Address).filter_by(account_id=b.account_id).all():
+            a.is_default = 0
+    row = Address(account_id=b.account_id, label=b.label[:40],
+                  line1=b.line1, line2=b.line2, city=b.city,
+                  state=b.state, zip=b.zip,
+                  is_default=1 if b.make_default else 0)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    out = {"id": row.id, "address": _fmt_address(row)}
+    db.close()
+    return out
+
+
+@app.get("/addresses")
+def address_list(request: Request, account_id: int):
+    require_auth(request)
+    db = Session()
+    rows = db.query(Address).filter_by(account_id=account_id).all()
+    out = [{"id": a.id, "label": a.label, "address": _fmt_address(a),
+            "default": bool(a.is_default)} for a in rows]
+    db.close()
+    return out
+
+
+@app.delete("/addresses")
+def address_delete(request: Request, address_id: int):
+    require_auth(request)
+    db = Session()
+    row = db.query(Address).filter_by(id=address_id).first()
+    if row:
+        db.delete(row)
+        db.commit()
+    db.close()
+    return {"ok": True}
+
+
+class CardBody(BaseModel):
+    account_id: int
+    number: str
+    exp: str                    # MM/YY
+    cvv: str = ""
+    name_on_card: str = ""
+    label: str = ""
+    make_default: bool = True
+
+
+@app.post("/cards")
+def card_add(b: CardBody, request: Request):
+    require_auth(request)
+    num = "".join(ch for ch in b.number if ch.isdigit())
+    if not _luhn_ok(num):
+        raise HTTPException(400, "That card number doesn't check out.")
+    db = Session()
+    if b.make_default:
+        for c in db.query(PaymentCard).filter_by(account_id=b.account_id).all():
+            c.is_default = 0
+    row = PaymentCard(account_id=b.account_id, label=b.label[:40],
+                      last4=num[-4:], brand=_card_brand(num),
+                      exp=b.exp[:7], name_on_card=b.name_on_card[:120],
+                      secret_blob=vault_put({"number": num, "cvv": b.cvv}),
+                      is_default=1 if b.make_default else 0)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    out = {"id": row.id, "brand": row.brand, "last4": row.last4}
+    db.close()
+    return out
+
+
+@app.get("/cards")
+def card_list(request: Request, account_id: int):
+    """Never returns the number."""
+    require_auth(request)
+    db = Session()
+    rows = db.query(PaymentCard).filter_by(account_id=account_id).all()
+    out = [{"id": c.id, "label": c.label, "brand": c.brand,
+            "last4": c.last4, "exp": c.exp, "default": bool(c.is_default)}
+           for c in rows]
+    db.close()
+    return out
+
+
+@app.delete("/cards")
+def card_delete(request: Request, card_id: int):
+    require_auth(request)
+    db = Session()
+    row = db.query(PaymentCard).filter_by(id=card_id).first()
+    if row:
+        db.delete(row)
+        db.commit()
+    db.close()
+    return {"ok": True}
+
+
+class OrderBody(BaseModel):
+    account_id: int
+    site: str
+    item: str
+    quantity: int = 1
+    expected_price: str = ""
+    address_id: int | None = None
+    card_id: int | None = None
+    call_id: int | None = None
+
+
+@app.post("/orders/draft")
+def order_draft(b: OrderBody, request: Request):
+    """Create the order. Nothing is placed until /orders/confirm."""
+    require_auth(request)
+    db = Session()
+    addr = None
+    if b.address_id:
+        addr = db.query(Address).filter_by(id=b.address_id).first()
+    else:
+        addr = (db.query(Address).filter_by(account_id=b.account_id)
+                  .order_by(Address.is_default.desc()).first())
+    card = None
+    if b.card_id:
+        card = db.query(PaymentCard).filter_by(id=b.card_id).first()
+    else:
+        card = (db.query(PaymentCard).filter_by(account_id=b.account_id)
+                  .order_by(PaymentCard.is_default.desc()).first())
+    row = Order(account_id=b.account_id, call_id=b.call_id,
+                site=b.site.lower(), item=b.item, quantity=b.quantity,
+                expected_price=b.expected_price,
+                address_id=addr.id if addr else None,
+                card_id=card.id if card else None, state="draft")
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    out = {"order_id": row.id,
+           "site": row.site, "item": row.item, "quantity": row.quantity,
+           "expected_price": row.expected_price,
+           "address": _fmt_address(addr) if addr else "",
+           "card": f"{card.brand} ending {card.last4}" if card else "",
+           "ready": bool(addr and (card or b.site.lower() in
+                                  ("walmart", "amazon", "temu")))}
+    db.close()
+    return out
+
+
+@app.post("/orders/confirm")
+def order_confirm(request: Request, order_id: int, confirmed: str = ""):
+    """Caller said yes out loud. Starts the checkout job."""
+    require_auth(request)
+    if confirmed.strip().lower() not in ("yes", "confirmed", "place it"):
+        raise HTTPException(400, "Needs an explicit yes.")
+    if not BROWSERBASE_API_KEY:
+        raise HTTPException(400, "Browserbase isn't configured.")
+    db = Session()
+    row = db.query(Order).filter_by(id=order_id).first()
+    if not row or row.state not in ("draft", "failed"):
+        db.close()
+        raise HTTPException(400, "Order isn't in a state to confirm.")
+    row.state = "confirmed"
+    acct_id, site = row.account_id, row.site
+    db.commit()
+    db.close()
+    jid = start_job(acct_id, "checkout", site, payload={"order_id": order_id})
+    _order_set(order_id, "placing", "Checkout started.", job_id=jid)
+    return {"order_id": order_id, "job_id": jid, "state": "placing"}
+
+
+@app.post("/orders/cancel")
+def order_cancel(request: Request, order_id: int):
+    require_auth(request)
+    _order_set(order_id, "cancelled", "Cancelled by the customer.")
+    return {"ok": True}
+
+
+@app.get("/orders/status")
+def order_status(request: Request, order_id: int):
+    require_auth(request)
+    db = Session()
+    row = db.query(Order).filter_by(id=order_id).first()
+    db.close()
+    if not row:
+        raise HTTPException(404, "Unknown order.")
+    return {"order_id": row.id, "state": row.state, "message": row.message,
+            "confirmation": row.confirmation, "final_total": row.final_total,
+            "history": row.history or ""}
+
+
+@app.get("/orders")
+def orders_list(request: Request, account_id: int = 0, limit: int = 50):
+    require_auth(request)
+    db = Session()
+    q = db.query(Order)
+    if account_id:
+        q = q.filter_by(account_id=account_id)
+    rows = q.order_by(Order.id.desc()).limit(limit).all()
+    names = {a.id: a.name for a in db.query(Account).all()}
+    out = [{"order_id": r.id, "who": names.get(r.account_id) or "?",
+            "site": r.site, "item": r.item, "quantity": r.quantity,
+            "expected_price": r.expected_price, "state": r.state,
+            "confirmation": r.confirmation, "final_total": r.final_total,
+            "message": r.message, "history": r.history or "",
+            "at": r.at.strftime("%b %-d %-I:%M %p") if r.at else ""}
+           for r in rows]
+    db.close()
+    return out
 
 
 class FollowupBody(BaseModel):
@@ -3053,6 +4103,8 @@ ADMIN_HTML = """<!doctype html>
     <a data-p="customers">Customers</a>
     <a data-p="followups">To do</a>
     <a data-p="signins">Sign-ins</a>
+    <a data-p="orders">Orders</a>
+    <a data-p="sites">Websites</a>
     <a data-p="jobs">Site logins</a>
     <a data-p="texts">Texts</a>
   </nav>
@@ -3132,6 +4184,49 @@ ADMIN_HTML = """<!doctype html>
     <th>Result</th><th></th></tr></thead>
     <tbody id="obrows"><tr><td colspan="6" class="hint">Loading&hellip;</td></tr>
     </tbody></table>
+  </div>
+</section>
+
+<section class="page" id="p-orders">
+  <div class="card"><h2>Orders</h2>
+    <div class="hint">Every order a customer confirmed on the phone, and what
+      happened to it. Card numbers never appear here.</div>
+    <button class="sec" onclick="loadOrders()">Refresh</button>
+    <table><thead><tr><th>#</th><th>Who</th><th>Site</th><th>Item</th>
+    <th>Expected</th><th>Status</th><th>Confirmation</th><th>When</th>
+    <th></th></tr></thead>
+    <tbody id="orderrows"><tr><td colspan="9" class="hint">Loading&hellip;</td>
+    </tr></tbody></table>
+  </div>
+</section>
+
+<section class="page" id="p-sites">
+  <div class="card"><h2>What customers ask for, by site</h2>
+    <div class="hint">Last 30 days. "Learned" means it ran from saved steps
+      with no thinking; "fell back" means the saved steps broke and it
+      worked it out fresh. Nothing here needs you to do anything.</div>
+    <button class="sec" onclick="loadSites()">Refresh</button>
+    <table><thead><tr><th>Site</th><th>Requests</th><th>Worked</th>
+    <th>Learned</th><th>Fell back</th><th>Avg time</th>
+    <th>Most asked</th></tr></thead>
+    <tbody id="siterows"><tr><td colspan="7" class="hint">Loading&hellip;</td>
+    </tr></tbody></table>
+  </div>
+  <div class="card"><h2>What it has learned</h2>
+    <div class="hint">Steps it recorded after succeeding once. It retires a
+      recipe by itself after repeated failures and re-learns.</div>
+    <table><thead><tr><th>Site</th><th>Task</th><th>Example</th>
+    <th>Worked</th><th>Failed</th><th>Last ok</th><th></th></tr></thead>
+    <tbody id="reciperows"><tr><td colspan="7" class="hint">Loading&hellip;</td>
+    </tr></tbody></table>
+  </div>
+  <div class="card"><h2>Recent website activity</h2>
+    <div class="hint">Every request, including fallbacks and failures.</div>
+    <table><thead><tr><th>When</th><th>Site</th><th>Task</th>
+    <th>What they asked</th><th>How</th><th>Result</th><th>Time</th>
+    <th></th></tr></thead>
+    <tbody id="siteevents"><tr><td colspan="8" class="hint">Loading&hellip;</td>
+    </tr></tbody></table>
   </div>
 </section>
 
@@ -3352,6 +4447,104 @@ function showOb(id, btn){
   btn.textContent = open ? 'Steps' : 'Hide';
 }
 
+async function loadOrders(){
+  const tb = document.getElementById('orderrows');
+  try{
+    const d = await (await fetch('/orders?limit=50')).json();
+    if(!d.length){ tb.innerHTML='<tr><td colspan="9" class="hint">'+
+      'No orders yet.</td></tr>'; return; }
+    tb.innerHTML = d.map(function(o){
+      var cls = o.state==='placed'?'ok':(o.state==='failed'?'no':
+                (o.state==='cancelled'?'hint':'warn'));
+      return '<tr><td>'+o.order_id+'</td><td>'+esc(o.who)+'</td>'+
+        '<td><span class="tag">'+esc(o.site)+'</span></td>'+
+        '<td>'+o.quantity+' x '+esc(o.item)+'</td>'+
+        '<td>'+(o.expected_price?'$'+esc(o.expected_price):'')+'</td>'+
+        '<td class="'+cls+'">'+esc(o.state)+
+        (o.message?'<span class="'+(cls==='no'?'err':'hint')+'">'+
+          esc(o.message)+'</span>':'')+'</td>'+
+        '<td>'+esc(o.confirmation||'')+(o.final_total?'<br><span class="hint">$'+
+          esc(o.final_total)+'</span>':'')+'</td>'+
+        '<td>'+esc(o.at)+'</td>'+
+        '<td><button class="sec" onclick="showOrd('+o.order_id+',this)">'+
+        'Steps</button></td></tr>'+
+        '<tr class="det" id="od'+o.order_id+'" style="display:none">'+
+        '<td colspan="9"><pre>'+esc(o.history||'No steps.')+'</pre></td></tr>';
+    }).join('');
+  }catch(e){ tb.innerHTML='<tr><td colspan="9" class="no">'+esc(e.message)+
+    '</td></tr>'; }
+}
+function showOrd(id, btn){
+  const row = document.getElementById('od'+id);
+  const open = row.style.display === 'table-row';
+  row.style.display = open ? 'none' : 'table-row';
+  btn.textContent = open ? 'Steps' : 'Hide';
+}
+async function loadSites(){
+  const tb = document.getElementById('siterows');
+  const rb = document.getElementById('reciperows');
+  const eb = document.getElementById('siteevents');
+  try{
+    const d = await (await fetch('/sites/report?days=30')).json();
+    tb.innerHTML = d.sites.length ? d.sites.map(function(x){
+      var tasks = (x.tasks||[]).map(function(t){
+        return '<span class="tag">'+esc(t[0])+' '+t[1]+'</span>'; }).join('');
+      return '<tr><td><b>'+esc(x.site)+'</b></td><td>'+x.requests+'</td>'+
+        '<td class="ok">'+x.ok+'</td><td>'+x.via_recipe+'</td>'+
+        '<td class="'+(x.fallbacks?'warn':'')+'">'+x.fallbacks+'</td>'+
+        '<td>'+x.avg_seconds+'s</td><td>'+tasks+'</td></tr>'; }).join('')
+      : '<tr><td colspan="7" class="hint">No website requests yet.</td></tr>';
+    rb.innerHTML = d.recipes.length ? d.recipes.map(function(r){
+      var steps = (r.steps||[]).map(function(st, i){
+        var t = (i+1)+'. '+st.action;
+        if(st.desc) t += ' → '+st.desc;
+        if(st.url) t += ' → '+st.url;
+        if(st.text) t += ' ["'+st.text+'"]';
+        return t; }).join(String.fromCharCode(10));
+      return '<tr'+(r.retired?' style="opacity:.45"':'')+'>'+
+        '<td>'+esc(r.site)+'</td><td><span class="tag">'+esc(r.task)+
+        '</span>'+(r.retired?' <span class="no">retired</span>':'')+'</td>'+
+        '<td class="hint">'+esc(r.example)+'</td>'+
+        '<td class="ok">'+r.ok+'</td><td class="'+(r.failed?'no':'')+'">'+
+        r.failed+'</td><td>'+esc(r.last_ok)+'</td>'+
+        '<td><button class="sec" onclick="showRec('+r.id+',this)">Steps'+
+        '</button></td></tr>'+
+        '<tr class="det" id="rc'+r.id+'" style="display:none"><td colspan="7">'+
+        '<pre>'+esc(steps||'No steps.')+'</pre></td></tr>'; }).join('')
+      : '<tr><td colspan="7" class="hint">Nothing learned yet.</td></tr>';
+  }catch(e){ tb.innerHTML='<tr><td colspan="7" class="no">'+esc(e.message)+
+    '</td></tr>'; }
+  try{
+    const ev = await (await fetch('/sites/events?limit=40')).json();
+    eb.innerHTML = ev.length ? ev.map(function(x){
+      var how = x.path==='recipe' ? '<span class="ok">learned</span>'
+        : x.path==='fallback' ? '<span class="warn">fell back</span>'
+        : 'worked it out';
+      var res = x.outcome==='ok' ? '<span class="ok">ok</span>'
+        : '<span class="no">failed</span>';
+      return '<tr><td>'+esc(x.at)+'</td><td>'+esc(x.site)+'</td>'+
+        '<td><span class="tag">'+esc(x.task)+'</span></td>'+
+        '<td class="hint">'+esc(x.goal)+'</td><td>'+how+'</td>'+
+        '<td>'+res+'</td><td>'+x.seconds+'s</td>'+
+        '<td>'+(x.job_id?'<button class="sec" onclick="jumpJob('+x.job_id+
+        ')">Details</button>':'')+'</td></tr>'; }).join('')
+      : '<tr><td colspan="8" class="hint">Nothing yet.</td></tr>';
+  }catch(e){ eb.innerHTML='<tr><td colspan="8" class="no">'+esc(e.message)+
+    '</td></tr>'; }
+}
+function showRec(id, btn){
+  const row = document.getElementById('rc'+id);
+  const open = row.style.display === 'table-row';
+  row.style.display = open ? 'none' : 'table-row';
+  btn.textContent = open ? 'Steps' : 'Hide';
+}
+function jumpJob(id){
+  document.querySelector('nav a[data-p="jobs"]').click();
+  setTimeout(function(){
+    var row = document.getElementById('jb'+id);
+    if(row){ row.style.display='table-row'; row.scrollIntoView(); }
+  }, 300);
+}
 async function loadHealth(){
   try{
     const d = await (await fetch('/jobs/health')).json();
@@ -3375,7 +4568,8 @@ async function loadJobs(){
     tb.innerHTML = d.map(function(j){
       var cls = j.state==='done'?'ok':(j.state==='failed'?'no':'warn');
       return '<tr><td>'+j.job_id+'</td><td>'+esc(j.who)+'</td>'+
-        '<td><span class="tag">'+esc(j.site)+'</span></td>'+
+        '<td><span class="tag">'+esc(j.site)+'</span> '+
+        '<span class="hint">'+esc(j.kind)+'</span></td>'+
         '<td>'+esc(j.at)+'</td>'+
         '<td class="'+cls+'">'+esc(j.state)+
         (j.message?'<span class="'+(cls==='no'?'err':'hint')+'">'+
@@ -3438,9 +4632,10 @@ async function add(){
   else { m.textContent='Failed — that number may already exist.'; }
 }
 
-load(); loadCalls(); loadStats(); loadDlr(); loadOb(); loadFu(); loadJobs(); loadHealth();
+load(); loadCalls(); loadStats(); loadDlr(); loadOb(); loadFu(); loadJobs(); loadHealth(); loadSites(); loadOrders();
 setInterval(function(){ loadCalls(); loadStats(); loadDlr(); loadOb();
-                        loadFu(); loadJobs(); loadHealth(); }, 25000);
+                        loadFu(); loadJobs(); loadHealth(); loadSites();
+                        loadOrders(); }, 25000);
 </script></body></html>"""
 
 

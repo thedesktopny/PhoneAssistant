@@ -154,6 +154,7 @@ class Assistant(Agent):
         self.job_id = None
         self.pw_attempts = 0
         self.job_question = ""
+        self.order_id = None
         self.mailbox = ""
 
         today = datetime.now(ZoneInfo("America/New_York")).strftime(
@@ -253,6 +254,49 @@ slowly, same as before. Read it back, get a yes, then save_site_login.
   emailed them a code — ask for it and call submit_site_code.
 - Once a site is signed in, we stay signed in, so they won't be asked again
   every time.
+
+PLACING AN ORDER — do it exactly like a careful person would
+1. Find out what they want: the item, how many, and which site. If they're
+   vague, use search_site or do_on_website to find it and read them the
+   name and price. Get a yes on the exact item before going further.
+2. Address: call list_addresses. If they have one, read it back and ask
+   "ship it there?" If none, take it down — street, city, state, zip —
+   read it back, and save_address.
+3. Payment: call list_cards. If they have one, say "the Visa ending 1234?"
+   and get a yes. If none, ask if the site has a card saved already; if not,
+   take the card: number in groups of four, expiry, security code, name.
+   Read back ONLY the last four digits and expiry, never the full number,
+   then save_card. If the number is rejected, ask them to read it again.
+4. Call draft_order with everything. It tells you what it has.
+5. Read the whole thing back in one go: item, quantity, price, address,
+   card ending. Then ask exactly: "Should I place this order?" Wait.
+6. Only on a clear yes, call confirm_order. Tell them it takes a minute or
+   two and stay with them. Poll check_order every 15 seconds.
+   - needs_input: it's asking something only they can answer — a code, or
+     the total came out higher than expected. Ask them, then
+     answer_website_question.
+   - placed: read them the confirmation number and total, and say they'll
+     get the site's own email too.
+   - failed: say what happened and that nothing was charged unless it says
+     otherwise. Leave a note for the office.
+7. "Cancel that" at any point before it's placed -> cancel_order.
+Never read a full card number aloud. Never place anything without the
+explicit "yes" to "Should I place this order?"
+
+ANY WEBSITE AT ALL
+do_on_website works on sites we've never set up. Give it a plain-English
+goal and, if you know it, the site.
+- "Check my Verizon bill" -> do_on_website(goal="find the current balance
+  and due date", site="verizon")
+- "Is my prescription ready at CVS?" -> goal="check if the prescription is
+  ready for pickup", site="cvs"
+- "How much is a snow blower at Home Depot?" -> goal="find snow blowers and
+  their prices", site="homedepot"
+Then poll get_site_result. It takes 30 to 90 seconds — say what you're doing
+and stay with them. If it says needs_input, it's asking a question only they
+can answer, usually a code or a choice: ask them, then call
+answer_website_question.
+It never buys or pays anything. If a goal needs that, it stops and asks.
 
 USING A SIGNED-IN SITE
 - "What did I order from Walmart?" / "where's my order?" ->
@@ -501,6 +545,190 @@ FINDING EMAIL
                        "leave_note_for_office")
         return "Noted for the office. Tell them it's been passed on."
 
+    # ------------------------------------------------------ ordering
+    @function_tool
+    @auto_report("orders")
+    async def list_addresses(self, context: RunContext):
+        """The caller's saved shipping addresses."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        rows = await backend_get("/addresses", account_id=self.account_id)
+        if not rows:
+            return "No address saved. Take one down and save_address."
+        return "; ".join(f"[{r['id']}] {r['label']}: {r['address']}"
+                         + (" (main)" if r.get("default") else "")
+                         for r in rows)
+
+    @function_tool
+    @auto_report("orders")
+    async def save_address(self, context: RunContext, line1: str, city: str,
+                           state: str, zip: str, line2: str = "",
+                           label: str = "home"):
+        """Save a shipping address after reading it back and getting a yes."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        d = await backend_post("/addresses", {
+            "account_id": self.account_id, "label": label, "line1": line1,
+            "line2": line2, "city": city, "state": state, "zip": zip})
+        return f"Saved: {d.get('address')} (id {d.get('id')})."
+
+    @function_tool
+    @auto_report("orders")
+    async def list_cards(self, context: RunContext):
+        """The caller's saved cards — brand and last four only."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        rows = await backend_get("/cards", account_id=self.account_id)
+        if not rows:
+            return ("No card saved. Ask whether the site already has one, "
+                    "or take one down and save_card.")
+        return "; ".join(f"[{r['id']}] {r['brand']} ending {r['last4']}, "
+                         f"expires {r['exp']}"
+                         + (" (main)" if r.get("default") else "")
+                         for r in rows)
+
+    @function_tool
+    @auto_report("orders")
+    async def save_card(self, context: RunContext, number: str, exp: str,
+                        cvv: str = "", name_on_card: str = ""):
+        """Save a payment card. exp is MM/YY. Read back only the last four
+        digits and expiry — never the full number."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            d = await backend_post("/cards", {
+                "account_id": self.account_id, "number": number,
+                "exp": exp, "cvv": cvv, "name_on_card": name_on_card})
+        except Exception as e:
+            if "check out" in str(e):
+                return ("That number doesn't check out. Ask them to read "
+                        "it again in groups of four.")
+            raise
+        return (f"Saved a {d.get('brand')} ending {d.get('last4')}. "
+                f"Never say the full number again.")
+
+    @function_tool
+    @auto_report("orders")
+    async def draft_order(self, context: RunContext, site: str, item: str,
+                          quantity: int = 1, expected_price: str = "",
+                          address_id: int = 0, card_id: int = 0):
+        """Put the order together. Nothing is placed yet."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        d = await backend_post("/orders/draft", {
+            "account_id": self.account_id, "site": site, "item": item,
+            "quantity": quantity, "expected_price": expected_price,
+            "address_id": address_id or None, "card_id": card_id or None,
+            "call_id": self.call_id})
+        self.order_id = d.get("order_id")
+        return (f"Order {d.get('order_id')} drafted: {d.get('quantity')} x "
+                f"{d.get('item')} from {d.get('site')}"
+                f"{', about $' + d['expected_price'] if d.get('expected_price') else ''}"
+                f". Ship to {d.get('address') or 'the site\'s saved address'}. "
+                f"Pay with {d.get('card') or 'the site\'s saved card'}. "
+                f"Read all of that back and ask: Should I place this order?")
+
+    @function_tool
+    @auto_report("orders")
+    async def confirm_order(self, context: RunContext, caller_said: str):
+        """Place the order. ONLY after the caller clearly said yes to
+        'Should I place this order?' Pass what they said."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        if not getattr(self, "order_id", None):
+            return "No order drafted."
+        said = caller_said.strip().lower()
+        if not any(w in said for w in ("yes", "yeah", "place it", "go ahead",
+                                       "confirm", "do it", "sure")):
+            return "That wasn't a clear yes. Do not place it. Ask again."
+        try:
+            async with httpx.AsyncClient(timeout=25) as c:
+                r = await c.post(f"{BACKEND}/orders/confirm", headers=AUTH,
+                                 params={"order_id": self.order_id,
+                                         "confirmed": "yes"})
+                d = r.json()
+        except Exception as e:
+            log.error(f"confirm failed: {e}")
+            return "Couldn't start the checkout."
+        self.job_id = d.get("job_id")
+        await log_turn(self.call_id, "tool", f"order {self.order_id} placing",
+                       "confirm_order")
+        return ("Placing it now. Tell them it takes a minute or two, stay "
+                "with them, and call check_order.")
+
+    @function_tool
+    @auto_report("orders")
+    async def check_order(self, context: RunContext):
+        """How the order is going. Call every 15 seconds until placed."""
+        if not getattr(self, "order_id", None):
+            return "No order in progress."
+        d = await backend_get("/orders/status", order_id=self.order_id)
+        st, msg = d.get("state", ""), d.get("message", "")
+        if st == "placed":
+            conf = d.get("confirmation") or "not shown"
+            total = d.get("final_total") or "not shown"
+            return f"PLACED. Confirmation {conf}, total {total}. Tell them."
+        if st == "failed":
+            return f"It didn't go through: {msg}. Nothing should be charged."
+        if st == "cancelled":
+            return "That order was cancelled."
+        if "Needs the customer" in msg:
+            return (msg + " Ask them, then call answer_website_question.")
+        return f"Still working: {msg}. Check again shortly."
+
+    @function_tool
+    @auto_report("orders")
+    async def cancel_order(self, context: RunContext):
+        """Cancel the current order before it's placed."""
+        if not getattr(self, "order_id", None):
+            return "No order to cancel."
+        async with httpx.AsyncClient(timeout=20) as c:
+            await c.post(f"{BACKEND}/orders/cancel", headers=AUTH,
+                         params={"order_id": self.order_id})
+        oid = self.order_id
+        self.order_id = None
+        return f"Order {oid} cancelled. Nothing was placed."
+
+    @function_tool
+    @auto_report("browse")
+    async def do_on_website(self, context: RunContext, goal: str,
+                            site: str = "", url: str = ""):
+        """Do something on any website, described in plain English. Works on
+        sites we've never configured. It reads pages and decides its own
+        steps. It will never buy or pay for anything."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            async with httpx.AsyncClient(timeout=25) as c:
+                r = await c.post(f"{BACKEND}/jobs/browse", headers=AUTH,
+                                 params={"account_id": self.account_id,
+                                         "goal": goal, "site": site,
+                                         "url": url,
+                                         "call_id": self.call_id or 0})
+                d = r.json()
+        except Exception as e:
+            log.error(f"browse failed: {e}")
+            return "Couldn't start that."
+        self.job_id = d.get("job_id")
+        self.job_question = goal
+        return ("On it. Tell them it takes up to a minute and stay with "
+                "them, then call get_site_result.")
+
+    @function_tool
+    @auto_report("browse")
+    async def answer_website_question(self, context: RunContext, answer: str):
+        """Pass the caller's answer back to a browsing job that asked for
+        something — a code, a choice, a size."""
+        if not getattr(self, "job_id", None):
+            return "Nothing is waiting on an answer."
+        try:
+            await backend_post("/jobs/code",
+                               {"job_id": self.job_id, "code": answer})
+        except Exception as e:
+            log.error(f"answer failed: {e}")
+            return "That didn't go through."
+        return "Passed it on. Check again in a few seconds."
+
     @function_tool
     @auto_report("site_read")
     async def check_site_orders(self, context: RunContext, site: str):
@@ -558,6 +786,11 @@ FINDING EMAIL
             return d.get("answer") or "Nothing came back."
         if d.get("state") == "failed":
             return f"It didn't work: {d.get('message', '')}"
+        if d.get("state") == "needs_input":
+            return (d.get("message", "") +
+                    " Ask them, then call answer_website_question.")
+        if d.get("state") == "working":
+            return f"Still going: {d.get('message', '')}. Check again shortly."
         if d.get("state") == "waiting":
             return "Queued behind another job. A moment longer."
         return "Still loading the page. Check again shortly."
