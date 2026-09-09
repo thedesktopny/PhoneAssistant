@@ -67,6 +67,24 @@ async def log_turn(call_id, who, text="", tool="", latency_ms=0):
         log.warning(f"log_turn failed: {e}")
 
 
+async def report_problem(account_id, call_id, reason, note, tool=""):
+    """Record a failure for staff. Called automatically, not by the model."""
+    try:
+        await backend_post("/followups", {
+            "account_id": account_id,
+            "call_id": call_id,
+            "reason": reason[:60],
+            "note": note[:2000],
+            "channel": "voice",
+        })
+    except Exception as e:
+        log.warning(f"could not report problem: {e}")
+    try:
+        await log_turn(call_id, "problem", note[:500], tool)
+    except Exception:
+        pass
+
+
 async def find_account(caller_number: str):
     """Match the caller's phone number to an account."""
     accounts = await backend_get("/accounts")
@@ -79,6 +97,36 @@ async def find_account(caller_number: str):
 
 
 # ------------------------------------------------------------------ agent
+
+def auto_report(reason: str):
+    """Decorator: log any tool failure for staff, without being asked."""
+    def wrap(fn):
+        async def inner(self, context, *args, **kwargs):
+            try:
+                result = await fn(self, context, *args, **kwargs)
+            except Exception as e:
+                await report_problem(
+                    getattr(self, "account_id", None),
+                    getattr(self, "call_id", None),
+                    reason, f"{fn.__name__} crashed: {e}", fn.__name__)
+                return ("Something went wrong there. Tell them you've left "
+                        "a note for the office.")
+            text = str(result).lower()
+            bad = ("didn't go", "did not go", "couldn't", "could not",
+                   "failed", "didn't work", "didn't save", "error",
+                   "no address found", "nothing matched", "isn't configured")
+            if any(b in text for b in bad):
+                await report_problem(
+                    getattr(self, "account_id", None),
+                    getattr(self, "call_id", None),
+                    reason, f"{fn.__name__}: {result}", fn.__name__)
+            return result
+        inner.__name__ = fn.__name__
+        inner.__doc__ = fn.__doc__
+        inner.__annotations__ = getattr(fn, "__annotations__", {})
+        return inner
+    return wrap
+
 
 class Assistant(Agent):
     def __init__(self, account: dict, caller_number: str = "",
@@ -127,6 +175,18 @@ Speak English. Start every call in English and stay in English unless the
 caller clearly speaks to you in another language first — then answer in
 theirs and keep to it for the rest of the call. Never switch languages on
 your own, and never switch back mid-call unless they do.
+
+NEVER PROMISE WHAT YOU CAN'T DO
+Only say you have done something after the tool has actually done it. If you
+have no tool for what they want, say plainly that you can't do it yourself
+and offer to leave a note for the office — then actually call
+leave_note_for_office. Never say "I'll make sure that's logged" or "someone
+will look into it" without calling that tool first.
+
+Failures are recorded for the office automatically, so you don't have to
+remember. Still use leave_note_for_office when a caller asks you to pass
+something on, complains, or wants something you have no tool for — and say
+you've done it only after the tool returns.
 
 HOW YOU TALK
 - You are on a phone call. Keep every reply to one or two short sentences.
@@ -271,6 +331,7 @@ FINDING EMAIL
         return "PIN incorrect."
 
     @function_tool
+    @auto_report("email")
     async def check_email(self, context: RunContext, how_many: int = 5,
                           mailbox: str = ""):
         """Get the caller's unread emails. Set mailbox to their name for it
@@ -295,6 +356,7 @@ FINDING EMAIL
         return "\n".join(lines)
 
     @function_tool
+    @auto_report("email")
     async def read_email(self, context: RunContext, which: int):
         """Read the full text of one email, by its number in the last list."""
         if not self.verified:
@@ -315,6 +377,7 @@ FINDING EMAIL
         return f"From {data.get('from')}. Subject {data.get('subject')}. {body}"
 
     @function_tool
+    @auto_report("email")
     async def search_email(self, context: RunContext, query: str,
                            how_many: int = 5, mailbox: str = ""):
         """Search the whole mailbox using Gmail search syntax. Use this for
@@ -345,6 +408,7 @@ FINDING EMAIL
         return "\n".join(lines)
 
     @function_tool
+    @auto_report("email")
     async def find_contact(self, context: RunContext, name: str):
         """Look up someone's email address from past correspondence."""
         if not self.verified:
@@ -362,6 +426,29 @@ FINDING EMAIL
                          for m in matches)
 
     @function_tool
+    async def leave_note_for_office(self, context: RunContext, note: str,
+                                    reason: str = "general"):
+        """Record something for staff to follow up on: a failure, a request
+        you can't handle, or anything the caller asks to be passed on.
+        Reason is a short label like signin_failed, complaint, request."""
+        try:
+            await backend_post("/followups", {
+                "account_id": self.account_id,
+                "call_id": self.call_id,
+                "reason": reason[:60],
+                "note": note,
+                "channel": "voice",
+            })
+        except Exception as e:
+            log.error(f"followup failed: {e}")
+            return ("It didn't save. Tell them honestly that you couldn't "
+                    "log it and to call the office directly.")
+        await log_turn(self.call_id, "tool", f"note: {reason}",
+                       "leave_note_for_office")
+        return "Noted for the office. Tell them it's been passed on."
+
+    @function_tool
+    @auto_report("account")
     async def disconnect_email(self, context: RunContext, mailbox: str = ""):
         """Remove one connected mailbox and revoke access at Google."""
         if not self.verified:
@@ -413,6 +500,7 @@ FINDING EMAIL
         return "Nothing was deleted."
 
     @function_tool
+    @auto_report("account")
     async def list_mailboxes(self, context: RunContext):
         """Which email addresses this caller has connected, most-used first."""
         if not self.verified:
@@ -439,6 +527,7 @@ FINDING EMAIL
                 ". Ask which one if it isn't obvious.")
 
     @function_tool
+    @auto_report("account")
     async def name_mailbox(self, context: RunContext, mailbox: str,
                            name: str = "", make_main: bool = False):
         """Give a mailbox a short name the caller can say, and/or make it
@@ -484,6 +573,7 @@ FINDING EMAIL
         return f"Using {self.mailbox} from now on."
 
     @function_tool
+    @auto_report("signin")
     async def connect_email(self, context: RunContext, email: str,
                             password: str):
         """Connect the caller's Gmail using the address and password they
@@ -507,6 +597,7 @@ FINDING EMAIL
                 "call check_connect.")
 
     @function_tool
+    @auto_report("signin")
     async def check_connect(self, context: RunContext):
         """How the email sign-in is going. Call every 15 seconds or so."""
         if not getattr(self, "onboard_sid", None):
@@ -527,11 +618,24 @@ FINDING EMAIL
         if state == "done":
             return f"Connected. {msg}"
         if state == "failed":
-            return (f"It didn't work: {msg}. Apologise, say someone will "
-                    f"call them back, and move on.")
+            try:
+                await backend_post("/followups", {
+                    "account_id": self.account_id,
+                    "call_id": self.call_id,
+                    "reason": "signin_failed",
+                    "note": f"Email sign-in failed for "
+                            f"{d.get('email', '')}: {msg}",
+                    "channel": "voice",
+                })
+            except Exception:
+                pass
+            return (f"It didn't work: {msg}. Apologise, tell them you've "
+                    f"left a note for the office and someone will call "
+                    f"them back, then move on.")
         return f"Still working ({state}). Keep them company and check again."
 
     @function_tool
+    @auto_report("signin")
     async def try_another_way(self, context: RunContext):
         """If the caller can't tap the notification on their phone, ask
         Google to text them a code instead."""
@@ -548,6 +652,7 @@ FINDING EMAIL
                 "then check_connect again.")
 
     @function_tool
+    @auto_report("signin")
     async def submit_code(self, context: RunContext, code: str):
         """Give Google the verification code the caller just read out."""
         if not getattr(self, "onboard_sid", None):
@@ -563,6 +668,7 @@ FINDING EMAIL
         return "Code sent. Wait a few seconds and call check_connect."
 
     @function_tool
+    @auto_report("sms")
     async def send_text(self, context: RunContext, message: str,
                         to: str = ""):
         """Text the caller something — an address, a number, a link. Leave
@@ -581,6 +687,7 @@ FINDING EMAIL
         return "Text sent." if data.get("sent") else "The text didn't go out."
 
     @function_tool
+    @auto_report("sms")
     async def text_setup_link(self, context: RunContext):
         """Text the caller the link to connect their email account."""
         try:
@@ -598,6 +705,7 @@ FINDING EMAIL
         return "The link didn't go out."
 
     @function_tool
+    @auto_report("search")
     async def web_search(self, context: RunContext, query: str,
                          near: str = ""):
         """Search the web for anything not in their email or calendar —
@@ -618,6 +726,7 @@ FINDING EMAIL
         return (ans + " " + extra)[:1200]
 
     @function_tool
+    @auto_report("calendar")
     async def check_calendar(self, context: RunContext, days: int = 1):
         """What's on the caller's calendar. days=1 is today, 7 is the week."""
         if not self.verified:
@@ -647,6 +756,7 @@ FINDING EMAIL
         return "\n".join(lines)
 
     @function_tool
+    @auto_report("calendar")
     async def find_free_time(self, context: RunContext, date: str,
                              minutes: int = 60):
         """Open slots on a date. date must be YYYY-MM-DD."""
@@ -665,6 +775,7 @@ FINDING EMAIL
         return f"{data.get('date')} is open at: " + ", ".join(free)
 
     @function_tool
+    @auto_report("calendar")
     async def create_event(self, context: RunContext, title: str,
                            start_iso: str, minutes: int = 60,
                            location: str = ""):
@@ -686,6 +797,7 @@ FINDING EMAIL
         return "Added to the calendar."
 
     @function_tool
+    @auto_report("email")
     async def send_email(self, context: RunContext,
                          to: str, subject: str, body: str):
         """Send an email. Only call AFTER you have read the draft back out loud

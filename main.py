@@ -164,6 +164,19 @@ class Onboard(Base):
     at = Column(DateTime, default=datetime.utcnow)
 
 
+class Followup(Base):
+    """Something a caller asked to be looked at, or that the agent couldn't do."""
+    __tablename__ = "followups"
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"), nullable=True)
+    call_id = Column(Integer, nullable=True)
+    at = Column(DateTime, default=datetime.utcnow)
+    reason = Column(String(60), default="")
+    note = Column(Text, default="")
+    channel = Column(String(10), default="voice")
+    done = Column(Integer, default=0)
+
+
 Base.metadata.create_all(engine)
 
 
@@ -1183,6 +1196,13 @@ TEXT_TOOLS = [
             "minutes": {"type": "integer"}},
             "required": ["title", "start_iso"]}}},
     {"type": "function", "function": {
+        "name": "leave_note_for_office",
+        "description": ("Record something for staff: a failure, a request "
+                        "you can't handle, or anything to pass on."),
+        "parameters": {"type": "object", "properties": {
+            "note": {"type": "string"}, "reason": {"type": "string"}},
+            "required": ["note"]}}},
+    {"type": "function", "function": {
         "name": "disconnect_email",
         "description": "Remove one connected mailbox and revoke it at Google.",
         "parameters": {"type": "object", "properties": {
@@ -1246,6 +1266,10 @@ talk to you about this." Nothing more. Never explain the rules.
 If someone is in danger or a medical emergency, help them reach emergency
 services — that comes first.
 
+Only say you've done something after the tool actually did it. If you can't
+do what they ask, say so and use leave_note_for_office, then tell them it's
+been passed on. Never promise a follow-up you haven't recorded.
+
 Before sending an email or booking anything, state what you're about to do
 and wait for a yes.
 
@@ -1281,6 +1305,14 @@ def _run_text_tool(account_id: int, name: str, args: dict):
             return tool_create_event(account_id, args["title"],
                                      args["start_iso"],
                                      args.get("minutes", 60))
+        if name == "leave_note_for_office":
+            db = Session()
+            db.add(Followup(account_id=account_id,
+                            reason=(args.get("reason") or "general")[:60],
+                            note=args.get("note", "")[:2000], channel="sms"))
+            db.commit()
+            db.close()
+            return {"ok": True}
         if name == "disconnect_email":
             return disconnect_mailbox(account_id, args.get("mailbox", ""))
         if name == "delete_my_account":
@@ -1393,6 +1425,13 @@ def text_brain(account_id: int, incoming: str) -> str:
             except Exception:
                 args = {}
             result = _run_text_tool(account_id, fn, args)
+            if isinstance(result, dict) and result.get("error"):
+                db = Session()
+                db.add(Followup(account_id=account_id, reason=fn[:60],
+                                note=f"{fn} failed: {result['error']}"[:2000],
+                                channel="sms"))
+                db.commit()
+                db.close()
             msgs.append({"role": "tool", "tool_call_id": c["id"],
                          "content": json.dumps(result)[:3000]})
 
@@ -1931,6 +1970,64 @@ def call_detail(call_id: int, request: Request):
     return out
 
 
+class FollowupBody(BaseModel):
+    account_id: int | None = None
+    call_id: int | None = None
+    reason: str = ""
+    note: str = ""
+    channel: str = "voice"
+
+
+@app.post("/followups")
+def followup_add(b: FollowupBody, request: Request):
+    require_auth(request)
+    db = Session()
+    row = Followup(account_id=b.account_id, call_id=b.call_id,
+                   reason=b.reason[:60], note=b.note[:2000],
+                   channel=b.channel)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    out = {"id": row.id}
+    db.close()
+    return out
+
+
+@app.get("/followups")
+def followups_list(request: Request, include_done: int = 0,
+                   limit: int = 50):
+    require_auth(request)
+    db = Session()
+    q = db.query(Followup)
+    if not include_done:
+        q = q.filter(Followup.done == 0)
+    rows = q.order_by(Followup.id.desc()).limit(limit).all()
+    names = {a.id: a.name for a in db.query(Account).all()}
+    phones = {}
+    for p in db.query(PhoneNumber).all():
+        phones.setdefault(p.account_id, p.number)
+    out = [{"id": r.id, "who": names.get(r.account_id) or "unknown",
+            "phone": phones.get(r.account_id, ""),
+            "call_id": r.call_id, "reason": r.reason, "note": r.note,
+            "channel": r.channel, "done": bool(r.done),
+            "at": r.at.strftime("%b %-d %-I:%M %p") if r.at else ""}
+           for r in rows]
+    db.close()
+    return out
+
+
+@app.post("/followups/done")
+def followup_done(request: Request, followup_id: int, undo: int = 0):
+    require_auth(request)
+    db = Session()
+    row = db.query(Followup).filter_by(id=followup_id).first()
+    if row:
+        row.done = 0 if undo else 1
+        db.commit()
+    db.close()
+    return {"ok": True}
+
+
 class SmsBody(BaseModel):
     to: str
     message: str
@@ -2088,6 +2185,7 @@ ADMIN_HTML = """<!doctype html>
     <a data-p="overview" class="on">Overview</a>
     <a data-p="calls">Calls</a>
     <a data-p="customers">Customers</a>
+    <a data-p="followups">To do</a>
     <a data-p="signins">Sign-ins</a>
     <a data-p="texts">Texts</a>
   </nav>
@@ -2143,6 +2241,19 @@ ADMIN_HTML = """<!doctype html>
     <label>PIN</label><input id="k" value="1234">
     <button onclick="add()">Create</button>
     <div class="msg" id="msg"></div>
+  </div>
+</section>
+
+<section class="page" id="p-followups">
+  <div class="card"><h2>Needs attention</h2>
+    <div class="hint">Anything the assistant couldn't finish, or that a
+      caller asked to be passed on.</div>
+    <button class="sec" onclick="loadFu()">Refresh</button>
+    <button class="sec" onclick="fuAll=!fuAll;loadFu()">Show/hide done</button>
+    <table><thead><tr><th>When</th><th>Who</th><th>Why</th><th>Note</th>
+    <th>Call</th><th></th></tr></thead>
+    <tbody id="furows"><tr><td colspan="6" class="hint">Loading&hellip;</td></tr>
+    </tbody></table>
   </div>
 </section>
 
@@ -2302,6 +2413,34 @@ async function load(){
     tb.innerHTML='<tr><td colspan="5" class="no">'+esc(e.message)+'</td></tr>'; }
 }
 
+var fuAll = false;
+async function loadFu(){
+  const tb = document.getElementById('furows');
+  try{
+    const d = await (await fetch('/followups?include_done='+
+      (fuAll?1:0))).json();
+    if(!d.length){
+      tb.innerHTML='<tr><td colspan="6" class="hint">Nothing outstanding.'+
+        '</td></tr>'; return; }
+    tb.innerHTML = d.map(function(f){
+      return '<tr'+(f.done?' style="opacity:.45"':'')+'>'+
+        '<td>'+esc(f.at)+'</td>'+
+        '<td>'+esc(f.who)+'<br><span class="hint">'+esc(f.phone)+'</span></td>'+
+        '<td><span class="tag">'+esc(f.reason)+'</span><br>'+
+        '<span class="hint">'+esc(f.channel)+'</span></td>'+
+        '<td>'+esc(f.note)+'</td>'+
+        '<td>'+(f.call_id?('#'+f.call_id):'&mdash;')+'</td>'+
+        '<td><button class="sec" onclick="fuDone('+f.id+','+
+        (f.done?1:0)+')">'+(f.done?'Reopen':'Done')+'</button></td></tr>';
+    }).join('');
+  }catch(e){
+    tb.innerHTML='<tr><td colspan="6" class="no">'+esc(e.message)+'</td></tr>'; }
+}
+async function fuDone(id, isDone){
+  await fetch('/followups/done?followup_id='+id+'&undo='+(isDone?1:0),
+              {method:'POST'});
+  loadFu();
+}
 async function loadOb(){
   const tb = document.getElementById('obrows');
   try{
@@ -2375,9 +2514,9 @@ async function add(){
   else { m.textContent='Failed — that number may already exist.'; }
 }
 
-load(); loadCalls(); loadStats(); loadDlr(); loadOb();
-setInterval(function(){ loadCalls(); loadStats(); loadDlr(); loadOb(); },
-            25000);
+load(); loadCalls(); loadStats(); loadDlr(); loadOb(); loadFu();
+setInterval(function(){ loadCalls(); loadStats(); loadDlr(); loadOb();
+                        loadFu(); }, 25000);
 </script></body></html>"""
 
 
