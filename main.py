@@ -2608,6 +2608,34 @@ def vault_status(request: Request):
             "mailbox_tokens": counts, "site_logins": login_counts}
 
 
+@app.get("/vault/test")
+def vault_test(request: Request):
+    """Try a real encrypt/decrypt and report exactly what fails."""
+    require_auth(request)
+    out = {
+        "azure_key_id_set": bool(AZURE_KEY_ID),
+        "azure_tenant_set": bool(os.environ.get("AZURE_TENANT_ID")),
+        "azure_client_set": bool(os.environ.get("AZURE_CLIENT_ID")),
+        "azure_secret_set": bool(os.environ.get("AZURE_CLIENT_SECRET")),
+        "kms_key_set": bool(KMS_KEY_ID),
+    }
+    if AZURE_KEY_ID:
+        kid = AZURE_KEY_ID.rstrip("/")
+        parts = kid.split("/keys/")
+        out["key_id_has_version"] = (len(parts) == 2
+                                     and parts[1].count("/") == 1)
+    try:
+        blob = vault_put({"probe": "ok"})
+        out["encrypt"] = "ok"
+        out["format"] = blob.split(":", 1)[0] if ":" in blob else "local"
+        out["decrypt"] = ("ok" if vault_get(blob).get("probe") == "ok"
+                          else "mismatch")
+    except Exception as e:
+        out["encrypt"] = "failed"
+        out["error"] = str(e)[:800]
+    return out
+
+
 @app.post("/vault/migrate")
 def vault_migrate(request: Request, confirm: str = ""):
     """Re-encrypt every stored secret with the key that's active now."""
@@ -2631,7 +2659,7 @@ def vault_migrate(request: Request, confirm: str = ""):
                 moved += 1
             except Exception as e:
                 failed.append(f"{model.__tablename__}#{row.id}: "
-                              f"{str(e)[:80]}")
+                              f"{str(e)[:600]}")
     db.commit()
     db.close()
     return {"re_encrypted": moved, "failed": failed}
