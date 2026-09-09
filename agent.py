@@ -152,6 +152,7 @@ class Assistant(Agent):
         self.last_events = []
         self.onboard_sid = None
         self.job_id = None
+        self.pw_attempts = 0
         self.mailbox = ""
 
         today = datetime.now(ZoneInfo("America/New_York")).strftime(
@@ -285,9 +286,18 @@ If check_email says their account has no email linked, offer to connect it
 on this call. Then:
 1. Ask for their email address. Have them spell the part before the @.
    Read it back and get a yes.
-2. Ask for their password. Tell them to say it slowly, one character at a
-   time, and to say "capital" before any capital letter. Read the whole
-   thing back character by character and get a yes before continuing.
+2. Ask for their password. This is the part that goes wrong most, so be
+   careful:
+   - Tell them to say it one character at a time, saying "capital" before a
+     capital letter, and naming symbols out loud ("exclamation mark", "at
+     sign", "hyphen").
+   - Read the whole thing back character by character, saying "capital"
+     where it applies, and get a clear yes before you use it.
+   - If any character is unclear, ask about that one character again rather
+     than the whole password.
+   - If they'd rather not say it out loud, offer to text them a link where
+     they can type it: send_password_link. That's often easier and always
+     more accurate.
 3. Call connect_email. It takes up to a minute — tell them you're working
    on it and stay on the line.
 4. Call check_connect every 15 seconds or so. Google will ask them to prove
@@ -307,8 +317,13 @@ on this call. Then:
    you misheard.
 5. When it says done, tell them their email is connected and offer to read
    their new messages.
-6. If it fails, apologise, say you'll have someone call them back, and move
-   on. Do not ask for the password again.
+6. If Google says the password is wrong, you may try TWICE more, no more:
+   ask them to say it again slowly, read it back, and call connect_email
+   again. Say plainly that you may have misheard rather than blaming them.
+   After a third wrong attempt, stop — Google can lock the account. Say
+   you'll have someone call them back, and move on.
+7. Any other failure: apologise once, say you've left a note for the office,
+   and move on. Do not ask for the password again.
 Never repeat their password back to anyone else, never say it after the
 sign-in is finished, and never put it in a text message.
 
@@ -713,6 +728,28 @@ FINDING EMAIL
 
     @function_tool
     @auto_report("signin")
+    async def send_password_link(self, context: RunContext):
+        """Text the caller a link where they can type their Google password
+        instead of saying it out loud. Use when they'd rather not speak it,
+        or after a mis-heard attempt."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            async with httpx.AsyncClient(timeout=20) as c:
+                r = await c.post(f"{BACKEND}/sms/link", headers=AUTH,
+                                 params={"account_id": self.account_id,
+                                         "to": self.caller_number or ""})
+                d = r.json()
+        except Exception as e:
+            log.error(f"password link failed: {e}")
+            return "Couldn't send that."
+        if d.get("sent"):
+            return ("Sent them a link. Tell them to tap it, sign in there, "
+                    "and call back when done.")
+        return "The text didn't go out. Carry on by voice instead."
+
+    @function_tool
+    @auto_report("signin")
     async def connect_email(self, context: RunContext, email: str,
                             password: str):
         """Connect the caller's Gmail using the address and password they
@@ -768,6 +805,17 @@ FINDING EMAIL
                 })
             except Exception:
                 pass
+            low = (msg or "").lower()
+            if "password is wrong" in low:
+                self.pw_attempts = getattr(self, "pw_attempts", 0) + 1
+                if self.pw_attempts < 3:
+                    return (f"Google didn't accept that password. Say you "
+                            f"may have misheard, ask them to say it again "
+                            f"one character at a time, read it back, then "
+                            f"call connect_email again. "
+                            f"(Attempt {self.pw_attempts} of 3.)")
+                return ("Three wrong passwords. Stop trying — Google can "
+                        "lock the account. Tell them someone will call back.")
             return (f"It didn't work: {msg}. Apologise, tell them you've "
                     f"left a note for the office and someone will call "
                     f"them back, then move on.")
