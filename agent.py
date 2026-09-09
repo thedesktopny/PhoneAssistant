@@ -12,6 +12,8 @@ Env vars needed:
 
 import os
 import asyncio
+import functools
+import inspect
 import logging
 import httpx
 from datetime import datetime
@@ -99,11 +101,17 @@ async def find_account(caller_number: str):
 # ------------------------------------------------------------------ agent
 
 def auto_report(reason: str):
-    """Decorator: log any tool failure for staff, without being asked."""
+    """Log any tool failure for staff, without the model being asked to.
+
+    The wrapper must keep the wrapped function's exact signature — LiveKit
+    reads it to build the tool schema for the model.
+    """
     def wrap(fn):
-        async def inner(self, context, *args, **kwargs):
+        @functools.wraps(fn)
+        async def inner(*args, **kwargs):
+            self = args[0] if args else None
             try:
-                result = await fn(self, context, *args, **kwargs)
+                result = await fn(*args, **kwargs)
             except Exception as e:
                 await report_problem(
                     getattr(self, "account_id", None),
@@ -121,9 +129,7 @@ def auto_report(reason: str):
                     getattr(self, "call_id", None),
                     reason, f"{fn.__name__}: {result}", fn.__name__)
             return result
-        inner.__name__ = fn.__name__
-        inner.__doc__ = fn.__doc__
-        inner.__annotations__ = getattr(fn, "__annotations__", {})
+        inner.__signature__ = inspect.signature(fn)
         return inner
     return wrap
 
