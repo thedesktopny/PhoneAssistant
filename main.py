@@ -2587,6 +2587,56 @@ def jobs_list(request: Request, limit: int = 30):
     return out
 
 
+@app.get("/vault/status")
+def vault_status(request: Request):
+    """Which key protects what."""
+    require_auth(request)
+    db = Session()
+    counts = {"azure": 0, "aws": 0, "local": 0}
+    for row in db.query(Connection).all():
+        b = row.secret_blob or ""
+        counts["azure" if b.startswith("akv:") else
+               "aws" if b.startswith("kms:") else "local"] += 1
+    login_counts = {"azure": 0, "aws": 0, "local": 0}
+    for row in db.query(SiteLogin).all():
+        b = row.secret_blob or ""
+        login_counts["azure" if b.startswith("akv:") else
+                     "aws" if b.startswith("kms:") else "local"] += 1
+    db.close()
+    return {"active_key": ("azure" if AZURE_KEY_ID else
+                           "aws" if KMS_KEY_ID else "local"),
+            "mailbox_tokens": counts, "site_logins": login_counts}
+
+
+@app.post("/vault/migrate")
+def vault_migrate(request: Request, confirm: str = ""):
+    """Re-encrypt every stored secret with the key that's active now."""
+    require_auth(request)
+    if confirm != "MIGRATE":
+        raise HTTPException(400, "Pass confirm=MIGRATE.")
+    if not (AZURE_KEY_ID or KMS_KEY_ID):
+        raise HTTPException(400, "No cloud key is configured.")
+
+    moved, failed = 0, []
+    db = Session()
+    for model in (Connection, SiteLogin):
+        for row in db.query(model).all():
+            blob = row.secret_blob or ""
+            if AZURE_KEY_ID and blob.startswith("akv:"):
+                continue
+            if KMS_KEY_ID and not AZURE_KEY_ID and blob.startswith("kms:"):
+                continue
+            try:
+                row.secret_blob = vault_put(vault_get(blob))
+                moved += 1
+            except Exception as e:
+                failed.append(f"{model.__tablename__}#{row.id}: "
+                              f"{str(e)[:80]}")
+    db.commit()
+    db.close()
+    return {"re_encrypted": moved, "failed": failed}
+
+
 class FollowupBody(BaseModel):
     account_id: int | None = None
     call_id: int | None = None
