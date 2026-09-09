@@ -52,6 +52,9 @@ TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 # without it, falls back to the local Fernet key.
 KMS_KEY_ID = os.environ.get("KMS_KEY_ID", "")
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+# Azure alternative: full key id, e.g.
+# https://myvault.vault.azure.net/keys/phone-assistant/<version>
+AZURE_KEY_ID = os.environ.get("AZURE_KEY_ID", "")
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
 
 # SMS — set SMS_PROVIDER to "twilio" or "bulkvs"
@@ -266,6 +269,7 @@ _ensure_columns()
 # Everything else in the app stays the same.
 
 _kms = None
+_akv = None
 
 
 def _kms_client():
@@ -276,10 +280,34 @@ def _kms_client():
     return _kms
 
 
+def _azure_client():
+    """Azure Key Vault, using the app's client id/secret from the env."""
+    global _akv
+    if _akv is None and AZURE_KEY_ID:
+        from azure.identity import DefaultAzureCredential
+        from azure.keyvault.keys.crypto import CryptographyClient
+        _akv = CryptographyClient(AZURE_KEY_ID, DefaultAzureCredential())
+    return _akv
+
+
 def vault_put(data: dict) -> str:
-    """Encrypt. With KMS: a fresh data key per secret, itself wrapped by a
-    key that never leaves AWS. Without: the local Fernet key."""
+    """Encrypt. With a cloud key: a fresh data key per secret, itself wrapped
+    by a master key that never leaves the cloud. Without: the local key."""
     raw = json.dumps(data).encode()
+
+    az = _azure_client()
+    if az:
+        from azure.keyvault.keys.crypto import KeyWrapAlgorithm
+        from cryptography.fernet import Fernet as _F
+        import os as _os
+        dk = _os.urandom(32)
+        key = _b64.urlsafe_b64encode(dk)
+        sealed = _F(key).encrypt(raw)
+        wrapped = az.wrap_key(KeyWrapAlgorithm.rsa_oaep_256, dk).encrypted_key
+        del key, dk
+        return ("akv:" + _b64.b64encode(wrapped).decode() + ":"
+                + sealed.decode())
+
     c = _kms_client()
     if c:
         from cryptography.fernet import Fernet as _F
@@ -293,6 +321,22 @@ def vault_put(data: dict) -> str:
 
 
 def vault_get(blob: str) -> dict:
+    if blob.startswith("akv:"):
+        az = _azure_client()
+        if not az:
+            raise HTTPException(500,
+                                "This secret needs Azure Key Vault, which "
+                                "isn't configured.")
+        from azure.keyvault.keys.crypto import KeyWrapAlgorithm
+        from cryptography.fernet import Fernet as _F
+        _, wrapped, sealed = blob.split(":", 2)
+        dk = az.unwrap_key(KeyWrapAlgorithm.rsa_oaep_256,
+                           _b64.b64decode(wrapped)).key
+        key = _b64.urlsafe_b64encode(dk)
+        out = _F(key).decrypt(sealed.encode())
+        del key, dk
+        return json.loads(out.decode())
+
     if blob.startswith("kms:"):
         c = _kms_client()
         if not c:
