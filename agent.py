@@ -72,7 +72,7 @@ async def log_turn(call_id, who, text="", tool="", latency_ms=0):
             "call_id": call_id, "who": who, "text": text[:4000],
             "tool": tool, "latency_ms": int(latency_ms)})
     except Exception as e:
-        log.warning(f"log_turn failed: {e}")
+        log.error(f"LOG_TURN FAILED (check SERVICE_TOKEN): {e}")
 
 
 async def report_problem(account_id, call_id, reason, note, tool=""):

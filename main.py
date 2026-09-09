@@ -3251,6 +3251,8 @@ class CallStart(BaseModel):
 @app.post("/calls/start")
 def call_start(c: CallStart, request: Request):
     require_auth(request)
+    emit("call", "incoming", f"call from {c.from_number}",
+         "info", c.account_id)
     db = Session()
     row = Call(account_id=c.account_id, from_number=c.from_number,
                room=c.room)
@@ -3273,10 +3275,10 @@ class TurnBody(BaseModel):
 @app.post("/calls/turn")
 def call_turn(t: TurnBody, request: Request):
     require_auth(request)
-    if t.who in ("tool", "problem"):
-        emit("call", f"call {t.call_id}",
-             f"{t.tool or t.who}: {t.text}",
-             "error" if t.who == "problem" else "info")
+    label = {"caller": "caller", "agent": "agent",
+             "tool": t.tool or "tool", "problem": "PROBLEM"}.get(t.who, t.who)
+    emit("call", f"call {t.call_id}", f"{label}: {t.text}",
+         "error" if t.who == "problem" else "info")
     db = Session()
     db.add(CallTurn(call_id=t.call_id, who=t.who, text=t.text[:4000],
                     tool=t.tool, latency_ms=t.latency_ms))
@@ -3288,6 +3290,7 @@ def call_turn(t: TurnBody, request: Request):
 @app.post("/calls/end")
 def call_end(request: Request, call_id: int, verified: int = 0):
     require_auth(request)
+    emit("call", f"call {call_id}", "call ended")
     db = Session()
     row = db.query(Call).filter_by(id=call_id).first()
     if row:
