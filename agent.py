@@ -451,6 +451,7 @@ FINDING EMAIL
             log.warning(f"could not start watcher: {e}")
 
     def _watch_job(self, label: str):
+        # (site jobs)
         jid = getattr(self, "job_id", None)
         if not jid:
             return
@@ -1179,8 +1180,10 @@ FINDING EMAIL
         def describe(d):
             st, msg = d.get("state", ""), d.get("message", "")
             if st == "needs_tap":
-                return (f"Google just sent a prompt to their phone. Tell "
-                        f"them exactly: {msg} Then wait for them.")
+                return (f"Tell them this now, once: {msg} Do not repeat "
+                        f"yourself afterwards - wait quietly for them.")
+            if st == "verifying":
+                return msg
             if st == "needs_code":
                 return f"{msg} Ask them for the code."
             if st == "consenting":

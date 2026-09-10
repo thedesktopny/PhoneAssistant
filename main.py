@@ -1414,11 +1414,41 @@ def _run_signin(sid: int, account_id: int, email: str):
                        'Open the Gmail app|notification to your/i')
 
     def tap_number(page):
+        """Google shows a two-digit number the caller must pick on their
+        phone. It renders a moment after the screen appears, so look in a
+        few places and don't give up on the first miss."""
+        # The number is usually its own large element.
+        for sel in ('div[jsname] span:text-matches("^[0-9]{1,3}$")',
+                    'samp', 'strong:text-matches("^[0-9]{1,3}$")',
+                    '*[aria-live] >> text=/^[0-9]{1,3}$/'):
+            el = q(page, sel)
+            if el:
+                try:
+                    t = (el.inner_text() or "").strip()
+                    if t.isdigit() and 1 <= len(t) <= 3:
+                        return t
+                except Exception:
+                    pass
         body = screen(page)
-        m = (_re.search(r"\b(\d{2})\b\s*Check your device", body)
-             or _re.search(r"Check your device.{0,120}?\b(\d{2})\b", body)
-             or _re.search(r"tap\s+(\d{2})\b", body, _re.I))
-        return m.group(1) if m else ""
+        for pat in (r"tap\s+(\d{1,3})\b",
+                    r"select\s+(\d{1,3})\b",
+                    r"number\s+(\d{1,3})\b",
+                    r"\b(\d{1,3})\b\s*Check your device",
+                    r"Check your device.{0,160}?\b(\d{1,3})\b",
+                    r"tablet.{0,160}?\b(\d{1,3})\b"):
+            m = _re.search(pat, body, _re.I)
+            if m:
+                return m.group(1)
+        return ""
+
+    def wait_for_tap_number(page, tries: int = 6):
+        """The number can take a second or two to render."""
+        for _ in range(tries):
+            n = tap_number(page)
+            if n:
+                return n
+            settle(page, 1200)
+        return ""
 
     def describe_code_screen(page):
         """Say where the code went, so the caller knows what to look for."""
@@ -1575,22 +1605,80 @@ def _run_signin(sid: int, account_id: int, email: str):
                 browser.close()
                 return
 
-            # ---- verification, whichever form it takes, possibly twice
-            for _round in range(3):
+            def on_challenge(page):
+                """Still stuck on a Google verification screen?"""
+                u = page_url(page)
+                if "/challenge" in u or "/signin/v2/challenge" in u:
+                    return True
+                return bool(q(page, 'text=/Verify it.s you|Choose a way to '
+                                    'verify|2-Step Verification/i'))
+
+            def pick_from_selection(page):
+                """On 'Choose a way to verify', pick something we can do:
+                a texted code first, then a voice call, then anything."""
+                for sel in ('text=/Get a verification code at/i',
+                            'text=/Text message/i',
+                            'text=/Send a text message/i',
+                            'text=/Get a code.{0,40}(text|SMS)/i',
+                            'text=/Phone call/i',
+                            'text=/Call.{0,20}(instead|me)/i',
+                            'text=/Google Authenticator/i',
+                            'text=/backup code/i'):
+                    el = q(page, sel)
+                    if el:
+                        emit("signin", f"signin {sid}",
+                             f"Choosing verification method: {sel}")
+                        do_click(page, el, 4000)
+                        return True
+                return False
+
+            # ---- verification, whichever form it takes
+            for _round in range(6):
                 if "/link/callback" in page.url:
                     break
+                if (q(page, 'text=/Choose a way to verify/i')
+                        and not q(page, CODE_SEL)):
+                    _ob_set(sid, "verifying",
+                            "Google is asking how to verify. Picking a "
+                            "texted code.")
+                    if pick_from_selection(page):
+                        settle(page, 3000)
+                        continue
+                    _ob_set(sid, "failed",
+                            "Google offered no verification method we can "
+                            "use. " + where(page))
+                    browser.close()
+                    return
+
                 if wants_tap(page):
-                    num = tap_number(page)
-                    _ob_set(sid, "needs_tap",
-                            (f"Google sent a prompt to their phone. They tap "
-                             f"Yes and choose {num}." if num else
-                             "Google sent a prompt to their phone. They tap "
-                             "Yes on the notification."))
+                    num = wait_for_tap_number(page)
+                    if num:
+                        _ob_set(sid, "needs_tap",
+                                f"Google sent a prompt to their phone. Tell "
+                                f"them to tap Yes and choose the number "
+                                f"{num}.")
+                    else:
+                        emit("signin", f"signin {sid}",
+                             f"No number found on the tap screen. Screen "
+                             f"text: {screen(page)[:400]}", "warn")
+                        _ob_set(sid, "needs_tap",
+                                "Google sent a prompt to their phone. Tell "
+                                "them to tap Yes, and to read out the number "
+                                "shown on their own phone if it asks for one. "
+                                "If they already missed it, use "
+                                "try_another_way.")
                     waited = 0
                     switched = False
                     while waited < 200:
                         time.sleep(4)
                         waited += 4
+                        # the number sometimes renders after the first look
+                        if not num:
+                            num = tap_number(page)
+                            if num:
+                                _ob_set(sid, "needs_tap",
+                                        f"The number is {num}. Tell them to "
+                                        f"choose {num} on their phone.")
                         if (_PENDING.get(sid) or {}).get("other_way"):
                             _PENDING[sid]["other_way"] = False
                             if pick_another_method(page):
@@ -1667,6 +1755,11 @@ def _run_signin(sid: int, account_id: int, email: str):
                         f"Signed in as {fresh[0].email}, not {email}. "
                         f"Google was already signed into another account. "
                         f"Try again.")
+            elif "/challenge" in final or "Verify it" in final:
+                _ob_set(sid, "failed",
+                        "Google is still asking to verify and we ran out of "
+                        "attempts. The phone prompt expired. Try again and "
+                        "tap Yes as soon as it appears. " + final[:300])
             else:
                 _ob_set(sid, "failed", "Consent not completed. " + final)
     except Exception as e:
@@ -4947,9 +5040,15 @@ async function pollLive(){
   try{
     const d = await (await fetch('/events?after_id='+liveLast+'&limit=200')).json();
     if(d.length){
-      liveLines = liveLines.concat(d).slice(-800);
-      liveLast = d[d.length-1].id;
-      render();
+      const seen = {};
+      liveLines.forEach(function(l){ seen[l.id] = 1; });
+      const fresh = d.filter(function(l){
+        if(seen[l.id]) return false; seen[l.id] = 1; return true; });
+      if(fresh.length){
+        liveLines = liveLines.concat(fresh).slice(-800);
+        liveLast = Math.max(liveLast, fresh[fresh.length-1].id);
+        render();
+      }
     }
   }catch(e){}
 }
@@ -5140,7 +5239,9 @@ async function add(){
 }
 
 load(); loadCalls(); loadStats(); loadDlr(); loadOb(); loadFu(); loadJobs(); loadHealth(); loadSites(); loadOrders(); loadAlerts();
-pollLive(); setInterval(pollLive, 2000);
+if(!window._livePoller){
+  pollLive(); window._livePoller = setInterval(pollLive, 2000);
+}
 setInterval(function(){ loadCalls(); loadStats(); loadDlr(); loadOb();
                         loadFu(); loadJobs(); loadHealth(); loadSites();
                         loadOrders(); loadAlerts(); }, 25000);
