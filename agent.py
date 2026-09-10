@@ -19,6 +19,7 @@ import httpx
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from livekit import api
 from livekit.agents import (
     AgentServer, AgentSession, Agent, JobContext,
     RunContext, function_tool, cli,
@@ -30,6 +31,12 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("phone-assistant")
 
 BACKEND = os.environ["BACKEND_URL"].rstrip("/")
+
+# How long a call may run, and how long silence is tolerated, in seconds.
+# All three can be changed from Railway without touching the code.
+MAX_CALL_SECONDS = int(os.environ.get("MAX_CALL_SECONDS", "900"))    # 15 min
+SILENCE_WARN = int(os.environ.get("SILENCE_WARN", "20"))
+SILENCE_HANGUP = int(os.environ.get("SILENCE_HANGUP", "45"))
 SERVICE_TOKEN = os.environ.get("SERVICE_TOKEN", "")
 AUTH = {"Authorization": f"Bearer {SERVICE_TOKEN}"} if SERVICE_TOKEN else {}
 
@@ -152,6 +159,10 @@ class Assistant(Agent):
         self.last_events = []
         self.onboard_sid = None
         self.password_confirmed = False
+        self.hangup_reason = ""
+        self._hangup = None
+        self.hangup_reason = ""
+        self._hangup = None
         self.job_id = None
         self.pw_attempts = 0
         self.job_question = ""
@@ -166,6 +177,14 @@ reachable by phone and by text. This is a phone call.
 
 RECENT HISTORY (shared with their text messages — you already know this)
 {history or "Nothing recent."}
+
+
+ENDING THE CALL
+When the caller says goodbye, says they're done, says they don't need
+anything else, or asks you to hang up: say one short goodbye and call
+end_call. Do not keep asking if they need anything else after they have
+said no once. If they go quiet, ask once whether they are still there,
+then wait - do not fill the silence with chatter.
 
 
 TOPICS YOU DO NOT DISCUSS
@@ -1138,6 +1157,17 @@ FINDING EMAIL
         return "The text didn't go out. Carry on by voice instead."
 
     @function_tool
+    async def end_call(self, context: RunContext, reason: str = "finished"):
+        """Hang up. Call this only after saying goodbye, when the caller has
+        said they're done, said goodbye, or asked you to hang up."""
+        await log_turn(self.call_id, "tool", f"hanging up: {reason}",
+                       "end_call")
+        self.hangup_reason = reason
+        if self._hangup:
+            self._hangup.set()
+        return "Say a short goodbye now. Nothing else."
+
+    @function_tool
     @auto_report("signin")
     async def connect_email(self, context: RunContext, email: str,
                             password: str):
@@ -1180,14 +1210,15 @@ FINDING EMAIL
         def describe(d):
             st, msg = d.get("state", ""), d.get("message", "")
             if st == "needs_tap":
-                return (f"Tell them this now, once: {msg} Do not repeat "
-                        f"yourself afterwards - wait quietly for them.")
+                return (f"Say this once, then stop talking: {msg} Do not ask "
+                        f"them to confirm and do not repeat it. Stay silent "
+                        f"until I give you the next update.")
+            if st == "consenting":
+                return None
             if st == "verifying":
                 return msg
             if st == "needs_code":
                 return f"{msg} Ask them for the code."
-            if st == "consenting":
-                return "Say: almost done, just approving access."
             if st == "done":
                 return (f"Say their email is now connected ({msg}) and "
                         f"offer to read new messages.")
@@ -1515,6 +1546,90 @@ async def entrypoint(ctx: JobContext):
                 pass
 
     ctx.add_shutdown_callback(_close)
+
+    # ---------------------------------------------------------- hang up
+    # Calls must not stay open. LiveKit bills by the minute and a forgotten
+    # line ties up a browser session too.
+    hangup = asyncio.Event()
+    agent_obj._hangup = hangup
+    agent_obj.session = session
+    last_heard = {"at": time.monotonic()}
+    started_at = time.monotonic()
+
+    @session.on("user_input_transcribed")
+    def _heard(ev):
+        last_heard["at"] = time.monotonic()
+
+    async def watchdog():
+        warned = False
+        while not hangup.is_set():
+            await asyncio.sleep(5)
+            quiet = time.monotonic() - last_heard["at"]
+            total = time.monotonic() - started_at
+            busy = bool(getattr(agent_obj, "onboard_sid", None)
+                        or getattr(agent_obj, "job_id", None)
+                        or getattr(agent_obj, "order_id", None))
+
+            if total > MAX_CALL_SECONDS:
+                agent_obj.hangup_reason = "reached the maximum call length"
+                try:
+                    await session.generate_reply(
+                        instructions=("In English: say the call has reached "
+                                      "its time limit, they can call back "
+                                      "any time, then say goodbye. Two "
+                                      "sentences."))
+                    await asyncio.sleep(5)
+                except Exception:
+                    pass
+                hangup.set()
+                return
+
+            # while a sign-in or order is running, silence is expected
+            limit = SILENCE_HANGUP if not busy else SILENCE_HANGUP * 3
+            warn_at = SILENCE_WARN if not busy else SILENCE_WARN * 3
+
+            if quiet > limit:
+                agent_obj.hangup_reason = "no answer from the caller"
+                hangup.set()
+                return
+
+            if quiet > warn_at and not warned:
+                warned = True
+                try:
+                    await session.generate_reply(
+                        instructions=("In English: ask once, gently, if "
+                                      "they're still there. One short "
+                                      "sentence."))
+                except Exception:
+                    pass
+            elif quiet < warn_at:
+                warned = False
+
+    async def hangup_when_asked():
+        await hangup.wait()
+        await asyncio.sleep(3)          # let the goodbye finish playing
+        log.info(f"hanging up: {agent_obj.hangup_reason}")
+        await log_turn(call_id, "tool",
+                       f"call ended: {agent_obj.hangup_reason}", "end_call")
+        try:
+            await ctx.api.room.delete_room(
+                api.DeleteRoomRequest(room=ctx.room.name))
+        except Exception as e:
+            log.warning(f"delete_room failed, disconnecting: {e}")
+            try:
+                await ctx.room.disconnect()
+            except Exception:
+                pass
+        ctx.shutdown(reason=agent_obj.hangup_reason or "done")
+
+    asyncio.create_task(watchdog())
+    asyncio.create_task(hangup_when_asked())
+
+    # caller hung up on us
+    @ctx.room.on("participant_disconnected")
+    def _gone(p):
+        agent_obj.hangup_reason = "caller hung up"
+        hangup.set()
 
     await session.start(room=ctx.room, agent=agent_obj)
     await session.generate_reply(

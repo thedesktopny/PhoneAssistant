@@ -1717,24 +1717,99 @@ def _run_signin(sid: int, account_id: int, email: str):
                 break
 
             _ob_set(sid, "consenting", "Approving access.")
-            for _ in range(10):
-                settle(page, 2500)
-                try:
-                    if "/link/callback" in page.url:
-                        break
-                    if "Linked" in (page.content() or ""):
-                        break
-                except Exception:
+
+            def consent_screen(page):
+                """What Google is showing us right now."""
+                t = screen(page)
+                u = page_url(page)
+                if "/link/callback" in u:
+                    return "done", t
+                if _re.search(r"hasn.t verified this app|being tested|"
+                              r"unverified app", t, _re.I):
+                    return "unverified", t
+                if _re.search(r"wants access to your Google Account|"
+                              r"Select what .* can access|"
+                              r"See, edit, download", t, _re.I):
+                    return "scopes", t
+                if _re.search(r"Choose an account|Select an account", t,
+                              _re.I):
+                    return "chooser", t
+                return "other", t
+
+            approved = False
+            for attempt in range(24):
+                kind, text = consent_screen(page)
+                emit("signin", f"signin {sid}",
+                     f"consent screen [{kind}] {text[:160]}")
+                if kind == "done":
+                    approved = True
+                    break
+
+                if kind == "unverified":
+                    # "Continue" is sometimes hidden behind "Advanced".
+                    for sel in ('button:has-text("Continue")',
+                                'span:has-text("Continue")',
+                                'div[role="button"]:has-text("Continue")',
+                                'text=/^Continue$/'):
+                        el = q(page, sel)
+                        if el:
+                            do_click(page, el, 3000)
+                            break
+                    else:
+                        adv = q(page, 'text=/^Advanced$/')
+                        if adv:
+                            do_click(page, adv, 2000)
+                            unsafe = q(page, 'text=/Go to .*unsafe/i')
+                            if unsafe:
+                                do_click(page, unsafe, 3000)
                     continue
-                for sel in ('text=/^Advanced$/',
-                            'text=/Go to .*unsafe/i',
-                            'button:has-text("Continue")',
+
+                if kind == "chooser":
+                    acct = q(page, f'text=/{_re.escape(email)}/i')
+                    if acct:
+                        do_click(page, acct, 3000)
+                    continue
+
+                if kind == "scopes":
+                    # tick "Select all" if the boxes aren't already on
+                    for sel in ('text=/^Select all$/',
+                                'input[type="checkbox"][aria-label*="all" i]'):
+                        el = q(page, sel)
+                        if el:
+                            do_click(page, el, 1200)
+                            break
+                    for box in q_all(page, 'input[type="checkbox"]'):
+                        try:
+                            if not box.is_checked():
+                                box.check(timeout=3000)
+                        except Exception:
+                            pass
+                    for sel in ('button:has-text("Continue")',
+                                'button:has-text("Allow")',
+                                'span:has-text("Continue")',
+                                'span:has-text("Allow")',
+                                'div[role="button"]:has-text("Continue")'):
+                        el = q(page, sel)
+                        if el:
+                            do_click(page, el, 3000)
+                            break
+                    continue
+
+                # unknown screen: try the usual buttons, then wait
+                clicked = False
+                for sel in ('button:has-text("Continue")',
                             'button:has-text("Allow")',
+                            'button:has-text("Next")',
                             'span:has-text("Continue")',
+                            'span:has-text("Allow")',
                             'div[role="button"]:has-text("Continue")'):
                     el = q(page, sel)
                     if el:
-                        do_click(page, el, 2000)
+                        do_click(page, el, 3000)
+                        clicked = True
+                        break
+                if not clicked:
+                    settle(page, 2500)
 
             db = Session()
             rows = (db.query(Connection)
@@ -1755,6 +1830,13 @@ def _run_signin(sid: int, account_id: int, email: str):
                         f"Signed in as {fresh[0].email}, not {email}. "
                         f"Google was already signed into another account. "
                         f"Try again.")
+            elif _re.search(r"hasn.t verified this app|being tested", final,
+                            _re.I):
+                _ob_set(sid, "failed",
+                        "Stuck on Google's 'app not verified' warning. The "
+                        "Continue button could not be clicked. This account "
+                        "may not be on the app's test-user list in Google "
+                        "Cloud Console. " + final[:250])
             elif "/challenge" in final or "Verify it" in final:
                 _ob_set(sid, "failed",
                         "Google is still asking to verify and we ran out of "
