@@ -520,7 +520,7 @@ FINDING EMAIL
                         "signed-out" in msg.lower():
                     return ("Tell them the saved session has expired and "
                             "offer to sign in again now. Then call "
-                            "site_login.")
+                            "sign_in_to_site.")
                 return f"Say it didn't work: {msg}."
             return None
 
@@ -1281,7 +1281,7 @@ FINDING EMAIL
                    ("@gmail.com", "@googlemail.com")) and "@" in low:
             return ("This tool only connects Gmail. If they are trying to "
                     "sign in to a shop like Amazon or Walmart, use "
-                    "save_site_login and site_login instead. Do not call "
+                    "save_site_login and sign_in_to_site instead. Do not call "
                     "connect_email again for this.")
         if not self.password_confirmed:
             self.password_confirmed = True
@@ -1738,6 +1738,55 @@ async def entrypoint(ctx: JobContext):
             hangup.set()
     except Exception as e:
         log.warning(f"could not watch for disconnect: {e}")
+
+    # ------------------------------------------------------------ costs
+    usage = {"audio_in": 0, "audio_out": 0, "text_in": 0, "text_out": 0,
+             "cached_in": 0}
+
+    try:
+        @session.on("metrics_collected")
+        def _metrics(ev):
+            try:
+                m = getattr(ev, "metrics", None)
+                d = getattr(m, "__dict__", {}) or {}
+                usage["text_in"] += int(d.get("prompt_tokens", 0) or 0)
+                usage["text_out"] += int(d.get("completion_tokens", 0) or 0)
+                det = d.get("input_token_details") or {}
+                get = (det.get if isinstance(det, dict)
+                       else lambda k, v=0: getattr(det, k, v))
+                usage["audio_in"] += int(get("audio_tokens", 0) or 0)
+                usage["cached_in"] += int(get("cached_tokens", 0) or 0)
+                odet = d.get("output_token_details") or {}
+                oget = (odet.get if isinstance(odet, dict)
+                        else lambda k, v=0: getattr(odet, k, v))
+                usage["audio_out"] += int(oget("audio_tokens", 0) or 0)
+            except Exception as e:
+                log.debug(f"metrics parse: {e}")
+    except Exception as e:
+        log.warning(f"metrics not available: {e}")
+
+    async def _report_usage():
+        secs = int(time.monotonic() - started_at)
+        # audio tokens the model reported are for text-priced turns too;
+        # subtract them so nothing is counted twice
+        body = {
+            "call_id": call_id,
+            "account_id": account["account_id"],
+            "kind": "voice",
+            "audio_in": usage["audio_in"],
+            "audio_out": usage["audio_out"],
+            "text_in": max(0, usage["text_in"] - usage["audio_in"]
+                           - usage["cached_in"]),
+            "text_out": max(0, usage["text_out"] - usage["audio_out"]),
+            "cached_in": usage["cached_in"],
+            "call_seconds": secs,
+        }
+        try:
+            await backend_post("/usage", body)
+        except Exception as e:
+            log.warning(f"usage report failed: {e}")
+
+    ctx.add_shutdown_callback(_report_usage)
 
     # Start the agent FIRST. Nothing above this line may prevent it.
     await session.start(room=ctx.room, agent=agent_obj)

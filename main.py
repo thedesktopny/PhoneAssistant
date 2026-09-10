@@ -31,6 +31,7 @@ from fastapi.responses import (RedirectResponse, HTMLResponse,
 from pydantic import BaseModel
 from cryptography.fernet import Fernet
 from sqlalchemy import (create_engine, Column, Integer, String, DateTime,
+                        Float,
                         Text, ForeignKey)
 from sqlalchemy.orm import declarative_base, sessionmaker
 from google_auth_oauthlib.flow import Flow
@@ -310,6 +311,29 @@ class Order(Base):
     placed_at = Column(DateTime, nullable=True)
 
 
+class Usage(Base):
+    """What one call or text actually consumed, and what it cost."""
+    __tablename__ = "usage"
+    id = Column(Integer, primary_key=True)
+    at = Column(DateTime, default=datetime.utcnow)
+    call_id = Column(Integer, nullable=True)
+    account_id = Column(Integer, nullable=True)
+    kind = Column(String(20), default="voice")   # voice/sms
+    audio_in = Column(Integer, default=0)
+    audio_out = Column(Integer, default=0)
+    text_in = Column(Integer, default=0)
+    text_out = Column(Integer, default=0)
+    cached_in = Column(Integer, default=0)
+    mini_in = Column(Integer, default=0)
+    mini_out = Column(Integer, default=0)
+    call_seconds = Column(Integer, default=0)
+    browser_seconds = Column(Integer, default=0)
+    searches = Column(Integer, default=0)
+    texts = Column(Integer, default=0)
+    cost_cents = Column(Float, default=0.0)
+    breakdown = Column(Text, default="")
+
+
 class Event(Base):
     """Live log: every step of every job, sign-in, order and failure."""
     __tablename__ = "events"
@@ -368,6 +392,92 @@ def _ensure_columns():
 
 _ensure_columns()
 
+
+
+
+# ------------------------------------------------------------------ costs
+# Every rate can be overridden from Railway. VERIFY THESE against your own
+# invoices before pricing customers - vendors change them.
+def _rate(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except Exception:
+        return float(default)
+
+
+RATES = {
+    # OpenAI Realtime, per 1M tokens
+    "realtime_audio_in": _rate("RATE_RT_AUDIO_IN", 32.00),
+    "realtime_audio_out": _rate("RATE_RT_AUDIO_OUT", 64.00),
+    "realtime_text_in": _rate("RATE_RT_TEXT_IN", 4.00),
+    "realtime_text_out": _rate("RATE_RT_TEXT_OUT", 16.00),
+    "realtime_cached_in": _rate("RATE_RT_CACHED_IN", 0.40),
+    # gpt-4o-mini text brain, per 1M tokens
+    "mini_in": _rate("RATE_MINI_IN", 0.15),
+    "mini_out": _rate("RATE_MINI_OUT", 0.60),
+    # per minute
+    "livekit_agent_min": _rate("RATE_LIVEKIT_AGENT_MIN", 0.005),
+    "livekit_sip_min": _rate("RATE_LIVEKIT_SIP_MIN", 0.004),
+    "telephony_min": _rate("RATE_TELEPHONY_MIN", 0.0085),
+    "browser_min": _rate("RATE_BROWSER_MIN", 0.10),
+    # per unit
+    "search": _rate("RATE_SEARCH", 0.001),
+    "sms": _rate("RATE_SMS", 0.0079),
+}
+
+
+
+def price_usage(u) -> tuple:
+    """Return (dollars, breakdown dict) for one usage row."""
+    m = 1_000_000.0
+    parts = {
+        "voice model in": u.audio_in / m * RATES["realtime_audio_in"],
+        "voice model out": u.audio_out / m * RATES["realtime_audio_out"],
+        "text in": u.text_in / m * RATES["realtime_text_in"],
+        "text out": u.text_out / m * RATES["realtime_text_out"],
+        "cached in": u.cached_in / m * RATES["realtime_cached_in"],
+        "helper model": (u.mini_in / m * RATES["mini_in"]
+                         + u.mini_out / m * RATES["mini_out"]),
+        "livekit": (u.call_seconds / 60.0
+                    * (RATES["livekit_agent_min"]
+                       + RATES["livekit_sip_min"])),
+        "phone line": u.call_seconds / 60.0 * RATES["telephony_min"],
+        "browser": u.browser_seconds / 60.0 * RATES["browser_min"],
+        "web search": u.searches * RATES["search"],
+        "texts": u.texts * RATES["sms"],
+    }
+    parts = {k: round(v, 6) for k, v in parts.items() if v > 0}
+    return round(sum(parts.values()), 6), parts
+
+
+def record_usage(**kw):
+    """Add or update the usage row for a call. Never raises."""
+    try:
+        db = Session()
+        row = None
+        if kw.get("call_id"):
+            row = db.query(Usage).filter_by(call_id=kw["call_id"]).first()
+        if not row:
+            row = Usage(**{k: v for k, v in kw.items()
+                           if hasattr(Usage, k)})
+            db.add(row)
+        else:
+            for k, v in kw.items():
+                if hasattr(Usage, k) and isinstance(v, (int, float)):
+                    setattr(row, k, (getattr(row, k) or 0) + v)
+                elif hasattr(Usage, k) and v is not None:
+                    setattr(row, k, v)
+        db.flush()
+        dollars, parts = price_usage(row)
+        row.cost_cents = round(dollars * 100, 4)
+        row.breakdown = json.dumps(parts)
+        db.commit()
+        db.close()
+        return dollars
+    except Exception as e:
+        emit("cost", "usage", f"could not record usage: {str(e)[:150]}",
+             "warn")
+        return 0.0
 
 
 # --------------------------------------------------------------- scrubbing
@@ -2220,7 +2330,23 @@ _queue_lock = threading.Lock()
 _waiting = 0
 
 
+_JOB_STARTED = {}
+
+
 def _job_set(jid: int, state: str, message: str = ""):
+    if state in ("opening", "signing_in") and jid not in _JOB_STARTED:
+        _JOB_STARTED[jid] = time.time()
+    if state in ("done", "failed") and jid in _JOB_STARTED:
+        secs = int(time.time() - _JOB_STARTED.pop(jid))
+        try:
+            db2 = Session()
+            job = db2.query(Job).filter_by(id=jid).first()
+            acc = job.account_id if job else None
+            db2.close()
+            record_usage(account_id=acc, kind="browser",
+                         browser_seconds=secs)
+        except Exception:
+            pass
     emit("job", f"job {jid}", f"{state}: {message}",
          "error" if state == "failed" else "info")
     db = Session()
@@ -4398,6 +4524,101 @@ def browser_where(request: Request, phone: str = ""):
     return out
 
 
+class UsageBody(BaseModel):
+    call_id: int | None = None
+    account_id: int | None = None
+    kind: str = "voice"
+    audio_in: int = 0
+    audio_out: int = 0
+    text_in: int = 0
+    text_out: int = 0
+    cached_in: int = 0
+    mini_in: int = 0
+    mini_out: int = 0
+    call_seconds: int = 0
+    browser_seconds: int = 0
+    searches: int = 0
+    texts: int = 0
+
+
+@app.post("/usage")
+def usage_add(b: UsageBody, request: Request):
+    require_auth(request)
+    dollars = record_usage(**b.model_dump())
+    return {"ok": True, "cost_usd": dollars}
+
+
+@app.get("/usage/call")
+def usage_call(request: Request, call_id: int):
+    """What one call cost, itemised."""
+    require_auth(request)
+    db = Session()
+    row = db.query(Usage).filter_by(call_id=call_id).first()
+    db.close()
+    if not row:
+        return {"call_id": call_id, "cost_usd": 0, "note": "nothing recorded"}
+    dollars, parts = price_usage(row)
+    return {
+        "call_id": call_id,
+        "minutes": round((row.call_seconds or 0) / 60.0, 2),
+        "tokens": {"audio_in": row.audio_in, "audio_out": row.audio_out,
+                   "text_in": row.text_in, "text_out": row.text_out,
+                   "cached_in": row.cached_in,
+                   "helper_in": row.mini_in, "helper_out": row.mini_out},
+        "browser_minutes": round((row.browser_seconds or 0) / 60.0, 2),
+        "searches": row.searches, "texts": row.texts,
+        "cost_usd": round(dollars, 4),
+        "breakdown_usd": parts,
+    }
+
+
+@app.get("/usage/summary")
+def usage_summary(request: Request, days: int = 30):
+    """What calls are costing you, and what that means per customer."""
+    require_auth(request)
+    since = datetime.utcnow() - timedelta(days=days)
+    db = Session()
+    rows = db.query(Usage).filter(Usage.at >= since).all()
+    names = {a.id: a.name for a in db.query(Account).all()}
+    db.close()
+
+    total = sum((r.cost_cents or 0) for r in rows) / 100.0
+    mins = sum((r.call_seconds or 0) for r in rows) / 60.0
+    calls = len([r for r in rows if r.kind == "voice"])
+
+    per_account = {}
+    for r in rows:
+        k = names.get(r.account_id, "unknown")
+        d = per_account.setdefault(k, {"calls": 0, "minutes": 0.0,
+                                       "cost_usd": 0.0})
+        d["calls"] += 1
+        d["minutes"] += (r.call_seconds or 0) / 60.0
+        d["cost_usd"] += (r.cost_cents or 0) / 100.0
+
+    combined = {}
+    for r in rows:
+        try:
+            for k, v in json.loads(r.breakdown or "{}").items():
+                combined[k] = combined.get(k, 0) + v
+        except Exception:
+            pass
+
+    return {
+        "days": days,
+        "calls": calls,
+        "total_minutes": round(mins, 1),
+        "total_cost_usd": round(total, 2),
+        "cost_per_call_usd": round(total / calls, 4) if calls else 0,
+        "cost_per_minute_usd": round(total / mins, 4) if mins else 0,
+        "by_component_usd": {k: round(v, 4) for k, v in
+                             sorted(combined.items(), key=lambda x: -x[1])},
+        "by_customer": {k: {kk: round(vv, 3) for kk, vv in v.items()}
+                        for k, v in sorted(
+                            per_account.items(),
+                            key=lambda x: -x[1]["cost_usd"])},
+    }
+
+
 @app.get("/browser/proxy_status")
 def proxy_status(request: Request):
     require_auth(request)
@@ -4922,6 +5143,7 @@ ADMIN_HTML = """<!doctype html>
   <h1>Phone Assistant</h1>
   <nav>
     <a data-p="live">Live</a>
+    <a data-p="costs">Costs</a>
     <a data-p="overview" class="on">Overview</a>
     <a data-p="calls">Calls</a>
     <a data-p="customers">Customers</a>
@@ -4936,6 +5158,27 @@ ADMIN_HTML = """<!doctype html>
     .then(()=>location.reload())">Sign out</button>
 </header>
 <main>
+
+<section class="page" id="p-costs">
+  <div class="card"><h2>What calls cost</h2>
+    <div class="hint">Real token counts from each call, priced with the
+      rates in Railway. Verify the rates against your own invoices before
+      you price customers.</div>
+    <label style="display:inline-block;margin:8px 14px 8px 0">Period
+      <select id="costdays" style="width:auto;margin-left:6px">
+        <option value="1">today</option>
+        <option value="7">7 days</option>
+        <option value="30" selected>30 days</option>
+        <option value="90">90 days</option>
+      </select></label>
+    <div id="costtop" style="margin:14px 0"></div>
+    <h2 class="no">Where the money goes</h2>
+    <table><tbody id="costparts"></tbody></table>
+    <h2 class="no" style="margin-top:18px">By customer</h2>
+    <table><thead><tr><th>Customer</th><th>Calls</th><th>Minutes</th>
+      <th>Cost</th></tr></thead><tbody id="costcust"></tbody></table>
+  </div>
+</section>
 
 <section class="page" id="p-live">
   <div class="card"><h2>Live log</h2>
@@ -5235,6 +5478,31 @@ async function load(){
 }
 
 var fuAll = false;
+async function loadCosts(){
+  try{
+    const days = document.getElementById('costdays').value;
+    const d = await (await fetch('/usage/summary?days='+days)).json();
+    document.getElementById('costtop').innerHTML =
+      '<b style="font-size:26px">$'+d.total_cost_usd.toFixed(2)+'</b>'+
+      '<span class="hint"> over '+d.calls+' calls, '+
+      d.total_minutes+' minutes</span><br>'+
+      '<span class="hint">$'+d.cost_per_call_usd.toFixed(3)+
+      ' per call &middot; $'+d.cost_per_minute_usd.toFixed(3)+
+      ' per minute</span>';
+    document.getElementById('costparts').innerHTML =
+      Object.entries(d.by_component_usd).map(function(e){
+        return '<tr><td>'+esc(e[0])+'</td><td>$'+e[1].toFixed(4)+
+               '</td></tr>'; }).join('') ||
+      '<tr><td class="hint">Nothing recorded yet.</td></tr>';
+    document.getElementById('costcust').innerHTML =
+      Object.entries(d.by_customer).map(function(e){
+        return '<tr><td>'+esc(e[0])+'</td><td>'+e[1].calls+'</td><td>'+
+               e[1].minutes.toFixed(1)+'</td><td>$'+
+               e[1].cost_usd.toFixed(3)+'</td></tr>'; }).join('') ||
+      '<tr><td class="hint">Nothing recorded yet.</td></tr>';
+  }catch(e){}
+}
+document.getElementById('costdays').addEventListener('change', loadCosts);
 async function loadAlerts(){
   try{
     const d = await (await fetch('/followups?include_done=0')).json();
@@ -5524,13 +5792,13 @@ async function add(){
   else { m.textContent='Failed — that number may already exist.'; }
 }
 
-load(); loadCalls(); loadStats(); loadDlr(); loadOb(); loadFu(); loadJobs(); loadHealth(); loadSites(); loadOrders(); loadAlerts();
+load(); loadCalls(); loadStats(); loadDlr(); loadOb(); loadFu(); loadJobs(); loadHealth(); loadSites(); loadOrders(); loadAlerts(); loadCosts();
 if(!window._livePoller){
   pollLive(); window._livePoller = setInterval(pollLive, 2000);
 }
 setInterval(function(){ loadCalls(); loadStats(); loadDlr(); loadOb();
                         loadFu(); loadJobs(); loadHealth(); loadSites();
-                        loadOrders(); loadAlerts(); }, 25000);
+                        loadOrders(); loadAlerts(); loadCosts(); }, 25000);
 </script></body></html>"""
 
 
