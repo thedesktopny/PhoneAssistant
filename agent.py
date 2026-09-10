@@ -1552,13 +1552,15 @@ async def entrypoint(ctx: JobContext):
     # line ties up a browser session too.
     hangup = asyncio.Event()
     agent_obj._hangup = hangup
-    agent_obj.session = session
     last_heard = {"at": time.monotonic()}
     started_at = time.monotonic()
 
-    @session.on("user_input_transcribed")
-    def _heard(ev):
-        last_heard["at"] = time.monotonic()
+    try:
+        @session.on("user_input_transcribed")
+        def _heard(ev):
+            last_heard["at"] = time.monotonic()
+    except Exception as e:
+        log.warning(f"could not watch for silence: {e}")
 
     async def watchdog():
         warned = False
@@ -1622,16 +1624,22 @@ async def entrypoint(ctx: JobContext):
                 pass
         ctx.shutdown(reason=agent_obj.hangup_reason or "done")
 
-    asyncio.create_task(watchdog())
-    asyncio.create_task(hangup_when_asked())
+    try:
+        @ctx.room.on("participant_disconnected")
+        def _gone(p):
+            agent_obj.hangup_reason = "caller hung up"
+            hangup.set()
+    except Exception as e:
+        log.warning(f"could not watch for disconnect: {e}")
 
-    # caller hung up on us
-    @ctx.room.on("participant_disconnected")
-    def _gone(p):
-        agent_obj.hangup_reason = "caller hung up"
-        hangup.set()
-
+    # Start the agent FIRST. Nothing above this line may prevent it.
     await session.start(room=ctx.room, agent=agent_obj)
+
+    try:
+        asyncio.create_task(watchdog())
+        asyncio.create_task(hangup_when_asked())
+    except Exception as e:
+        log.warning(f"hangup watchdog not started: {e}")
     await session.generate_reply(
         instructions=(f"In English: greet {account.get('name')} by name in "
                       f"one short sentence and ask for their PIN. "
