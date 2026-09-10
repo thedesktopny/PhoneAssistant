@@ -1724,7 +1724,6 @@ def _run_signin(sid: int, account_id: int, email: str):
     def describe_code_screen(page):
         """Say where the code went, so the caller knows what to look for."""
         body = screen(page)
-        m = _re.search(r"\(?\s*[•\*\u2022]{0,3}\s*(\d{2,4})\s*\)?\s*$", "")
         if _re.search(r"enter your (device |phone )?(pin|passcode)|"
                       r"screen lock|unlock your (phone|device)", body, _re.I):
             return ("Google wants the PIN or passcode they use to unlock "
@@ -1756,8 +1755,7 @@ def _run_signin(sid: int, account_id: int, email: str):
                    or q(page, 'text=/Try another method/i'))
             if not alt:
                 return False
-            alt.click()
-            page.wait_for_timeout(3500)
+            do_click(page, alt, 3500)
             for sel in ('text=/Get a verification code at/i',
                         'text=/Text message/i',
                         'text=/Send code/i',
@@ -1765,8 +1763,7 @@ def _run_signin(sid: int, account_id: int, email: str):
                         'text=/Phone call/i'):
                 opt = q(page, sel)
                 if opt:
-                    opt.click()
-                    settle(page, 3500)
+                    do_click(page, opt, 3500)
                     return True
             return True          # menu is open; caller can be told options
         except Exception:
@@ -1791,11 +1788,10 @@ def _run_signin(sid: int, account_id: int, email: str):
             code = st.get("code")
             if code:
                 _PENDING[sid]["code"] = None
-                try:
-                    page.fill(CODE_SEL, code, timeout=10000)
-                    page.keyboard.press("Enter")
-                    settle(page, 5000)
-                except Exception:
+                code_el = q(page, CODE_SEL)
+                if code_el:
+                    do_fill(page, code_el, code, True, 5000)
+                else:
                     settle(page, 4000)
                 if q(page, 'text=/Wrong code|incorrect code|try again/i'):
                     _ob_set(sid, "needs_code",
@@ -1825,13 +1821,9 @@ def _run_signin(sid: int, account_id: int, email: str):
             do_goto(page, f"{PUBLIC_URL}/link/start?account_id={account_id}",
                     4000)
 
-            try:
-                other = q(page, 'text=/Use another account/i')
-                if other:
-                    other.click()
-                    settle(page, 2500)
-            except Exception:
-                pass
+            other = q(page, 'text=/Use another account/i')
+            if other:
+                do_click(page, other, 2500)
 
             try:
                 page.wait_for_selector(EMAIL_SEL, timeout=30000)
@@ -1840,9 +1832,12 @@ def _run_signin(sid: int, account_id: int, email: str):
                 browser.close()
                 return
 
-            page.fill(EMAIL_SEL, email)
-            page.keyboard.press("Enter")
-            settle(page, 3500)
+            email_el = q(page, EMAIL_SEL)
+            if not email_el:
+                _ob_set(sid, "failed", "No email box. " + where(page))
+                browser.close()
+                return
+            do_fill(page, email_el, email, True, 3500)
 
             try:
                 page.wait_for_selector(PW_SEL, timeout=30000)
@@ -1851,11 +1846,14 @@ def _run_signin(sid: int, account_id: int, email: str):
                 browser.close()
                 return
 
+            pw_el = q(page, PW_SEL)
+            if not pw_el:
+                _ob_set(sid, "failed", "No password box. " + where(page))
+                browser.close()
+                return
             emit("signin", f"signin {sid}",
                  f"typing password: {_shape(password)}")
-            page.fill(PW_SEL, password)
-            page.keyboard.press("Enter")
-            settle(page, 5000)
+            do_fill(page, pw_el, password, True, 5000)
 
             if q(page, 'text=/Wrong password/i'):
                 emit("signin", f"signin {sid}",
@@ -1905,7 +1903,7 @@ def _run_signin(sid: int, account_id: int, email: str):
 
             # ---- verification, whichever form it takes
             for _round in range(6):
-                if "/link/callback" in page.url:
+                if "/link/callback" in page_url(page):
                     break
                 if (q(page, 'text=/Choose a way to verify/i')
                         and not q(page, CODE_SEL)):
@@ -1956,11 +1954,8 @@ def _run_signin(sid: int, account_id: int, email: str):
                                 switched = True
                                 break
                         # approving navigates the page — that's success
-                        try:
-                            if "/link/callback" in page.url:
-                                break
-                        except Exception:
-                            pass
+                        if "/link/callback" in page_url(page):
+                            break
                         if not wants_tap(page):
                             settle(page, 2000)
                             if not wants_tap(page):
@@ -2509,12 +2504,7 @@ def _run_site_login(jid: int, account_id: int, site: str):
                          f"screen: {page_text(page, 250)}")
             browser.close()
     except Exception as e:
-        detail = ""
-        try:
-            if page:
-                detail = " url=" + page.url[:100]
-        except Exception:
-            pass
+        detail = " url=" + page_url(page)[:100] if page else ""
         _job_set(jid, "failed", f"Browser error: {str(e)[:150]}{detail}")
         try:
             if browser:
@@ -2951,8 +2941,9 @@ def _run_browse(jid: int, account_id: int, site: str):
                     _job_set(jid, "failed", act.get("answer", "")[:600])
                     break
                 if a == "ask_user":
-                    q = act.get("question", "")[:300]
-                    _job_set(jid, "needs_input", q)
+                    # never name this 'q' - that shadows the page helper q()
+                    question = act.get("question", "")[:300]
+                    _job_set(jid, "needs_input", question)
                     waited, reply = 0, None
                     while waited < 240:
                         time.sleep(3)
@@ -2964,7 +2955,7 @@ def _run_browse(jid: int, account_id: int, site: str):
                     if not reply:
                         _job_set(jid, "failed", "No answer from the caller.")
                         break
-                    history.append(f"asked: {q} -> they said: {reply}")
+                    history.append(f"asked: {question} -> they said: {reply}")
                     _job_set(jid, "working", "Carrying on.")
                     continue
 
@@ -3170,9 +3161,11 @@ def _run_checkout(jid: int, account_id: int, site: str):
                     _job_set(jid, "failed", act.get("answer", "")[:400])
                     break
                 if a == "ask_user":
-                    q = act.get("question", "")[:300]
-                    _job_set(jid, "needs_input", q)
-                    _order_set(oid, "placing", f"Needs the customer: {q}")
+                    # never name this 'q' - that shadows the page helper q()
+                    question = act.get("question", "")[:300]
+                    _job_set(jid, "needs_input", question)
+                    _order_set(oid, "placing",
+                               f"Needs the customer: {question}")
                     waited, reply = 0, None
                     while waited < 240:
                         time.sleep(3)
@@ -3185,7 +3178,7 @@ def _run_checkout(jid: int, account_id: int, site: str):
                         _order_set(oid, "failed", "No answer from the customer.")
                         _job_set(jid, "failed", "No answer from the caller.")
                         break
-                    history.append(f"asked: {q} -> they said: {reply}")
+                    history.append(f"asked: {question} -> they said: {reply}")
                     continue
                 if a == "place_order":
                     total = str(act.get("total", ""))[:20]

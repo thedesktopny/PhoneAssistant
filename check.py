@@ -102,12 +102,47 @@ def _():
 
 @check("no raw page calls outside the safe helpers")
 def _():
-    src = open("main.py").read()
+    src = open("main.py", encoding="utf-8").read()
     start = src.index("# --------------------------------------------------- assisted Gmail sign-in")
-    body = src[start:]
-    for bad in ("page.query_selector(", "page.goto("):
-        # allow only inside the helper definitions above 'start'
-        assert bad not in body, f"raw {bad} found - use q()/do_goto()"
+    # stop at the admin page - its JavaScript legitimately calls .click()
+    body = src[start:src.index("ADMIN_HTML = ")]
+    for bad, use in (("page.query_selector(", "q()"),
+                     ("page.goto(", "do_goto()"),
+                     ("page.fill(", "do_fill()"),
+                     ("page.inner_text(", "page_text()"),
+                     ("page.url", "page_url()"),
+                     (".click()", "do_click()")):
+        # allowed only inside the helper definitions above 'start'
+        assert bad not in body, f"raw {bad} found - use {use} instead"
+
+
+@check("nothing shadows a page helper (the q= landmine)")
+def _():
+    """A local named q, do_click, ... makes the real helper unreachable for
+    the whole function - an UnboundLocalError the moment someone follows
+    rule 3 and calls it."""
+    import ast
+    helpers = {"q", "q_all", "page_text", "page_url", "do_click", "do_fill",
+               "do_goto", "settle"}
+    tree = ast.parse(open("main.py", encoding="utf-8").read())
+    bad = set()
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if fn.name in helpers:
+            continue
+        uses = {n.func.id for n in ast.walk(fn)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        if not uses & helpers:
+            continue          # doesn't touch a page, can't be bitten
+        for node in ast.walk(fn):
+            if (isinstance(node, ast.Name) and node.id in helpers
+                    and isinstance(node.ctx, ast.Store)):
+                bad.add(f"{fn.name}() assigns to '{node.id}'")
+        for arg in fn.args.args + fn.args.kwonlyargs:
+            if arg.arg in helpers:
+                bad.add(f"{fn.name}() has an argument named '{arg.arg}'")
+    assert not bad, "; ".join(sorted(bad))
 
 
 @check("caller country routing")
@@ -155,14 +190,14 @@ def _():
 def _():
     from livekit.agents import Agent
     props = {k for k, v in vars(Agent).items() if isinstance(v, property)}
-    src = open("agent.py").read()
+    src = open("agent.py", encoding="utf-8").read()
     for m in re.finditer(r"(?:agent_obj|self)\.(\w+)\s*=[^=]", src):
         assert m.group(1) not in props, f"assigns read-only: {m.group(1)}"
 
 
 @check("every self._method the agent calls is actually defined")
 def _():
-    src = open("agent.py").read()
+    src = open("agent.py", encoding="utf-8").read()
     called = set(re.findall(r"self\._(\w+)\(", src))
     defined = {a or b for a, b in re.findall(
         r"    def _(\w+)\(|    async def _(\w+)\(", src)}
@@ -172,7 +207,7 @@ def _():
 
 @check("session.start happens before the hangup watchdog")
 def _():
-    src = open("agent.py").read()
+    src = open("agent.py", encoding="utf-8").read()
     assert src.index("await session.start(room=ctx.room, agent=agent_obj)") \
         < src.index("asyncio.create_task(watchdog())")
 

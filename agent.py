@@ -164,18 +164,15 @@ class Assistant(Agent):
         self.job_site = ""
         self.hangup_reason = ""
         self._hangup = None
-        self.site_fails = {}
-        self.job_site = ""
-        self.hangup_reason = ""
-        self._hangup = None
         self.job_id = None
         self.pw_attempts = 0
         self.job_question = ""
         self.order_id = None
         self.mailbox = ""
 
-        today = datetime.now(ZoneInfo("America/New_York")).strftime(
-            "%A, %B %-d, %Y")
+        # %-d is Linux-only and raises on Windows, where check.py is run
+        _now = datetime.now(ZoneInfo("America/New_York"))
+        today = f"{_now:%A, %B} {_now.day}, {_now.year}"
         super().__init__(instructions=f"""
 You are a personal assistant for {account.get('name', 'the caller')},
 reachable by phone and by text. This is a phone call.
