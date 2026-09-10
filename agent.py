@@ -1808,6 +1808,10 @@ async def entrypoint(ctx: JobContext):
                     await c.post(f"{BACKEND}/calls/end", headers=AUTH,
                                  params={"call_id": call_id,
                                          "verified": int(agent_obj.verified)})
+                    # nobody is listening any more - don't keep paying for
+                    # a browser to finish an answer no one will hear
+                    await c.post(f"{BACKEND}/jobs/cancel_for_call",
+                                 headers=AUTH, params={"call_id": call_id})
             except Exception:
                 pass
 

@@ -1772,6 +1772,23 @@ def do_goto(page, url: str, wait_ms: int = 3500) -> bool:
     return True
 
 
+def page_eval(page, js, arg=None):
+    """Run JavaScript inside the page, surviving a navigation.
+
+    One call that does the work in the browser beats hundreds of calls that
+    each cross the network to it."""
+    for _ in range(3):
+        try:
+            return (page.evaluate(js, arg) if arg is not None
+                    else page.evaluate(js))
+        except Exception as e:
+            if _is_nav_error(e):
+                settle(page)
+                continue
+            return None
+    return None
+
+
 def page_shot(page) -> str:
     """A JPEG of what the page looks like right now, base64 encoded.
     Returns "" if it can't be taken - never raises, never blocks a job."""
@@ -2879,37 +2896,61 @@ Rules:
   plain names, prices and dates. Never include a URL."""
 
 
+_SNAPSHOT_JS = """
+(limit) => {
+  const sel = 'a, button, input, textarea, select, [role=button], ' +
+              '[role=link], [role=combobox], [contenteditable="true"]';
+  const typed = ['input', 'textarea', 'select'];
+  const out = [];
+  for (const el of document.querySelectorAll(sel)) {
+    if (out.length >= limit) break;
+    const r = el.getBoundingClientRect();
+    if (!r.width || !r.height) continue;
+    const st = getComputedStyle(el);
+    if (st.visibility === 'hidden' || st.display === 'none') continue;
+    const tag = el.tagName.toLowerCase();
+    let label = el.getAttribute('aria-label') || el.getAttribute('placeholder')
+      || (el.innerText || '').trim() || el.getAttribute('name')
+      || el.getAttribute('value') || el.getAttribute('title') || '';
+    label = label.replace(/\\s+/g, ' ').slice(0, 70);
+    if (!label && !typed.includes(tag)) continue;
+    const type = el.getAttribute('type') || '';
+    el.setAttribute('data-pa-idx', String(out.length));
+    out.push({tag: tag, type: type, label: label});
+  }
+  return out;
+}
+"""
+
+
 def _page_snapshot(page, limit: int = 60):
-    """Page text plus a numbered list of interactive elements."""
-    els = q_all(page,
-                "a, button, input, textarea, select, [role=button], "
-                "[role=link]")
+    """Page text plus a numbered list of things you can interact with.
+
+    This used to ask the browser about each element one at a time - is it
+    visible, what tag, what label - which is seven network round trips per
+    element. On a big shop that took over two minutes for a single step,
+    and often timed out with an empty list, so the model was choosing
+    numbers for elements that weren't there. Now the browser does the whole
+    job once and hands back the finished list."""
+    raw = page_eval(page, _SNAPSHOT_JS, limit) or []
     items, seen = [], set()
-    for el in els:
-        if len(items) >= limit:
-            break
-        try:
-            if not el.is_visible():
-                continue
-            tag = el.evaluate("e => e.tagName.toLowerCase()")
-            label = (el.get_attribute("aria-label")
-                     or el.get_attribute("placeholder")
-                     or (el.inner_text() or "").strip()
-                     or el.get_attribute("name")
-                     or el.get_attribute("value") or "")
-            label = " ".join(label.split())[:70]
-            typ = el.get_attribute("type") or ""
-            key = f"{tag}|{typ}|{label}"
-            if not label and tag not in ("input", "textarea", "select"):
-                continue
-            if key in seen:
-                continue
-            seen.add(key)
-            items.append({"el": el,
-                          "desc": f"{tag}{'/' + typ if typ else ''}: {label}"})
-        except Exception:
+    for i, it in enumerate(raw):
+        tag = it.get("tag", "")
+        typ = it.get("type", "")
+        desc = f"{tag}{'/' + typ if typ else ''}: {it.get('label', '')}"
+        if desc in seen:
             continue
+        seen.add(desc)
+        items.append({"idx": i, "desc": desc})
     return items, page_text(page, 4000)
+
+
+def _handle(page, item):
+    """The live element for a snapshot entry, found by the marker the
+    snapshot left on it."""
+    if not item:
+        return None
+    return q(page, f'[data-pa-idx="{item["idx"]}"]')
 
 
 def _first_json(raw: str) -> dict:
@@ -3118,12 +3159,12 @@ def _match_element(items: list, desc: str):
     want = desc.lower()
     for it in items:
         if it["desc"].lower() == want:
-            return it["el"]
+            return it
     tail = want.split(":", 1)[-1].strip()
     if tail:
         for it in items:
             if tail in it["desc"].lower():
-                return it["el"]
+                return it
     return None
 
 
@@ -3139,7 +3180,7 @@ def _replay_recipe(page, steps: list, creds: dict, log_fn,
         try:
             if a in ("click", "type"):
                 items, _ = _page_snapshot(page)
-                el = _match_element(items, st.get("desc", ""))
+                el = _handle(page, _match_element(items, st.get("desc", "")))
                 if not el:
                     log_fn(f"replay step {i + 1}: couldn't find "
                            f"'{st.get('desc', '')}'")
@@ -3240,6 +3281,10 @@ def _run_browse(jid: int, account_id: int, site: str):
             # ---- 2. step-by-step agent
             outcome = "failed"
             for step in range(max_steps):
+                if (_JOBS.get(jid) or {}).get("cancelled"):
+                    _job_set(jid, "failed", "The caller hung up.",
+                             reason="cancelled")
+                    break
                 items, text = _page_snapshot(page)
                 shot = page_shot(page) if BROWSER_VISION else ""
                 act = _decide(goal, page_url(page), text, items, history,
@@ -3279,17 +3324,31 @@ def _run_browse(jid: int, account_id: int, site: str):
                     _job_set(jid, "working", "Carrying on.")
                     continue
 
+                if a in ("click", "type"):
+                    idx = int(act.get("index", -1) or -1)
+                    if idx < 0 or idx >= len(items):
+                        note = (f"There is no [{idx}] - the page offers "
+                                f"{len(items)} things you can use."
+                                + (" Nothing was found on the page at all; "
+                                   "it may still be loading, so wait or "
+                                   "scroll before choosing again."
+                                   if not items else ""))
+                        history.append(note)
+                        _job_set(jid, "working", note)
+                        settle(page, 2500)
+                        continue
+
                 try:
                     if a == "click":
                         it = items[int(act["index"])]
-                        do_click(page, it["el"])
+                        do_click(page, _handle(page, it))
                         recorded.append({"action": "click",
                                          "desc": it["desc"]})
                     elif a == "type":
                         it = items[int(act["index"])]
                         val = act.get("text", "")
                         real = _recipe_value(val, creds, subject)
-                        do_fill(page, it["el"], real,
+                        do_fill(page, _handle(page, it), real,
                                 bool(act.get("enter")))
                         # store what it meant, not what it said
                         recorded.append({"action": "type", "desc": it["desc"],
@@ -3466,6 +3525,10 @@ def _run_checkout(jid: int, account_id: int, site: str):
             do_goto(page, f"https://www.{site}.com", 4000)
 
             for step in range(30):
+                if (_JOBS.get(jid) or {}).get("cancelled"):
+                    _job_set(jid, "failed", "The caller hung up.",
+                             reason="cancelled")
+                    break
                 items, text = _page_snapshot(page, limit=80)
                 shot = page_shot(page) if BROWSER_VISION else ""
                 act = decide(page_url(page), text, items, history, shot)
@@ -3505,25 +3568,36 @@ def _run_checkout(jid: int, account_id: int, site: str):
                         break
                     history.append(f"asked: {question} -> they said: {reply}")
                     continue
+                if a in ("click", "type", "place_order"):
+                    idx = int(act.get("index", -1) or -1)
+                    if idx < 0 or idx >= len(items):
+                        note = (f"There is no [{idx}] - the page offers "
+                                f"{len(items)} things you can use.")
+                        history.append(note)
+                        _job_set(jid, "working", note)
+                        settle(page, 2500)
+                        continue
+
                 if a == "place_order":
                     total = str(act.get("total", ""))[:20]
                     _order_set(oid, "placing",
                                f"On the review screen, total {total}. "
                                f"Placing now.")
                     history.append(f"place_order total {total} — {why}")
-                    ok = do_click(page, items[int(act["index"])]["el"], 8000)
+                    ok = do_click(page, _handle(page, items[int(act["index"])]),
+                                  8000)
                     if not ok:
                         history.append("place_order click failed")
                     continue
 
                 try:
                     if a == "click":
-                        do_click(page, items[int(act["index"])]["el"])
+                        do_click(page, _handle(page, items[int(act["index"])]))
                     elif a == "type":
                         val = act.get("text", "")
                         real = values.get(val, val)
-                        do_fill(page, items[int(act["index"])]["el"], real,
-                                bool(act.get("enter")))
+                        do_fill(page, _handle(page, items[int(act["index"])]),
+                                real, bool(act.get("enter")))
                     elif a == "goto":
                         do_goto(page, act["url"])
                     elif a == "scroll":
@@ -4792,6 +4866,27 @@ def job_code(b: JobCode, request: Request):
         _JOBS[b.job_id]["code"] = clean
         return {"ok": True}
     raise HTTPException(400, "That job is no longer running.")
+
+
+@app.post("/jobs/cancel_for_call")
+def jobs_cancel_for_call(request: Request, call_id: int):
+    """The caller hung up - stop anything still running for them. A browser
+    job that outlives the call keeps spending on browser time and model
+    calls for an answer nobody will ever hear."""
+    require_auth(request)
+    db = Session()
+    rows = (db.query(Job)
+              .filter(Job.call_id == call_id,
+                      Job.state.notin_(["done", "failed", "cancelled"]))
+              .all())
+    ids = [r.id for r in rows]
+    db.close()
+    for jid in ids:
+        if jid in _JOBS:
+            _JOBS[jid]["cancelled"] = True
+        _job_set(jid, "failed", "The caller hung up before this finished.",
+                 reason="cancelled")
+    return {"cancelled": ids}
 
 
 @app.get("/jobs/status")

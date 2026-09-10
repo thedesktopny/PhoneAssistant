@@ -369,6 +369,50 @@ def _():
         "job_answer still summarises a sign-in as if it were a lookup"
 
 
+@check("the page snapshot is one call, not hundreds")
+def _():
+    """Asking the browser about each element separately took over two
+    minutes for a single step on a big shop, and often returned nothing -
+    so the model picked numbers for elements that weren't there."""
+    src = open("main.py", encoding="utf-8").read()
+    body = src[src.index("def _page_snapshot("):]
+    body = body[:body.index("\ndef ", 10)]
+    for slow in ("el.is_visible()", "el.get_attribute(", "el.inner_text()",
+                 "el.evaluate("):
+        assert slow not in body, \
+            f"{slow} is back in the snapshot - one round trip per element"
+    assert "page_eval(" in body, "the snapshot should run in the page"
+    # every entry must be addressable without holding a live handle
+    class P:
+        url = "https://x"
+
+        def evaluate(self, js, arg=None):
+            return [{"tag": "input", "type": "text", "label": "Search"},
+                    {"tag": "button", "type": "", "label": "Sign in"}]
+
+        def inner_text(self, _): return "hello"
+        def wait_for_load_state(self, *a, **k): pass
+        def wait_for_timeout(self, ms): pass
+    items, _text = main._page_snapshot(P())
+    assert [it["idx"] for it in items] == [0, 1], items
+    assert "Sign in" in items[1]["desc"], items
+
+
+@check("a job stops when the caller hangs up")
+def _():
+    """A Target job was still running twenty minutes after the call ended,
+    spending browser time and model calls on an answer nobody would hear."""
+    assert "/jobs/cancel_for_call" in {r.path for r in main.app.routes}
+    src = open("main.py", encoding="utf-8").read()
+    for fn in ("_run_browse", "_run_checkout"):
+        body = src[src.index(f"def {fn}("):]
+        body = body[:body.index("\ndef ", 10)]
+        assert '"cancelled"' in body, f"{fn} never checks for a hang-up"
+    agent_src = open("agent.py", encoding="utf-8").read()
+    assert "/jobs/cancel_for_call" in agent_src, \
+        "the agent never tells the backend the call ended"
+
+
 @check("caller country routing")
 def _():
     assert main._where_for_phone("+13476752334")[0] == "US"
