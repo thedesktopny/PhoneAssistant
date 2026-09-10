@@ -3107,6 +3107,26 @@ def _decide(goal: str, url: str, text: str, items: list, history: list,
 _TASK_CACHE = {}
 
 
+def _stuck_note(n: int) -> str:
+    """What to tell the agent when the page hasn't reacted.
+
+    Without this it repeated 'fill in the username, fill in the password'
+    twenty-four times on Target and called it a day. It has no memory that
+    an action did nothing, so it has to be told."""
+    if n == 1:
+        return "That changed nothing on the page."
+    if n == 2:
+        return ("That changed nothing again. The field may not be taking "
+                "input, or the form may need a different button - try "
+                "something else, not the same step.")
+    return ("Nothing you have tried has changed the page. Stop repeating "
+            "these steps. Either go back, try a completely different route, "
+            "or give_up and say what you could see.")
+
+
+STUCK_LIMIT = int(os.environ.get("BROWSE_STUCK_LIMIT", "4"))
+
+
 def _task_shape(goal: str) -> dict:
     """Split a goal into the KIND of task and its SUBJECT, in one call.
 
@@ -3323,6 +3343,7 @@ def _run_browse(jid: int, account_id: int, site: str):
     recorded = []          # steps with element descriptions, for the recipe
     history = []
     path_used = "agent"
+    stuck = 0              # actions in a row that changed nothing
     try:
         with sync_playwright() as p:
             browser, page, ctx_id = _open_with_session(p, account_id, site_key)
@@ -3455,6 +3476,20 @@ def _run_browse(jid: int, account_id: int, site: str):
                     history.append(f"{a} failed: {str(e)[:90]}")
                     _job_set(jid, "working", f"Retrying after: {str(e)[:80]}")
                     continue
+
+                # Did any of that actually do something?
+                after = (page_url(page), page_text(page, 200))
+                if after == (page_url(page), text[:200]) or                         after[1] == text[:200]:
+                    stuck += 1
+                    history.append(_stuck_note(stuck))
+                    if stuck >= STUCK_LIMIT:
+                        _job_set(jid, "failed",
+                                 f"The page stopped responding to anything "
+                                 f"it tried. Last screen: {text[:200]}",
+                                 reason="stuck")
+                        break
+                else:
+                    stuck = 0
 
                 shown = act.get("text", "")
                 if shown in ("SAVED_PASSWORD",):

@@ -501,6 +501,21 @@ def _():
     assert rows["calls"] >= 1, "a voice call stopped counting as one"
 
 
+@check("a page that stops responding ends the job, not 24 wasted steps")
+def _():
+    """On Target it repeated 'fill username, fill password' twenty-four
+    times and never noticed the page hadn't moved."""
+    first = main._stuck_note(1)
+    assert "changed nothing" in first, first
+    assert "not the same step" in main._stuck_note(2)
+    assert "Stop repeating" in main._stuck_note(3)
+    src = open("main.py", encoding="utf-8").read()
+    body = src[src.index("def _run_browse("):]
+    body = body[:body.index("\ndef ", 10)]
+    assert "STUCK_LIMIT" in body, "_run_browse never gives up on a dead page"
+    assert 'reason="stuck"' in body, "a stuck page needs its own reason code"
+
+
 @check("caller country routing")
 def _():
     assert main._where_for_phone("+13476752334")[0] == "US"
@@ -646,6 +661,37 @@ def _():
 
     other = agent.login_failure_line("amazon", "", "the page timed out", 0)
     assert "timed out" in other and "password" not in other, other
+
+
+@check("a username that isn't an email is questioned before it's saved")
+def _():
+    """Call 40: the caller said 'my email address is chesky163', we saved
+    'chesky163', never read it back, and then failed to sign in with it on
+    two separate calls without ever mentioning it."""
+    assert agent.username_warning("chesky163"), \
+        "a bare name was accepted as an email-style username"
+    assert agent.username_warning("chesky163@"), "a cut-off address passed"
+    assert agent.username_warning("") , "an empty username passed"
+    assert agent.username_warning("chesky163@gmail.com") == "", \
+        "a real address was wrongly questioned"
+    # and it must be raised BEFORE anything is stored
+    src = open("agent.py", encoding="utf-8").read()
+    body = src[src.index("async def save_site_login("):]
+    body = body[:body.index("\n    @function_tool")]
+    assert body.index("_login_confirmed") < body.index('backend_post("/logins"'), \
+        "save_site_login stores the login before confirming it"
+
+
+@check("a failed sign-in tells the caller which username was used")
+def _():
+    """It offered a password reset link for what was a username problem."""
+    said = agent.login_failure_line("target", "stuck", "no response", 0,
+                                    "chesky163")
+    assert "chesky163" in said and "email" in said.lower(), said
+    assert "password" not in said.split("Do NOT")[0].lower(), said
+    fine = agent.login_failure_line("target", "", "page timed out", 0,
+                                    "chesky163@gmail.com")
+    assert "chesky163@gmail.com" in fine, fine
 
 
 @check("required tools exist")

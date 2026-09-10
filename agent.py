@@ -166,7 +166,28 @@ ADDRESS_RULE = ("Only ever say an email address that appears above, copied "
                 "- never reconstruct or guess one.")
 
 
-def login_failure_line(site: str, reason: str, msg: str, fails: int) -> str:
+def username_warning(username: str) -> str:
+    """Why a saved username looks wrong, or "" if it looks fine.
+
+    A caller said "my email address is chesky163" and we saved 'chesky163'
+    - the part before the @ - then spent two calls failing to sign in with
+    it and never once mentioned it. If it isn't an email address, say so
+    before saving, not after it breaks."""
+    u = (username or "").strip()
+    if not u:
+        return "There is no username at all."
+    if "@" in u and "." in u.split("@")[-1]:
+        return ""
+    if "@" in u:
+        return (f"'{u}' has an @ but no proper domain after it, so it looks "
+                f"cut off.")
+    return (f"'{u}' has no @ in it, so it is not an email address. Most "
+            f"shops sign people in with their full email, and callers often "
+            f"say only the part before the @.")
+
+
+def login_failure_line(site: str, reason: str, msg: str, fails: int,
+                       username: str = "") -> str:
     """What to tell the model when a site sign-in fails.
 
     Kept out of the tool so it can be tested on its own. Only a real
@@ -193,7 +214,25 @@ def login_failure_line(site: str, reason: str, msg: str, fails: int) -> str:
                 f"and move on. Do NOT retry and do not ask for a password.")
     if reason == "cancelled":
         return "That was stopped because the call ended."
-    return f"It didn't work: {msg}"
+    if reason == "stuck":
+        return (f"{site} stopped responding to anything we tried. "
+                + _username_line(site, username)
+                + " Do NOT ask for the password.")
+    return f"It didn't work: {msg}. " + _username_line(site, username)
+
+
+def _username_line(site: str, username: str) -> str:
+    """Always give the caller something they can actually check."""
+    if not username:
+        return ""
+    warn = username_warning(username)
+    if warn:
+        return (f"The username saved for {site} is '{username}'. {warn} Read "
+                f"it back to them and ask whether their {site} username is "
+                f"their full email address. If it is, save_site_login again "
+                f"with the full address.")
+    return (f"The username saved for {site} is '{username}' - read it back "
+            f"and check it's right before trying anything else.")
 
 
 def _describe(i: int, m: dict) -> str:
@@ -229,6 +268,8 @@ class Assistant(Agent):
         self.order_id = None
         self.mailbox = ""
         self._mailboxes = None
+        self.job_username = ""
+        self._login_confirmed = {}
 
         # %-d is Linux-only and raises on Windows, where check.py is run
         _now = datetime.now(ZoneInfo("America/New_York"))
@@ -1125,6 +1166,13 @@ Never pick one for them silently.
             return "Couldn't start that."
         self.job_id = d.get("job_id")
         self.job_site = site
+        try:
+            rows = await backend_get("/logins", account_id=self.account_id)
+            self.job_username = next(
+                (r.get("username", "") for r in rows
+                 if (r.get("site") or "").lower() == site.lower()), "")
+        except Exception:
+            self.job_username = ""
         self._watch_job(f"signing in to {site}")
         return (f"Signing in to {site}. Tell them it takes about a minute, "
                 f"then call check_site_login.")
@@ -1151,7 +1199,8 @@ Never pick one for them silently.
             if reason == "bad_password":
                 self.site_fails[site] = self.site_fails.get(site, 0) + 1
             return login_failure_line(site, reason, msg,
-                                      self.site_fails.get(site, 0))
+                                      self.site_fails.get(site, 0),
+                                      getattr(self, "job_username", ""))
         if state == "waiting":
             return (msg + " Tell them it's queued and will start in a moment.")
         return ("Still running. Say nothing more about it - I will tell you "
@@ -1180,6 +1229,27 @@ Never pick one for them silently.
         reading the details back and getting a yes."""
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
+
+        # Confirm before storing, in code rather than in the instructions.
+        # A caller said "my email address is chesky163" and we saved the
+        # part before the @ without ever reading it back, then failed to
+        # sign in with it across two calls.
+        key = site.strip().lower()
+        if not self._login_confirmed.get(key):
+            self._login_confirmed[key] = True
+            warn = username_warning(username)
+            if warn:
+                return (f"Do not save yet. The username they gave for {site} "
+                        f"is '{username}'. {warn} Say that back to them and "
+                        f"ask plainly whether their {site} username is their "
+                        f"full email address. Then call save_site_login "
+                        f"again with whatever they confirm - the full "
+                        f"address if that's what it is, or '{username}' "
+                        f"unchanged if they're sure.")
+            return (f"Read this back before it is saved: the username is "
+                    f"'{username}'. Ask if that is right. If yes, call "
+                    f"save_site_login again unchanged; if not, call it "
+                    f"again with the correction.")
         try:
             await backend_post("/logins", {
                 "account_id": self.account_id, "site": site,
