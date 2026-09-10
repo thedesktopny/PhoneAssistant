@@ -913,6 +913,19 @@ def signed_in(page, why_for: str = "") -> tuple:
     return True, "could not tell - carrying on rather than blocking them"
 
 
+BOT_CHECK_MARKS = _re_scrub.compile(
+    r"(?i)(press and hold|prove you.re (not a robot|human)|"
+    r"verify you are (a )?human|i.m not a robot|captcha|"
+    r"unusual traffic from your|are you a robot)")
+
+
+def looks_like_bot_check(text: str) -> bool:
+    """The site is asking for a human. We do not try to get past these -
+    we stop and say so. Recognising it early also saves burning every
+    remaining step on a wall that will not move."""
+    return bool(text and BOT_CHECK_MARKS.search(text))
+
+
 def looks_signed_out(text: str) -> bool:
     """A page that shows sign-in prompts and no account name."""
     if not text:
@@ -1747,7 +1760,15 @@ def q_all(page, selector):
 
 
 def page_text(page, limit: int = 4000) -> str:
-    for _ in range(3):
+    """The visible text, trimmed INSIDE the browser. Pulling a whole shop
+    page across the network and then keeping the first 4000 characters was
+    costing seconds per step."""
+    js = ("(n) => (document.body ? document.body.innerText : '')"
+          ".replace(/\s+/g, ' ').slice(0, n)")
+    got = page_eval(page, js, limit)
+    if got:
+        return got
+    for _ in range(2):
         try:
             return " ".join((page.inner_text("body") or "").split())[:limit]
         except Exception as e:
@@ -3326,6 +3347,12 @@ def _run_browse(jid: int, account_id: int, site: str):
                              reason="cancelled")
                     break
                 items, text = _page_snapshot(page)
+                if looks_like_bot_check(text):
+                    _job_set(jid, "failed",
+                             f"{site_key} is asking for a human check that "
+                             f"we can't and shouldn't do for them.",
+                             reason="bot_check")
+                    break
                 shot = page_shot(page) if BROWSER_VISION else ""
                 act = _decide(goal, page_url(page), text, items, history,
                               hint, shot, account_id, call_id)

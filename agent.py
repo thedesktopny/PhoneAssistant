@@ -185,6 +185,14 @@ def login_failure_line(site: str, reason: str, msg: str, fails: int) -> str:
         return (f"The saved session for {site} has expired. Their login is "
                 f"still saved - do NOT ask for the password. Just call "
                 f"sign_in_to_site again.")
+    if reason == "bot_check":
+        return (f"{site} is demanding a human check - the kind where you "
+                f"press and hold a button to prove you aren't a robot. We "
+                f"don't do those. Tell them plainly that the site is "
+                f"blocking us today, offer to leave a note for the office, "
+                f"and move on. Do NOT retry and do not ask for a password.")
+    if reason == "cancelled":
+        return "That was stopped because the call ended."
     return f"It didn't work: {msg}"
 
 
@@ -1819,7 +1827,6 @@ async def entrypoint(ctx: JobContext):
             except Exception:
                 pass
 
-    ctx.add_shutdown_callback(_close)
 
     # ---------------------------------------------------------- hang up
     # Calls must not stay open. LiveKit bills by the minute and a forgotten
@@ -1953,7 +1960,10 @@ async def entrypoint(ctx: JobContext):
         except Exception as e:
             log.warning(f"usage report failed: {e}")
 
+    # usage first: shutdown has a time budget, and losing
+    # the cost of a call is worse than losing its tidy-up
     ctx.add_shutdown_callback(_report_usage)
+    ctx.add_shutdown_callback(_close)
 
     # Start the agent FIRST. Nothing above this line may prevent it.
     await session.start(room=ctx.room, agent=agent_obj)

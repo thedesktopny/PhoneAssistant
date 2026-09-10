@@ -31,8 +31,11 @@ Other useful reads: `/usage/summary?days=7`, `/browser/where`,
 - `main.py` — backend, admin panel, Gmail/Calendar, browser runners,
   ordering, costs, live log. Big. Read the section you need.
 - `agent.py` — the LiveKit voice agent and its ~45 tools.
-- `check.py` — pre-push checks. **Run before every push. Never push on a
-  failure.**
+- `check.py` — pre-push checks, offline. **Run before every push. Never
+  push on a failure.**
+- `scenarios.py` — replays real problems from real calls against the LIVE
+  backend. `check.py` proves the code holds together; this proves the
+  running system behaves. Needs `SERVICE_TOKEN` in the environment.
 - `requirements.txt`, `Procfile`.
 
 ## Rules that exist because something broke
@@ -87,7 +90,22 @@ Railway auto-deploys both services from `main` on push.
   list in Google Cloud Console.
 
 ## When David reports a failed call
-1. Pull `/events` for the window he describes.
+1. Pull `/events` for the window he describes, and `/jobs` and `/calls/<id>`.
 2. Find the first `error`/`failed` line — the later ones are consequences.
 3. Fix the cause, add a check to `check.py` if it's a new class of bug,
    run `check.py`, then give him the one-block deploy command.
+4. **Add a scenario to `scenarios.py` that fails before the fix and passes
+   after it.** David should not have to ring in and reproduce a bug by
+   hand to find out whether it is fixed. Run it after the deploy and tell
+   him the result.
+
+## Rules of thumb this codebase learned the hard way
+- Nothing DECIDES anything by reading English prose. Jobs and sign-ins
+  carry a `reason` code; the message is for people, the reason is for code.
+- No stored time is formatted by hand — everything goes through
+  `local_str()`. The database is UTC, the customer is not.
+- Nothing keeps running after the caller hangs up.
+- Ask the browser once and let it do the work, rather than asking it about
+  each element in turn.
+- A site demanding a human check (press-and-hold, captcha) is a stop, not
+  a puzzle. Say so and move on.
