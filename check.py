@@ -212,6 +212,52 @@ def _():
         < src.index("asyncio.create_task(watchdog())")
 
 
+@check("every job a tool starts is watched (the 'keep waiting?' bug)")
+def _():
+    """A tool that sets self.job_id without starting a watcher leaves the
+    model with nothing to do but poll - and it fills the silence by asking
+    the caller whether they want to keep waiting."""
+    import ast
+    tree = ast.parse(open("agent.py", encoding="utf-8").read())
+    bad = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        # a real job start, not "self.job_id = None" in __init__
+        sets_job = any(
+            isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Attribute) and t.attr == "job_id"
+                    for t in n.targets)
+            and not (isinstance(n.value, ast.Constant)
+                     and n.value.value is None)
+            for n in ast.walk(fn))
+        if not sets_job:
+            continue
+        watches = any(
+            isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            and n.func.attr in ("_watch_job", "_start_watch")
+            for n in ast.walk(fn))
+        if not watches:
+            bad.append(fn.name)
+    assert not bad, (f"starts a job but never watches it: {', '.join(bad)} "
+                     f"- add self._watch_job(...)")
+
+
+@check("no polling chatter in tool results or descriptions")
+def _():
+    """Tool text outranks the system prompt in practice. If a result says
+    'check again shortly', the model checks again and talks while it waits,
+    whatever the prompt says."""
+    src = open("agent.py", encoding="utf-8").read()
+    # note: lower-case "let me check again" is fine - the prompt quotes it
+    # as a phrase the model must NOT say.
+    banned = ["Check again", "every 15 seconds", "in a few seconds",
+              "Poll check", "poll get_site_result"]
+    found = [b for b in banned if b in src]
+    assert not found, (f"polling chatter still in agent.py: {found} - "
+                       f"say 'I will tell you when it changes' instead")
+
+
 @check("required tools exist")
 def _():
     inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
@@ -223,6 +269,12 @@ def _():
 
 
 # ------------------------------------------------------------ result
+# Windows won't delete a file that's still open, and the database pool holds
+# it - so close the pool first, or check_tmp.db is left behind every run.
+try:
+    main.engine.dispose()
+except Exception:
+    pass
 try:
     os.remove("check_tmp.db")
 except Exception:

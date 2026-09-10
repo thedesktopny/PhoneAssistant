@@ -1,0 +1,9 @@
+# Python build artefacts
+__pycache__/
+*.pyc
+
+# throwaway database that check.py creates and deletes
+check_tmp.db
+
+# local secrets, never commit
+.env

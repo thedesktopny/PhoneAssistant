@@ -194,6 +194,13 @@ processing", "let me check again", "a few more moments", or anything
 similar. I will tell you the moment anything changes, and you speak then.
 Never call a check_ or get_ tool more than once while waiting.
 
+A job taking a long time is normal and is not a reason to speak. Some take
+a minute and a half. Waiting quietly is the correct behaviour, not a
+failure — do not apologise for it, do not remark on it, and never offer to
+give up or try another way just because time has passed. If a tool result
+ever seems to invite you to check back, ignore that and follow this rule
+instead: silence until I tell you something has changed.
+
 
 PASSWORDS
 Read a password back once, character by character, and ask if it is right.
@@ -293,7 +300,7 @@ slowly, same as before. Read it back, get a yes, then save_site_login.
 - Tell them plainly it's stored encrypted and they can have it deleted any
   time by asking.
 - Right after saving, offer to check it works: sign_in_to_site. It takes a
-  minute. Poll check_site_login. If it says needs_code, the site texted or
+  minute. Call check_site_login once. If it says needs_code, the site texted or
   emailed them a code — ask for it and call submit_site_code.
 - Once a site is signed in, we stay signed in, so they won't be asked again
   every time.
@@ -314,7 +321,7 @@ PLACING AN ORDER — do it exactly like a careful person would
 5. Read the whole thing back in one go: item, quantity, price, address,
    card ending. Then ask exactly: "Should I place this order?" Wait.
 6. Only on a clear yes, call confirm_order. Tell them it takes a minute or
-   two and stay with them. Poll check_order every 15 seconds.
+   two and stay with them. Call check_order once, then wait for my update.
    - needs_input: it's asking something only they can answer — a code, or
      the total came out higher than expected. Ask them, then
      answer_website_question.
@@ -335,18 +342,19 @@ goal and, if you know it, the site.
   ready for pickup", site="cvs"
 - "How much is a snow blower at Home Depot?" -> goal="find snow blowers and
   their prices", site="homedepot"
-Then poll get_site_result. It takes 30 to 90 seconds — say what you're doing
-and stay with them. If it says needs_input, it's asking a question only they
+Then call get_site_result once. It takes 30 to 90 seconds — say what you are
+doing, then wait for my update. If it says needs_input, it's asking a question only they
 can answer, usually a code or a choice: ask them, then call
 answer_website_question.
 It never buys or pays anything. If a goal needs that, it stops and asks.
 
 USING A SIGNED-IN SITE
 - "What did I order from Walmart?" / "where's my order?" ->
-  check_site_orders, then poll get_site_result until it has an answer.
+  check_site_orders, then call get_site_result once I tell you it is done.
   It takes 20 to 40 seconds — say you're looking it up and stay with them.
 - "Does Walmart have paper towels?" / "how much is X?" ->
-  search_site with the site and what they want, then get_site_result.
+  search_site with the site and what they want, then get_site_result once
+  I tell you it is done.
 - Read prices and dates plainly. Never read a URL out loud.
 - If it says they're signed out, offer sign_in_to_site again.
 
@@ -397,7 +405,7 @@ on this call. Then:
      more accurate.
 3. Call connect_email. It takes up to a minute — tell them you're working
    on it and stay on the line.
-4. Call check_connect every 15 seconds or so. Google will ask them to prove
+4. Call check_connect once. Google will ask them to prove
    it's them. It picks the method, and there are several — just do what
    check_connect tells you:
    - needs_tap: a notification went to their phone. Tell them to unlock it,
@@ -797,7 +805,8 @@ FINDING EMAIL
     @function_tool
     @auto_report("orders")
     async def check_order(self, context: RunContext):
-        """How the order is going. Call every 15 seconds until placed."""
+        """How the order is going. Call this at most ONCE. You will be told
+        automatically when it changes."""
         if not getattr(self, "order_id", None):
             return "No order in progress."
         d = await backend_get("/orders/status", order_id=self.order_id)
@@ -812,7 +821,8 @@ FINDING EMAIL
             return "That order was cancelled."
         if "Needs the customer" in msg:
             return (msg + " Ask them, then call answer_website_question.")
-        return f"Still working: {msg}. Check again shortly."
+        return (f"Still working: {msg}. Say nothing more about it - "
+                f"I will tell you the moment it changes.")
 
     @function_tool
     @auto_report("orders")
@@ -866,7 +876,8 @@ FINDING EMAIL
         except Exception as e:
             log.error(f"answer failed: {e}")
             return "That didn't go through."
-        return "Passed it on. Check again in a few seconds."
+        return ("Passed it on. Say nothing more about it - I will tell you "
+                "when it changes.")
 
     @function_tool
     @auto_report("site_read")
@@ -886,8 +897,9 @@ FINDING EMAIL
             return "Couldn't start that."
         self.job_id = d.get("job_id")
         self.job_question = f"their recent orders on {site}"
+        self._watch_job(f"recent orders on {site}")
         return ("Looking that up. Tell them it takes about half a minute, "
-                "then call get_site_result.")
+                "then say nothing until I tell you it's done.")
 
     @function_tool
     @auto_report("site_read")
@@ -907,13 +919,15 @@ FINDING EMAIL
             return "Couldn't start that."
         self.job_id = d.get("job_id")
         self.job_question = f"{query} on {site}"
+        self._watch_job(f"searching {site} for {query}")
         return ("Searching. Tell them it takes about half a minute, then "
-                "call get_site_result.")
+                "say nothing until I tell you it's done.")
 
     @function_tool
     @auto_report("site_read")
     async def get_site_result(self, context: RunContext):
-        """What the site lookup found. Call every 15 seconds until it answers."""
+        """What the site lookup found. Call this at most ONCE. You will be
+        told automatically when it changes."""
         if not getattr(self, "job_id", None):
             return "Nothing running."
         try:
@@ -929,10 +943,12 @@ FINDING EMAIL
             return (d.get("message", "") +
                     " Ask them, then call answer_website_question.")
         if d.get("state") == "working":
-            return f"Still going: {d.get('message', '')}. Check again shortly."
+            return (f"Still going: {d.get('message', '')}. Say nothing more "
+                    f"about it - I will tell you when it changes.")
         if d.get("state") == "waiting":
             return "Queued behind another job. A moment longer."
-        return "Still loading the page. Check again shortly."
+        return ("Still loading the page. Say nothing more about it - I will "
+                "tell you when it changes.")
 
     @function_tool
     @auto_report("site_login")
@@ -1004,7 +1020,8 @@ FINDING EMAIL
         except Exception as e:
             log.error(f"job code failed: {e}")
             return "That code didn't go through."
-        return "Code sent. Check again in a few seconds."
+        return ("Code sent. Say nothing more about it - I will tell you when "
+                "it changes.")
 
     @function_tool
     @auto_report("logins")
@@ -1343,7 +1360,8 @@ FINDING EMAIL
     @function_tool
     @auto_report("signin")
     async def check_connect(self, context: RunContext):
-        """How the email sign-in is going. Call every 15 seconds or so."""
+        """How the email sign-in is going. Call this at most ONCE. You will
+        be told automatically when it changes."""
         if not getattr(self, "onboard_sid", None):
             return "No sign-in running."
         try:
@@ -1387,7 +1405,8 @@ FINDING EMAIL
             return (f"It didn't work: {msg}. Apologise, tell them you've "
                     f"left a note for the office and someone will call "
                     f"them back, then move on.")
-        return f"Still working ({state}). Keep them company and check again."
+        return (f"Still working ({state}). Stay with them, but say nothing "
+                f"more about it - I will tell you when it changes.")
 
     @function_tool
     @auto_report("signin")
