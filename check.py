@@ -377,8 +377,36 @@ def _():
                            "+1555", 1)
     names = {getattr(t, "__name__", "") for t in inst.tools}
     for t in ("connect_email", "check_email", "mark_read", "end_call",
-              "save_site_login", "sign_in_to_site", "confirm_order"):
+              "save_site_login", "sign_in_to_site", "confirm_order",
+              "recent_email"):
         assert t in names, f"tool missing: {t}"
+
+
+@check("email results keep the sender, date and read state")
+def _():
+    """These were trimmed to a display name, so when a caller asked for the
+    sender's address the model had nothing and made one up."""
+    line = agent._describe(1, {
+        "from": "Coinbase Bytes <newsletter@mail.coinbase.com>",
+        "subject": "Why are privacy tokens outperforming bitcoin?",
+        "when": "Aug 13 at 9:02 AM", "category": "Promotions",
+        "unread": True})
+    for must in ("newsletter@mail.coinbase.com", "Aug 13", "Promotions",
+                 "unread"):
+        assert must in line, f"{must!r} was dropped before the model: {line}"
+    src = open("agent.py", encoding="utf-8").read()
+    assert '.split("<")[0]' not in src, \
+        "an email tool is trimming the sender again - use _describe()"
+
+
+@check("the call record is saved (duration and PIN status)")
+def _():
+    """/calls/end was posted without the service token, so every call was
+    stored as 0 seconds and PIN 'no'."""
+    src = open("agent.py", encoding="utf-8").read()
+    i = src.index("/calls/end")
+    assert "headers=AUTH" in src[i - 200:i + 200], \
+        "/calls/end is posted without headers=AUTH - it will 401"
 
 
 # ------------------------------------------------------------ result

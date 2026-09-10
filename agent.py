@@ -157,6 +157,26 @@ def auto_report(reason: str):
     return wrap
 
 
+# Everything the backend knows about a message, handed to the model intact.
+# It used to be trimmed to a display name, so when a caller asked "what is
+# the sender's address?" the model had nothing and invented one.
+ADDRESS_RULE = ("Only ever say an email address that appears above, copied "
+                "exactly. If the caller asks for an address you were not "
+                "given, say you don't have it and offer to open the message "
+                "- never reconstruct or guess one.")
+
+
+def _describe(i: int, m: dict) -> str:
+    """One line about a message: who, when, which tab, read or not."""
+    who = (m.get("from") or "").strip() or "unknown sender"
+    when = m.get("when", "")
+    cat = m.get("category", "")
+    bits = [b for b in (when, cat if cat and cat != "Inbox" else "",
+                        "unread" if m.get("unread") else "") if b]
+    tail = f" ({', '.join(bits)})" if bits else ""
+    return f"{i}. From {who}{tail}: {m.get('subject')}"
+
+
 class Assistant(Agent):
     def __init__(self, account: dict, caller_number: str = "",
                  call_id: int | None = None, history: str = ""):
@@ -178,6 +198,7 @@ class Assistant(Agent):
         self.job_question = ""
         self.order_id = None
         self.mailbox = ""
+        self._mailboxes = None
 
         # %-d is Linux-only and raises on Windows, where check.py is run
         _now = datetime.now(ZoneInfo("America/New_York"))
@@ -463,15 +484,59 @@ LOOKING THINGS UP
   which direction, then offer to text them the address rather than reading
   turn-by-turn steps.
 
-FINDING EMAIL
-- check_email is for unread mail only.
-- To find anything else — a person, an old thread, a topic, an attachment —
-  use search_email. It searches the whole mailbox with Gmail search syntax,
-  e.g. "from:chaim", "invoice", "from:amazon after:2026/08/01".
+FINDING EMAIL — pick the right tool
+- "My last few emails", "what came in today", "what's new", "read or
+  unread, doesn't matter" -> recent_email. This is the common one.
+- "Anything new?", "any unread?" -> check_email. Unread only.
+- A person, a topic, an old thread, an attachment -> search_email, using
+  real Gmail syntax: "from:chaim", "invoice", "after:2026/08/01". Never
+  invent an operator - if you aren't sure of the syntax, use recent_email
+  and read from that instead.
 - If a search returns nothing, do not just say you found nothing. Try a
   different, broader wording once, and tell the caller what you tried.
 - To get somebody's address, use find_contact with their name.
+
+WHAT YOU KNOW ABOUT A MESSAGE
+Every message you are given comes with who it is from, when it arrived,
+which tab it landed in, and whether it is read. Say the date whenever you
+describe a message - "from Coinbase, last Tuesday" - so they can tell
+straight away if you are reading something old.
+Never say an email address, a date, or a subject you were not given. If
+they ask for something you do not have, say plainly that you do not have
+it and offer to open the message with read_email. Guessing an address is
+worse than useless: they use it to decide whether an email is genuine.
+
+WHICH MAILBOX
+If they have more than one, ask which before you read anything. The tools
+will tell you when this applies - when they do, ask the question and wait.
+Never pick one for them silently.
 """.strip())
+
+    async def _which_mailbox(self, mailbox: str = "") -> str:
+        """Returns an instruction to ask the caller which mailbox, or "" to
+        carry on. Asking is enforced here rather than left to the prompt,
+        because silently guessing looks like reading the wrong person's
+        mail."""
+        if mailbox or self.mailbox:
+            return ""
+        if self._mailboxes is None:
+            try:
+                rows = await backend_get("/mailboxes",
+                                         account_id=self.account_id)
+            except Exception:
+                self._mailboxes = []
+                return ""
+            self._mailboxes = [(r.get("label") or r.get("email") or "")
+                               for r in rows]
+            if len(rows) == 1:
+                self.mailbox = rows[0].get("email", "")
+        if len(self._mailboxes) > 1:
+            return ("They have more than one mailbox: "
+                    + ", ".join(self._mailboxes)
+                    + ". Ask which one they want, in one short question, "
+                      "then call this again passing that name as mailbox. "
+                      "Do not guess and do not read anything yet.")
+        return ""
 
     async def _watch(self, kind, fetch, describe):
         """Poll a background job and make the agent speak when it changes."""
@@ -564,6 +629,9 @@ FINDING EMAIL
         to true if they only want real inbox mail, not Promotions."""
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
+        ask = await self._which_mailbox(mailbox)
+        if ask:
+            return ask
         try:
             data = await backend_get(
                 "/test/unread", account_id=self.account_id, limit=how_many,
@@ -577,15 +645,10 @@ FINDING EMAIL
                        "check_email", backend_get.last_ms)
         lines = [f"{data.get('unread_count', 0)} unread."]
         for i, m in enumerate(self.last_list, 1):
-            sender = m.get("from", "").split("<")[0].strip().strip('"')
-            when = m.get("when", "")
-            cat = m.get("category", "")
-            tail = f" ({cat})" if cat and cat != "Inbox" else ""
-            lines.append(f"{i}. From {sender}, {when}{tail}: "
-                         f"{m.get('subject')}")
+            lines.append(_describe(i, m))
         lines.append("Say when each one arrived. If any are marked "
                      "Promotions or Updates, mention that they came from "
-                     "that tab, not the main inbox.")
+                     "that tab, not the main inbox. " + ADDRESS_RULE)
         return "\n".join(lines)
 
     @function_tool
@@ -618,6 +681,9 @@ FINDING EMAIL
         thread. Examples: 'from:chaim', 'invoice', 'from:amazon'."""
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
+        ask = await self._which_mailbox(mailbox)
+        if ask:
+            return ask
         try:
             data = await backend_get("/test/search",
                                      account_id=self.account_id,
@@ -636,8 +702,41 @@ FINDING EMAIL
                        "search_email", backend_get.last_ms)
         lines = [f"{len(msgs)} found."]
         for i, m in enumerate(msgs, 1):
-            sender = m.get("from", "").split("<")[0].strip().strip('"')
-            lines.append(f"{i}. From {sender}: {m.get('subject')}")
+            lines.append(_describe(i, m))
+        lines.append(ADDRESS_RULE)
+        return "\n".join(lines)
+
+    @function_tool
+    @auto_report("email")
+    async def recent_email(self, context: RunContext, how_many: int = 5,
+                           mailbox: str = ""):
+        """The caller's most recent emails, read AND unread, newest first.
+        Use this whenever they ask for their last few emails, what came in
+        today, or what's new - check_email only shows unread ones."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        ask = await self._which_mailbox(mailbox)
+        if ask:
+            return ask
+        try:
+            data = await backend_get("/test/search",
+                                     account_id=self.account_id,
+                                     q="in:inbox", limit=how_many,
+                                     which=mailbox or self.mailbox)
+        except Exception as e:
+            log.error(f"recent failed: {e}")
+            return "I couldn't reach the mailbox just now."
+        msgs = data.get("messages", [])
+        if not msgs:
+            return "Nothing in the inbox at all."
+        self.last_list = msgs
+        await log_turn(self.call_id, "tool", f"recent {len(msgs)}",
+                       "recent_email", backend_get.last_ms)
+        lines = [f"The {len(msgs)} most recent, newest first:"]
+        for i, m in enumerate(msgs, 1):
+            lines.append(_describe(i, m))
+        lines.append("Read them out newest first and say when each arrived. "
+                     + ADDRESS_RULE)
         return "\n".join(lines)
 
     @function_tool
@@ -1679,7 +1778,7 @@ async def entrypoint(ctx: JobContext):
         if call_id:
             try:
                 async with httpx.AsyncClient(timeout=10) as c:
-                    await c.post(f"{BACKEND}/calls/end",
+                    await c.post(f"{BACKEND}/calls/end", headers=AUTH,
                                  params={"call_id": call_id,
                                          "verified": int(agent_obj.verified)})
             except Exception:
