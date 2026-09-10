@@ -777,8 +777,17 @@ SIGNED_OUT_MARKS = _re_scrub.compile(
 
 
 def _browser_error(e) -> str:
-    """Say what an HTTP failure from Browserbase actually means."""
+    """Say what a failure during a browser job actually means. Not every
+    HTTP error comes from Browserbase - the thinking is OpenAI's."""
     t = str(e)
+    if "openai" in t.lower() or getattr(e, "_from_openai", False):
+        if "401" in t:
+            return ("OpenAI rejected the API key (401). OPENAI_API_KEY is "
+                    "missing or wrong on the BACKEND service in Railway - "
+                    "the voice agent having one is not enough.")
+        if "429" in t:
+            return "OpenAI is rate limiting or the account is out of credit."
+        return f"The thinking step failed: {t[:160]}"
     if "401" in t:
         return ("Browserbase rejected the API key (401). Check "
                 "BROWSERBASE_API_KEY and BROWSERBASE_PROJECT_ID in Railway.")
@@ -2826,33 +2835,72 @@ def _decide(goal: str, url: str, text: str, items: list, history: list,
 _TASK_CACHE = {}
 
 
-def _task_label(goal: str) -> str:
-    """Short stable label for a goal, so 'where's my order' and 'check my
-    order status' land on the same recipe."""
+def _task_shape(goal: str) -> dict:
+    """Split a goal into the KIND of task and its SUBJECT, in one call.
+
+    The kind keys the recipe, so 'where's my order' and 'check my order
+    status' share one. The subject is the part that changes between
+    callers - 'paper towels', 'milk' - and is what gets typed. Recording
+    the subject as a placeholder is what lets a search recipe be reused."""
     key = goal.strip().lower()
     if key in _TASK_CACHE:
         return _TASK_CACHE[key]
-    label = "misc"
+    out = {"label": "misc", "subject": ""}
     if OPENAI_API_KEY:
         try:
             d = _openai_chat(model=MODEL_SUMMARY, messages=[
                 {"role": "system",
-                 "content": ("Reduce the task to a short snake_case label of "
-                             "1-3 words describing the kind of task, not the "
-                             "specifics. Examples: order_status, "
-                             "product_price, account_balance, store_hours, "
-                             "prescription_ready, track_package. Reply with "
-                             "the label only.")},
+                 "content": ('Split the task into its kind and its subject. '
+                             'Reply with JSON only: {"label": "...", '
+                             '"subject": "..."}. label is a snake_case kind '
+                             'of 1-3 words describing the type of task, not '
+                             'the specifics: order_status, product_price, '
+                             'account_balance, store_hours, track_package. '
+                             'subject is the specific thing being looked '
+                             'for, or "" when the task has no variable '
+                             'subject. Examples: "find snow blowers and '
+                             'their prices" -> {"label": "product_price", '
+                             '"subject": "snow blowers"}. "where is my '
+                             'order" -> {"label": "order_status", '
+                             '"subject": ""}.')},
                 {"role": "user", "content": goal[:300]}])
             raw = (d["choices"][0]["message"].get("content") or "").strip()
-            raw = "".join(ch if ch.isalnum() or ch == "_" else "_"
-                          for ch in raw.lower()).strip("_")[:60]
-            if raw:
-                label = raw
+            raw = raw.replace("```json", "").replace("```", "").strip()
+            got = json.loads(raw)
+            label = "".join(ch if ch.isalnum() or ch == "_" else "_"
+                            for ch in str(got.get("label", "")).lower())
+            label = label.strip("_")[:60]
+            if label:
+                out = {"label": label,
+                       "subject": str(got.get("subject", ""))[:120].strip()}
         except Exception:
             pass
-    _TASK_CACHE[key] = label
-    return label
+    _TASK_CACHE[key] = out
+    return out
+
+
+def _task_label(goal: str) -> str:
+    return _task_shape(goal)["label"]
+
+
+def _recipe_value(val: str, creds: dict, subject: str) -> str:
+    """Turn a recorded placeholder back into a real value at replay time."""
+    if val == "SAVED_PASSWORD":
+        return creds.get("password", "")
+    if val == "SAVED_USERNAME":
+        return creds.get("username", "")
+    if val == "TASK_SUBJECT":
+        return subject
+    return val
+
+
+def _as_placeholder(typed: str, subject: str) -> str:
+    """When the agent typed the subject of the task, record it as a
+    placeholder so the next caller's subject goes in instead."""
+    a, b = (typed or "").strip().lower(), (subject or "").strip().lower()
+    if len(a) >= 2 and b and (a == b or a in b or b in a):
+        return "TASK_SUBJECT"
+    return typed
 
 
 def _record_request(site, task, goal, path, outcome, seconds, jid):
@@ -2927,8 +2975,13 @@ def _match_element(items: list, desc: str):
     return None
 
 
-def _replay_recipe(page, steps: list, creds: dict, log_fn):
+def _replay_recipe(page, steps: list, creds: dict, log_fn,
+                   subject: str = ""):
     """Run recorded steps without the model. Returns (ok, answer_text)."""
+    needs = any(st.get("text") == "TASK_SUBJECT" for st in steps)
+    if needs and not subject:
+        log_fn("saved steps need a subject and this task has none")
+        return False, ""
     for i, st in enumerate(steps):
         a = st.get("action")
         try:
@@ -2942,11 +2995,7 @@ def _replay_recipe(page, steps: list, creds: dict, log_fn):
                 if a == "click":
                     do_click(page, el)
                 else:
-                    val = st.get("text", "")
-                    if val == "SAVED_PASSWORD":
-                        val = creds.get("password", "")
-                    elif val == "SAVED_USERNAME":
-                        val = creds.get("username", "")
+                    val = _recipe_value(st.get("text", ""), creds, subject)
                     do_fill(page, el, val, bool(st.get("enter")))
             elif a == "goto":
                 do_goto(page, st["url"])
@@ -2980,7 +3029,10 @@ def _run_browse(jid: int, account_id: int, site: str):
     # a sign-in plus a lookup does not fit in twelve
     max_steps = int(payload.get("max_steps", 24))
     site_key = site or "generic"
-    task = _task_label(goal)
+    shape = _task_shape(goal)
+    task = shape["label"]
+    # the part that changes between callers, e.g. "paper towels"
+    subject = (payload.get("query") or shape["subject"] or "").strip()
     t0 = time.time()
 
     creds = use_site_login(account_id, site, purpose=f"job {jid} browse") \
@@ -3011,7 +3063,7 @@ def _run_browse(jid: int, account_id: int, site: str):
                 _job_set(jid, "working",
                          f"Using what worked before for {task}.")
                 ok, text = _replay_recipe(page, recipe["steps"], creds,
-                                          log_fn)
+                                          log_fn, subject)
                 if ok and text:
                     answer = _summarise_page(text, goal)
                     if is_blocked(answer):
@@ -3084,15 +3136,12 @@ def _run_browse(jid: int, account_id: int, site: str):
                     elif a == "type":
                         it = items[int(act["index"])]
                         val = act.get("text", "")
-                        real = val
-                        if val == "SAVED_PASSWORD":
-                            real = creds.get("password", "")
-                        elif val == "SAVED_USERNAME":
-                            real = creds.get("username", "")
+                        real = _recipe_value(val, creds, subject)
                         do_fill(page, it["el"], real,
                                 bool(act.get("enter")))
+                        # store what it meant, not what it said
                         recorded.append({"action": "type", "desc": it["desc"],
-                                         "text": val,
+                                         "text": _as_placeholder(val, subject),
                                          "enter": bool(act.get("enter"))})
                     elif a == "goto":
                         do_goto(page, act["url"])
@@ -3754,8 +3803,19 @@ def _openai_chat(messages: list, tools=None, model: str = "",
         data=json.dumps(payload).encode(),
         headers={"Authorization": f"Bearer {OPENAI_API_KEY}",
                  "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=90) as r:
-        data = json.loads(r.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=90) as r:
+            data = json.loads(r.read().decode())
+    except Exception as e:
+        # Mark it, so a browser job doesn't report this as a Browserbase
+        # fault, and shout - a bad key here silently breaks every job.
+        try:
+            e._from_openai = True
+        except Exception:
+            pass
+        emit("openai", "chat", f"{payload['model']} call failed: "
+                               f"{str(e)[:180]}", "error", account_id)
+        raise
 
     # Until now these tokens were never counted anywhere.
     try:
@@ -4787,6 +4847,8 @@ def models_list(request: Request):
     out = {"in_use": {"browser": MODEL_BROWSER, "summary": MODEL_SUMMARY,
                       "text": MODEL_TEXT,
                       "browser_sees_pictures": BROWSER_VISION},
+           "openai_key_set_on_backend": bool(OPENAI_API_KEY),
+           "openai_key_length": len(OPENAI_API_KEY),
            "rates_per_million": {"browser_in": RATES["brain_in"],
                                  "browser_out": RATES["brain_out"]}}
     try:

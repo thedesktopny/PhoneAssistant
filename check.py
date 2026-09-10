@@ -199,6 +199,37 @@ def _():
         f"no browser-brain line in the breakdown: {d}"
 
 
+@check("a learned search is reusable for a different subject")
+def _():
+    """Recipes used to bake the typed words in, so the recipe for
+    'search for paper towels' typed 'paper towels' at the next caller who
+    asked for milk."""
+    creds = {"username": "u", "password": "p"}
+    # what gets written down when the agent types the task's subject
+    assert main._as_placeholder("paper towels", "paper towels") == \
+        "TASK_SUBJECT"
+    assert main._as_placeholder("towels", "paper towels") == "TASK_SUBJECT"
+    # anything that isn't the subject is kept literally
+    assert main._as_placeholder("14 Elm St", "paper towels") == "14 Elm St"
+    # and it comes back as the NEXT caller's subject
+    assert main._recipe_value("TASK_SUBJECT", creds, "milk") == "milk"
+    assert main._recipe_value("SAVED_PASSWORD", creds, "milk") == "p"
+    assert main._recipe_value("nothing special", creds, "milk") == \
+        "nothing special"
+
+
+@check("an OpenAI failure isn't blamed on Browserbase")
+def _():
+    """A bad OPENAI_API_KEY on the backend broke every browser job while
+    the log said Browserbase had rejected the key."""
+    e = Exception("HTTP Error 401: Unauthorized")
+    e._from_openai = True
+    said = main._browser_error(e)
+    assert "OpenAI" in said and "BACKEND" in said, said
+    plain = main._browser_error(Exception("HTTP Error 401: Unauthorized"))
+    assert "Browserbase" in plain, plain
+
+
 @check("caller country routing")
 def _():
     assert main._where_for_phone("+13476752334")[0] == "US"
