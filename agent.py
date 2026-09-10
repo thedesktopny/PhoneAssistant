@@ -166,6 +166,28 @@ ADDRESS_RULE = ("Only ever say an email address that appears above, copied "
                 "- never reconstruct or guess one.")
 
 
+def login_failure_line(site: str, reason: str, msg: str, fails: int) -> str:
+    """What to tell the model when a site sign-in fails.
+
+    Kept out of the tool so it can be tested on its own. Only a real
+    rejection by the site asks the caller for their password again - this
+    used to fire on any message containing the word "password", including
+    "there is still a password box on the page", which means the session
+    expired and the saved password is perfectly good."""
+    if reason == "bad_password":
+        if fails >= 2:
+            return (f"{site} rejected the password twice. Do NOT ask for it "
+                    f"again. Offer two choices: text them a link so they can "
+                    f"type it themselves, or have the office call them back.")
+        return (f"{site} says the password is wrong. Ask them to say it once "
+                f"more, slowly. This is the last spoken attempt.")
+    if reason == "signed_out":
+        return (f"The saved session for {site} has expired. Their login is "
+                f"still saved - do NOT ask for the password. Just call "
+                f"sign_in_to_site again.")
+    return f"It didn't work: {msg}"
+
+
 def _describe(i: int, m: dict) -> str:
     """One line about a message: who, when, which tab, read or not."""
     who = (m.get("from") or "").strip() or "unknown sender"
@@ -329,6 +351,9 @@ slowly, same as before. Read it back, get a yes, then save_site_login.
 - "Forget my Amazon login" -> forget_site_login.
 - Tell them plainly it's stored encrypted and they can have it deleted any
   time by asking.
+- A saved login STAYS saved. Never tell them you don't keep it or that they
+  have to give it again - you can always sign in again with what is stored.
+  Only ask for a password again if the site itself rejected it.
 - Right after saving, offer to check it works: sign_in_to_site. It takes a
   minute. Call check_site_login once. If it says needs_code, the site texted or
   emailed them a code — ask for it and call submit_site_code.
@@ -585,6 +610,7 @@ Never pick one for them silently.
 
         def describe(d):
             st, msg = d.get("state", ""), d.get("message", "")
+            kind = d.get("kind", "")
             if st == "needs_code":
                 return f"{msg} Ask them for it."
             if st == "needs_input":
@@ -592,14 +618,21 @@ Never pick one for them silently.
             if st == "waiting":
                 return "Say it's queued and will start in a moment."
             if st == "done":
+                if kind == "site_login":
+                    return ("Say they are signed in now, then start what "
+                            "they originally asked for again. Do not ask "
+                            "get_site_result about the sign-in itself.")
                 return ("Say it's done, then get the details with "
-                        "get_site_result or check_site_login.")
+                        "get_site_result.")
             if st == "failed":
-                if "not signed in" in msg.lower() or \
-                        "signed-out" in msg.lower():
+                if d.get("reason") == "signed_out":
                     return ("Tell them the saved session has expired and "
-                            "offer to sign in again now. Then call "
-                            "sign_in_to_site.")
+                            "that you'll sign in again with the login they "
+                            "already gave you - do not ask for a password. "
+                            "Then call sign_in_to_site.")
+                if d.get("reason") == "bad_password":
+                    return (f"Say the site didn't accept the password: "
+                            f"{msg}")
                 return f"Say it didn't work: {msg}."
             return None
 
@@ -1100,24 +1133,17 @@ Never pick one for them silently.
         except Exception:
             return "Couldn't check just now."
         state, msg = d.get("state", ""), d.get("message", "")
+        reason = d.get("reason", "")
         if state == "needs_code":
             return msg + " Ask for it, then call submit_site_code."
         if state == "done":
             return f"Done. {msg}"
         if state == "failed":
             site = getattr(self, "job_site", "") or "the site"
-            self.site_fails[site] = self.site_fails.get(site, 0) + 1
-            if "password is incorrect" in msg.lower() or \
-                    "password" in msg.lower():
-                if self.site_fails[site] >= 2:
-                    return (f"{site} rejected the password twice. Do NOT ask "
-                            f"for it again. Offer two choices: text them a "
-                            f"link so they can type it themselves, or have "
-                            f"the office call them back.")
-                return (f"{site} says the password is wrong. Ask them to say "
-                        f"it once more, slowly. This is the last spoken "
-                        f"attempt.")
-            return f"It didn't work: {msg}"
+            if reason == "bad_password":
+                self.site_fails[site] = self.site_fails.get(site, 0) + 1
+            return login_failure_line(site, reason, msg,
+                                      self.site_fails.get(site, 0))
         if state == "waiting":
             return (msg + " Tell them it's queued and will start in a moment.")
         return ("Still running. Say nothing more about it - I will tell you "

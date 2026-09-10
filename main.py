@@ -241,6 +241,10 @@ class Job(Base):
     payload = Column(Text, default="{}")
     state = Column(String(30), default="queued")
     message = Column(Text, default="")
+    # why it ended, as a fixed word rather than English prose: bad_password,
+    # signed_out, needs_code, ... Anything that has to DECIDE something
+    # reads this, never the message.
+    reason = Column(String(40), default="")
     history = Column(Text, default="")
     at = Column(DateTime, default=datetime.utcnow)
     done_at = Column(DateTime, nullable=True)
@@ -389,6 +393,9 @@ def _ensure_columns():
         "usage": [
             ("brain_in", "INTEGER DEFAULT 0"),
             ("brain_out", "INTEGER DEFAULT 0"),
+        ],
+        "jobs": [
+            ("reason", "VARCHAR(40) DEFAULT ''"),
         ],
     }
     # Each ALTER gets its own transaction: in Postgres one failure aborts
@@ -1596,28 +1603,47 @@ def _bb_session(context_id: str = "", country: str = "",
         geo["state"] = state
     if city:
         geo["city"] = city
-    body = {
-        "projectId": BROWSERBASE_PROJECT_ID,
-        "proxies": [{"type": "browserbase", "geolocation": geo}],
-    }
+    body = {"projectId": BROWSERBASE_PROJECT_ID}
     if context_id:
         body["browserSettings"] = {"context": {"id": context_id,
                                                "persist": True}}
-    try:
-        req = urllib.request.Request(
-            "https://api.browserbase.com/v1/sessions",
-            data=json.dumps(body).encode(),
-            headers={"X-BB-API-Key": BROWSERBASE_API_KEY,
-                     "Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=25) as r:
-            return json.loads(r.read().decode()).get("id", "")
-    except Exception as e:
-        detail = str(e)[:300]
-        if "402" in detail or "Payment Required" in detail:
-            _flag_proxy_unavailable(country)
-        else:
+
+    # The SAME call asks for the proxy and creates the session that keeps
+    # the customer logged in. Asking for a proxy we don't have used to fail
+    # the whole call, so we lost the session too - and every job started
+    # logged out, making the site demand a fresh code every single time.
+    # Proxies are a nice-to-have; staying signed in is not.
+    with_proxy = dict(body)
+    with_proxy["proxies"] = [{"type": "browserbase", "geolocation": geo}]
+    attempts = [(True, with_proxy), (False, body)]
+    if PROXY_STATUS.get("proxies_enabled") is False:
+        attempts = [(False, body)]          # already known, don't waste a call
+
+    for wants_proxy, payload in attempts:
+        try:
+            req = urllib.request.Request(
+                "https://api.browserbase.com/v1/sessions",
+                data=json.dumps(payload).encode(),
+                headers={"X-BB-API-Key": BROWSERBASE_API_KEY,
+                         "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=25) as r:
+                sid = json.loads(r.read().decode()).get("id", "")
+            if sid:
+                PROXY_STATUS.update({"proxies_enabled": wants_proxy,
+                                     "checked": datetime.utcnow(),
+                                     "note": "" if wants_proxy else
+                                     "running without a proxy so the "
+                                     "signed-in session survives"})
+                return sid
+        except Exception as e:
+            detail = str(e)[:300]
+            if wants_proxy and ("402" in detail
+                                or "Payment Required" in detail):
+                _flag_proxy_unavailable(country)
+                continue        # keep the session, drop the proxy
             _flag_proxy_fallback(f"{detail} (wanted {country})")
-        return ""
+            return ""
+    return ""
 
 
 def _bb_connect_url(context_id: str = "", account_id=None,
@@ -1630,10 +1656,13 @@ def _bb_connect_url(context_id: str = "", account_id=None,
         country, state, city = _where_for_account(account_id)
     sid = _bb_session(context_id, country, state, city)
     if sid:
-        PROXY_STATUS.update({"proxies_enabled": True,
-                             "checked": datetime.utcnow(), "note": ""})
-        emit("browser", "proxy", f"browsing from {country}"
-                                 f"{'/' + state if state else ''}",
+        # _bb_session records whether a proxy was actually granted - don't
+        # overwrite it here, or the status page reports proxies that the
+        # plan never gave us.
+        emit("browser", "proxy",
+             f"browsing from {country}{'/' + state if state else ''}"
+             f"{'' if PROXY_STATUS.get('proxies_enabled') else ' (no proxy)'}"
+             f"{', session kept' if context_id else ''}",
              "info", account_id)
         return (f"wss://connect.browserbase.com?apiKey={BROWSERBASE_API_KEY}"
                 f"&sessionId={sid}")
@@ -2467,7 +2496,7 @@ _waiting = 0
 _JOB_STARTED = {}
 
 
-def _job_set(jid: int, state: str, message: str = ""):
+def _job_set(jid: int, state: str, message: str = "", reason: str = ""):
     if state in ("opening", "signing_in") and jid not in _JOB_STARTED:
         _JOB_STARTED[jid] = time.time()
     if state in ("done", "failed") and jid in _JOB_STARTED:
@@ -2488,6 +2517,7 @@ def _job_set(jid: int, state: str, message: str = ""):
     if row:
         row.state = state
         row.message = message[:500]
+        row.reason = reason[:40]
         stamp = datetime.utcnow().strftime("%H:%M:%S")
         row.history = ((row.history or "") +
                        f"[{stamp}] {state}: {message[:300]}\n")[-6000:]
@@ -2658,6 +2688,16 @@ def _run_site_login(jid: int, account_id: int, site: str):
                     return
 
             settle(page, 3000)
+            screen = page_text(page, 1500)
+            if _re_scrub.search(r"(?i)(password is incorrect|wrong password|"
+                                r"incorrect password|password you entered)",
+                                screen or ""):
+                _job_set(jid, "failed",
+                         f"{site.title()} says the password is wrong.",
+                         reason="bad_password")
+                browser.close()
+                return
+
             ok, why = signed_in(page, f"{site} sign-in")
             if ok:
                 if ctx_id:
@@ -2730,7 +2770,8 @@ def _run_site_orders(jid: int, account_id: int, site: str):
                      "warn")
                 _job_set(jid, "failed",
                          f"Not signed in to {site} - {why}. The saved "
-                         f"session has expired. Sign in again first.")
+                         f"session has expired. Sign in again first.",
+                         reason="signed_out")
                 browser.close()
                 return
             _job_set(jid, "done", page_text(page, 1800))
@@ -4713,6 +4754,13 @@ def job_answer(request: Request, job_id: int, question: str = ""):
         return {"state": row.state, "message": row.message}
     if row.kind == "browse":
         return {"state": "done", "answer": row.message}
+    if row.kind == "site_login":
+        # Summarising "signed in and saved the session" against "what were
+        # my recent orders" produced "I couldn't find any order details" -
+        # right after a sign-in that had just worked.
+        return {"state": "done",
+                "answer": ("They are signed in now. Say so, then start what "
+                           "they originally asked for again.")}
     asked = question or ("their recent orders" if row.kind == "site_orders"
                          else "the search results")
     answer = _summarise_page(row.message or "", asked)
@@ -4756,7 +4804,7 @@ def job_status(request: Request, job_id: int):
         raise HTTPException(404, "Unknown job.")
     return {"job_id": row.id, "kind": row.kind, "site": row.site,
             "state": row.state, "message": row.message,
-            "history": row.history or ""}
+            "reason": row.reason or "", "history": row.history or ""}
 
 
 @app.get("/jobs/health")

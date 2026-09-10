@@ -318,6 +318,57 @@ def _():
         main.OPENAI_API_KEY = key
 
 
+@check("losing the proxy doesn't also lose the signed-in session")
+def _():
+    """One API call asks for the proxy AND creates the session that keeps
+    the customer logged in. A 402 for the proxy used to fail both, so every
+    job started logged out and the site demanded a new code each time."""
+    import json
+    seen = []
+
+    class Fake:
+        def __init__(self, body):
+            self.body = json.loads(body.decode())
+
+        def read(self):
+            return b'{"id": "sess_kept"}'
+
+        def __enter__(self):
+            seen.append("proxies" in self.body)
+            if "proxies" in self.body:
+                raise Exception("HTTP Error 402: Payment Required")
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    real_open, real_key = main.urllib.request.urlopen, main.BROWSERBASE_API_KEY
+    main.BROWSERBASE_API_KEY = "test"
+    main.PROXY_STATUS["proxies_enabled"] = None
+    main.urllib.request.urlopen = lambda req, timeout=0: Fake(req.data)
+    try:
+        sid = main._bb_session("ctx_abc", "US", "NY", "")
+    finally:
+        main.urllib.request.urlopen = real_open
+        main.BROWSERBASE_API_KEY = real_key
+    assert sid == "sess_kept", "gave up on the session when the proxy failed"
+    assert seen == [True, False], f"expected a retry without proxies: {seen}"
+    assert main.PROXY_STATUS["proxies_enabled"] is False, \
+        "claimed a proxy the plan never granted"
+
+
+@check("a finished sign-in isn't read back as the answer to a lookup")
+def _():
+    """'Signed in and saved the session' summarised against 'what were my
+    recent orders' came out as 'I couldn't find any order details'."""
+
+    src = open("main.py", encoding="utf-8").read()
+    i = src.index("def job_answer(")
+    body = src[i:src.index("\n@app.", i + 10)]
+    assert 'row.kind == "site_login"' in body, \
+        "job_answer still summarises a sign-in as if it were a lookup"
+
+
 @check("caller country routing")
 def _():
     assert main._where_for_phone("+13476752334")[0] == "US"
@@ -439,6 +490,30 @@ def _():
     assert "RealtimeModel(model=REALTIME_MODEL" in src, \
         "the voice model is hard-coded again - use REALTIME_MODEL"
     assert agent.REALTIME_MODEL, "REALTIME_MODEL is empty"
+
+
+@check("an expired session doesn't make it ask for the password again")
+def _():
+    """The agent decided by looking for the word 'password' anywhere in the
+    failure text. 'There is still a password box on the page' means the
+    session expired - and it asked the customer to read their password out
+    for no reason."""
+    stale = agent.login_failure_line(
+        "amazon", "signed_out",
+        "Not signed in to amazon - there is still a password box on the "
+        "page.", 0)
+    assert "do NOT ask for the password" in stale, stale
+    assert "say it once more" not in stale, stale
+
+    wrong = agent.login_failure_line(
+        "amazon", "bad_password", "Amazon says the password is wrong.", 1)
+    assert "password is wrong" in wrong, wrong
+    twice = agent.login_failure_line(
+        "amazon", "bad_password", "Amazon says the password is wrong.", 2)
+    assert "Do NOT ask for it again" in twice, twice
+
+    other = agent.login_failure_line("amazon", "", "the page timed out", 0)
+    assert "timed out" in other and "password" not in other, other
 
 
 @check("required tools exist")
