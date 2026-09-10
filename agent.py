@@ -62,9 +62,10 @@ class BackendError(Exception):
     pass
 
 
-async def backend_post(path: str, payload: dict):
+async def backend_post(path: str, payload: dict, params: dict = None):
     async with httpx.AsyncClient(timeout=20) as c:
-        r = await c.post(f"{BACKEND}{path}", json=payload, headers=AUTH)
+        r = await c.post(f"{BACKEND}{path}", json=payload, headers=AUTH,
+                         params=params or None)
         if r.status_code >= 400:
             raise BackendError(f"{path} -> {r.status_code} "
                                f"{r.text[:300]}")
@@ -159,8 +160,12 @@ class Assistant(Agent):
         self.last_events = []
         self.onboard_sid = None
         self.password_confirmed = False
+        self.site_fails = {}
+        self.job_site = ""
         self.hangup_reason = ""
         self._hangup = None
+        self.site_fails = {}
+        self.job_site = ""
         self.hangup_reason = ""
         self._hangup = None
         self.job_id = None
@@ -177,6 +182,21 @@ reachable by phone and by text. This is a phone call.
 
 RECENT HISTORY (shared with their text messages — you already know this)
 {history or "Nothing recent."}
+
+
+WHILE SOMETHING IS RUNNING
+When a sign-in, search or order is running in the background, say ONE
+sentence telling them it is running, then STAY SILENT. Do not say "still
+processing", "let me check again", "a few more moments", or anything
+similar. I will tell you the moment anything changes, and you speak then.
+Never call a check_ or get_ tool more than once while waiting.
+
+
+PASSWORDS
+Read a password back once, character by character, and ask if it is right.
+If a site rejects it TWICE, stop asking for it again. Offer to text them a
+link so they can type it themselves, or offer to have the office call them
+back. Do not attempt a third spoken password.
 
 
 ENDING THE CALL
@@ -513,15 +533,16 @@ FINDING EMAIL
     @function_tool
     @auto_report("email")
     async def check_email(self, context: RunContext, how_many: int = 5,
-                          mailbox: str = ""):
+                          mailbox: str = "", primary_only: bool = False):
         """Get the caller's unread emails. Set mailbox to their name for it
-        ("work", "personal") if they have more than one."""
+        ("work", "personal") if they have more than one. Set primary_only
+        to true if they only want real inbox mail, not Promotions."""
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
         try:
             data = await backend_get(
                 "/test/unread", account_id=self.account_id, limit=how_many,
-                which=mailbox or self.mailbox)
+                which=mailbox or self.mailbox, primary_only=primary_only)
         except Exception as e:
             log.error(f"unread failed: {e}")
             return "I couldn't reach the mailbox just now."
@@ -532,7 +553,14 @@ FINDING EMAIL
         lines = [f"{data.get('unread_count', 0)} unread."]
         for i, m in enumerate(self.last_list, 1):
             sender = m.get("from", "").split("<")[0].strip().strip('"')
-            lines.append(f"{i}. From {sender}: {m.get('subject')}")
+            when = m.get("when", "")
+            cat = m.get("category", "")
+            tail = f" ({cat})" if cat and cat != "Inbox" else ""
+            lines.append(f"{i}. From {sender}, {when}{tail}: "
+                         f"{m.get('subject')}")
+        lines.append("Say when each one arrived. If any are marked "
+                     "Promotions or Updates, mention that they came from "
+                     "that tab, not the main inbox.")
         return "\n".join(lines)
 
     @function_tool
@@ -916,6 +944,7 @@ FINDING EMAIL
             log.error(f"site login failed: {e}")
             return "Couldn't start that."
         self.job_id = d.get("job_id")
+        self.job_site = site
         self._watch_job(f"signing in to {site}")
         return (f"Signing in to {site}. Tell them it takes about a minute, "
                 f"then call check_site_login.")
@@ -923,7 +952,8 @@ FINDING EMAIL
     @function_tool
     @auto_report("site_login")
     async def check_site_login(self, context: RunContext):
-        """How the site sign-in is going. Call every 15 seconds or so."""
+        """How the site sign-in is going. Call this at most ONCE. You will
+        be told automatically when it changes."""
         if not getattr(self, "job_id", None):
             return "No sign-in running."
         try:
@@ -936,10 +966,23 @@ FINDING EMAIL
         if state == "done":
             return f"Done. {msg}"
         if state == "failed":
+            site = getattr(self, "job_site", "") or "the site"
+            self.site_fails[site] = self.site_fails.get(site, 0) + 1
+            if "password is incorrect" in msg.lower() or \
+                    "password" in msg.lower():
+                if self.site_fails[site] >= 2:
+                    return (f"{site} rejected the password twice. Do NOT ask "
+                            f"for it again. Offer two choices: text them a "
+                            f"link so they can type it themselves, or have "
+                            f"the office call them back.")
+                return (f"{site} says the password is wrong. Ask them to say "
+                        f"it once more, slowly. This is the last spoken "
+                        f"attempt.")
             return f"It didn't work: {msg}"
         if state == "waiting":
             return (msg + " Tell them it's queued and will start in a moment.")
-        return f"Still working ({state}). Check again shortly."
+        return ("Still running. Say nothing more about it - I will tell you "
+                "when it changes.")
 
     @function_tool
     @auto_report("site_login")
@@ -1157,6 +1200,52 @@ FINDING EMAIL
         return "The text didn't go out. Carry on by voice instead."
 
     @function_tool
+    @auto_report("email")
+    async def mark_read(self, context: RunContext, which_ones: str = "",
+                        mailbox: str = ""):
+        """Mark messages as read. Pass which_ones as the numbers from the
+        list you just read out, like "1,3", or leave it empty and set
+        everything=true via mark_all_read instead."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        if not self.last_list:
+            return "No list loaded. Call check_email or search_email first."
+        picks = [p.strip() for p in which_ones.split(",") if p.strip()]
+        ids = []
+        for p in picks:
+            try:
+                ids.append(self.last_list[int(p) - 1]["id"])
+            except Exception:
+                pass
+        if not ids:
+            return ("Ask which of the messages they mean, by number from the "
+                    "list you read out.")
+        try:
+            d = await backend_post("/email/mark_read", {}, params={
+                "account_id": self.account_id, "msg_ids": ",".join(ids),
+                "read": True, "which": mailbox})
+        except Exception as e:
+            return f"Couldn't do that: {str(e)[:200]}"
+        return f"Marked {d.get('changed', 0)} message(s) as read. Say so."
+
+    @function_tool
+    @auto_report("email")
+    async def mark_all_read(self, context: RunContext,
+                            primary_only: bool = False, mailbox: str = ""):
+        """Mark every unread message in the inbox as read. Only call this
+        after the caller has clearly confirmed they want all of them."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            d = await backend_post("/email/mark_read", {}, params={
+                "account_id": self.account_id, "all_unread": True,
+                "primary_only": primary_only, "which": mailbox})
+        except Exception as e:
+            return f"Couldn't do that: {str(e)[:200]}"
+        return (f"Marked {d.get('marked_read', 0)} messages as read in the "
+                f"{d.get('scope', 'inbox')}. Tell them the number.")
+
+    @function_tool
     async def end_call(self, context: RunContext, reason: str = "finished"):
         """Hang up. Call this only after saying goodbye, when the caller has
         said they're done, said goodbye, or asked you to hang up."""
@@ -1176,6 +1265,13 @@ FINDING EMAIL
         character and getting a clear yes."""
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
+        low = (email or "").lower()
+        if not any(low.endswith(d) for d in
+                   ("@gmail.com", "@googlemail.com")) and "@" in low:
+            return ("This tool only connects Gmail. If they are trying to "
+                    "sign in to a shop like Amazon or Walmart, use "
+                    "save_site_login and site_login instead. Do not call "
+                    "connect_email again for this.")
         if not self.password_confirmed:
             self.password_confirmed = True
             spelled = " ".join(

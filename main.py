@@ -14,6 +14,7 @@ Endpoints:
 
 import os
 import base64
+import re as _re_scrub
 import json
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
@@ -368,13 +369,41 @@ def _ensure_columns():
 _ensure_columns()
 
 
+
+# --------------------------------------------------------------- scrubbing
+# The model sometimes writes a password into a note or a problem report.
+# Nothing that reaches storage or the live log is trusted to be clean.
+
+_SECRET_PATTERNS = [
+    _re_scrub.compile(r"(?i)\b(pass(?:word|wd|code)|pwd|pin|otp|code|secret|"
+                      r"token|cvv|card\s*number)\b\s*(?:is|:|=|was)?\s*"
+                      r"['\"]?([^\s'\",.;]{3,64})['\"]?"),
+    _re_scrub.compile(r"(?i)\bthe password\b[^.]{0,20}?['\"]([^'\"]{3,64})"
+                      r"['\"]"),
+]
+
+
+def scrub(text: str) -> str:
+    """Remove anything that looks like a credential."""
+    if not text:
+        return text
+    out = text
+    for pat in _SECRET_PATTERNS:
+        out = pat.sub(lambda m: f"{m.group(1)} [removed]", out)
+    # long runs of spelled-out characters, e.g. "capital D, e, s, k, t, o, p"
+    out = _re_scrub.sub(
+        r"(?i)(capital\s+\w\b\s*,?\s*)(?:[a-z0-9]\s*,\s*){3,}[a-z0-9]",
+        "[password removed]", out)
+    return out
+
+
 def emit(kind: str, ref: str, text: str, level: str = "info",
          account_id=None):
     """Write to the live log. Never raises."""
     try:
         db = Session()
         db.add(Event(kind=kind, ref=ref[:40], account_id=account_id,
-                     level=level, text=text[:2000]))
+                     level=level, text=scrub(text)[:2000]))
         db.commit()
         db.close()
     except Exception:
@@ -549,10 +578,39 @@ def gmail_client(account_id: int, which: str = ""):
 # ----------------------------------------------------------------- tools
 # These are the functions the voice agent will call later.
 
-def tool_unread_summary(account_id: int, limit: int = 5, which: str = "") -> dict:
+
+def _when(internal_ms) -> str:
+    """Turn Gmail's timestamp into something worth saying out loud."""
+    try:
+        t = datetime.utcfromtimestamp(int(internal_ms) / 1000)
+    except Exception:
+        return ""
+    now = datetime.utcnow()
+    delta = now - t
+    mins = int(delta.total_seconds() // 60)
+    if mins < 1:
+        return "just now"
+    if mins < 60:
+        return f"{mins} minutes ago"
+    if delta.days < 1:
+        return t.strftime("today at %-I:%M %p")
+    if delta.days < 2:
+        return t.strftime("yesterday at %-I:%M %p")
+    if delta.days < 7:
+        return t.strftime("%A at %-I:%M %p")
+    return t.strftime("%b %-d at %-I:%M %p")
+
+
+def tool_unread_summary(account_id: int, limit: int = 5, which: str = "",
+                        primary_only: bool = False) -> dict:
+    """Unread mail. primary_only skips Promotions, Social and Updates -
+    the tabs people don't think of as their real inbox."""
     svc = gmail_client(account_id, which)
+    query = "is:unread in:inbox"
+    if primary_only:
+        query += " category:primary"
     res = svc.users().messages().list(
-        userId="me", q="is:unread in:inbox", maxResults=limit).execute()
+        userId="me", q=query, maxResults=limit).execute()
     ids = [m["id"] for m in res.get("messages", [])]
 
     items = []
@@ -565,11 +623,25 @@ def tool_unread_summary(account_id: int, limit: int = 5, which: str = "") -> dic
             "id": mid,
             "from": h.get("From", ""),
             "subject": h.get("Subject", "(no subject)"),
+            "when": _when(m.get("internalDate")),
+            "category": _category(m.get("labelIds") or []),
             "snippet": m.get("snippet", "")[:200],
         })
 
     total = res.get("resultSizeEstimate", len(items))
     return {"unread_count": total, "messages": items}
+
+
+def _category(labels) -> str:
+    """Which Gmail tab a message landed in."""
+    for lab, name in (("CATEGORY_PROMOTIONS", "Promotions"),
+                      ("CATEGORY_SOCIAL", "Social"),
+                      ("CATEGORY_UPDATES", "Updates"),
+                      ("CATEGORY_FORUMS", "Forums"),
+                      ("SPAM", "Spam")):
+        if lab in labels:
+            return name
+    return "Inbox"
 
 
 def _extract_body(payload) -> str:
@@ -598,8 +670,47 @@ def tool_read_email(account_id: int, msg_id: str, which: str = "") -> dict:
         "from": h.get("From", ""),
         "subject": h.get("Subject", "(no subject)"),
         "date": h.get("Date", ""),
+        "when": _when(m.get("internalDate")),
         "body": body[:4000],
     }
+
+
+def tool_mark_read(account_id: int, msg_ids, read: bool = True,
+                   which: str = "") -> dict:
+    """Mark specific messages read or unread."""
+    svc = gmail_client(account_id, which)
+    ids = [msg_ids] if isinstance(msg_ids, str) else list(msg_ids)
+    if not ids:
+        return {"changed": 0}
+    body = ({"removeLabelIds": ["UNREAD"]} if read
+            else {"addLabelIds": ["UNREAD"]})
+    body["ids"] = ids
+    svc.users().messages().batchModify(userId="me", body=body).execute()
+    return {"changed": len(ids), "read": read}
+
+
+def tool_mark_all_read(account_id: int, which: str = "",
+                       primary_only: bool = False, limit: int = 500) -> dict:
+    """Clear the unread flag across the inbox."""
+    svc = gmail_client(account_id, which)
+    query = "is:unread in:inbox"
+    if primary_only:
+        query += " category:primary"
+    done = 0
+    while done < limit:
+        res = svc.users().messages().list(
+            userId="me", q=query, maxResults=min(500, limit - done)).execute()
+        ids = [m["id"] for m in res.get("messages", [])]
+        if not ids:
+            break
+        svc.users().messages().batchModify(
+            userId="me",
+            body={"ids": ids, "removeLabelIds": ["UNREAD"]}).execute()
+        done += len(ids)
+        if len(ids) < 500:
+            break
+    return {"marked_read": done,
+            "scope": "primary inbox" if primary_only else "whole inbox"}
 
 
 def tool_send_email(account_id: int, to: str, subject: str,
@@ -630,7 +741,9 @@ def tool_search_email(account_id: int, query: str, limit: int = 5, which: str = 
             "from": h.get("From", ""),
             "to": h.get("To", ""),
             "subject": h.get("Subject", "(no subject)"),
-            "date": h.get("Date", ""),
+            "when": _when(d.get("internalDate")),
+            "category": _category(d.get("labelIds") or []),
+            "unread": "UNREAD" in (d.get("labelIds") or []),
             "snippet": d.get("snippet", "")[:200],
         })
     return {"found": len(items), "messages": items}
@@ -3537,9 +3650,26 @@ def link_callback(request: Request):
 
 @app.get("/test/unread")
 def test_unread(request: Request, account_id: int, limit: int = 5,
-                which: str = ""):
+                which: str = "", primary_only: bool = False):
     require_auth(request)
-    return tool_unread_summary(account_id, limit, which)
+    return tool_unread_summary(account_id, limit, which, primary_only)
+
+
+@app.post("/email/mark_read")
+def email_mark_read(request: Request, account_id: int, msg_ids: str = "",
+                    read: bool = True, which: str = "",
+                    all_unread: bool = False, primary_only: bool = False):
+    """Mark one, several, or every unread message as read."""
+    require_auth(request)
+    if all_unread:
+        out = tool_mark_all_read(account_id, which, primary_only)
+        emit("email", "mark read", f"marked {out['marked_read']} read "
+                                   f"({out['scope']})", "info", account_id)
+        return out
+    ids = [i for i in msg_ids.split(",") if i.strip()]
+    if not ids:
+        raise HTTPException(400, "Give msg_ids, or set all_unread=true.")
+    return tool_mark_read(account_id, ids, read, which)
 
 
 @app.get("/test/read")
@@ -3775,6 +3905,7 @@ class TurnBody(BaseModel):
 @app.post("/calls/turn")
 def call_turn(t: TurnBody, request: Request):
     require_auth(request)
+    t.text = scrub(t.text or "")
     label = {"caller": "caller", "agent": "agent",
              "tool": t.tool or "tool", "problem": "PROBLEM"}.get(t.who, t.who)
     emit("call", f"call {t.call_id}", f"{label}: {t.text}",
@@ -4515,6 +4646,7 @@ class FollowupBody(BaseModel):
 @app.post("/followups")
 def followup_add(b: FollowupBody, request: Request):
     require_auth(request)
+    b.note = scrub(b.note or "")
     emit("followup", b.reason or "note", b.note, "warn", b.account_id)
     db = Session()
     row = Followup(account_id=b.account_id, call_id=b.call_id,
