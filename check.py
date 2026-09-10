@@ -173,6 +173,32 @@ def _():
         assert "_agent_fallback(" in body, f"{fn} has no fallback path"
 
 
+@check("the browser's model is configurable and nothing is hard-coded")
+def _():
+    src = open("main.py", encoding="utf-8").read()
+    assert '"model": "gpt' not in src, \
+        "a model name is hard-coded again - use MODEL_BROWSER/SUMMARY/TEXT"
+    assert main.MODEL_BROWSER, "MODEL_BROWSER is empty"
+    assert "/models" in {r.path for r in main.app.routes}, \
+        "/models is gone - you can't see what the account can run"
+
+
+@check("browser model tokens reach the costs page")
+def _():
+    """These were never counted before, so upgrading the model would have
+    raised the bill invisibly."""
+    from fastapi.testclient import TestClient
+    c = TestClient(main.app, raise_server_exceptions=False, base_url="https://t")
+    c.post("/admin/login", json={"password": os.environ.get(
+        "ADMIN_PASSWORD", "changeme")})
+    r = c.post("/usage", json={"call_id": 999998, "account_id": 1,
+                               "brain_in": 100000, "brain_out": 10000}).json()
+    assert r.get("cost_usd", 0) > 0, f"brain tokens priced at zero: {r}"
+    d = c.get("/usage/call?call_id=999998").json()
+    assert "browser brain" in d.get("breakdown_usd", {}), \
+        f"no browser-brain line in the breakdown: {d}"
+
+
 @check("caller country routing")
 def _():
     assert main._where_for_phone("+13476752334")[0] == "US"

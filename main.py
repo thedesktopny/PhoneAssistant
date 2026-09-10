@@ -326,6 +326,8 @@ class Usage(Base):
     cached_in = Column(Integer, default=0)
     mini_in = Column(Integer, default=0)
     mini_out = Column(Integer, default=0)
+    brain_in = Column(Integer, default=0)      # the model driving browsers
+    brain_out = Column(Integer, default=0)
     call_seconds = Column(Integer, default=0)
     browser_seconds = Column(Integer, default=0)
     searches = Column(Integer, default=0)
@@ -371,6 +373,10 @@ def _ensure_columns():
         "onboard": [
             ("history", "TEXT DEFAULT ''"),
         ],
+        "usage": [
+            ("brain_in", "INTEGER DEFAULT 0"),
+            ("brain_out", "INTEGER DEFAULT 0"),
+        ],
     }
     # Each ALTER gets its own transaction: in Postgres one failure aborts
     # the whole transaction, so batching them means later ones never run.
@@ -415,6 +421,9 @@ RATES = {
     # gpt-4o-mini text brain, per 1M tokens
     "mini_in": _rate("RATE_MINI_IN", 0.15),
     "mini_out": _rate("RATE_MINI_OUT", 0.60),
+    # the model driving the browser - change these to match MODEL_BROWSER
+    "brain_in": _rate("RATE_BRAIN_IN", 2.50),
+    "brain_out": _rate("RATE_BRAIN_OUT", 10.00),
     # per minute
     "livekit_agent_min": _rate("RATE_LIVEKIT_AGENT_MIN", 0.005),
     "livekit_sip_min": _rate("RATE_LIVEKIT_SIP_MIN", 0.004),
@@ -438,6 +447,8 @@ def price_usage(u) -> tuple:
         "cached in": u.cached_in / m * RATES["realtime_cached_in"],
         "helper model": (u.mini_in / m * RATES["mini_in"]
                          + u.mini_out / m * RATES["mini_out"]),
+        "browser brain": ((u.brain_in or 0) / m * RATES["brain_in"]
+                          + (u.brain_out or 0) / m * RATES["brain_out"]),
         "livekit": (u.call_seconds / 60.0
                     * (RATES["livekit_agent_min"]
                        + RATES["livekit_sip_min"])),
@@ -1636,6 +1647,21 @@ def do_goto(page, url: str, wait_ms: int = 3500) -> bool:
     return True
 
 
+def page_shot(page) -> str:
+    """A JPEG of what the page looks like right now, base64 encoded.
+    Returns "" if it can't be taken - never raises, never blocks a job."""
+    for _ in range(2):
+        try:
+            raw = page.screenshot(type="jpeg", quality=50, timeout=15000)
+            return _b64.b64encode(raw).decode()
+        except Exception as e:
+            if _is_nav_error(e):
+                settle(page)
+                continue
+            return ""
+    return ""
+
+
 def do_back(page, wait_ms: int = 3000) -> bool:
     """Back out of a dead end instead of getting stuck on it."""
     try:
@@ -2694,8 +2720,12 @@ def _run_site_search(jid: int, account_id: int, site: str):
 # action, and repeats. No per-site configuration.
 
 BROWSE_SYSTEM = """You are operating a web browser for someone on a phone
-call. You get the page's text and a numbered list of things you can interact
-with. Reply with ONE action as JSON and nothing else.
+call. You get the page's text, a numbered list of things you can interact
+with, and usually a picture of the page as it looks right now. Use the
+picture to see the layout - which box is the search box, where the total
+sits, what a button actually says. Act only on the numbered list; the
+picture is for understanding, the numbers are for clicking.
+Reply with ONE action as JSON and nothing else.
 
 Actions:
 {"action":"click","index":N,"why":"..."}
@@ -2759,8 +2789,19 @@ def _page_snapshot(page, limit: int = 60):
     return items, page_text(page, 4000)
 
 
+def _user_turn(msg: str, shot: str = ""):
+    """A user message, with a picture of the page attached when we have one."""
+    if not shot:
+        return {"role": "user", "content": msg}
+    return {"role": "user", "content": [
+        {"type": "text", "text": msg},
+        {"type": "image_url",
+         "image_url": {"url": f"data:image/jpeg;base64,{shot}"}}]}
+
+
 def _decide(goal: str, url: str, text: str, items: list, history: list,
-            answer_hint: str = ""):
+            answer_hint: str = "", shot: str = "", account_id=None,
+            call_id=None):
     listing = "\n".join(f"[{i}] {it['desc']}" for i, it in enumerate(items))
     steps = "\n".join(history[-8:]) or "(none yet)"
     msg = (f"GOAL: {goal}\n"
@@ -2770,7 +2811,9 @@ def _decide(goal: str, url: str, text: str, items: list, history: list,
            f"ELEMENTS:\n{listing}\n\n"
            f"PAGE TEXT:\n{text}")
     d = _openai_chat([{"role": "system", "content": BROWSE_SYSTEM},
-                      {"role": "user", "content": msg}])
+                      _user_turn(msg, shot)],
+                     model=MODEL_BROWSER, account_id=account_id,
+                     call_id=call_id, cheap=False)
     raw = (d["choices"][0]["message"].get("content") or "").strip()
     raw = raw.replace("```json", "").replace("```", "").strip()
     try:
@@ -2792,7 +2835,7 @@ def _task_label(goal: str) -> str:
     label = "misc"
     if OPENAI_API_KEY:
         try:
-            d = _openai_chat([
+            d = _openai_chat(model=MODEL_SUMMARY, messages=[
                 {"role": "system",
                  "content": ("Reduce the task to a short snake_case label of "
                              "1-3 words describing the kind of task, not the "
@@ -2929,6 +2972,7 @@ def _run_browse(jid: int, account_id: int, site: str):
     db = Session()
     row = db.query(Job).filter_by(id=jid).first()
     payload = json.loads(row.payload or "{}") if row else {}
+    call_id = row.call_id if row else None
     db.close()
     goal = payload.get("goal", "")
     start = payload.get("url") or (f"https://www.{site}.com"
@@ -2993,8 +3037,9 @@ def _run_browse(jid: int, account_id: int, site: str):
             outcome = "failed"
             for step in range(max_steps):
                 items, text = _page_snapshot(page)
+                shot = page_shot(page) if BROWSER_VISION else ""
                 act = _decide(goal, page_url(page), text, items, history,
-                              hint)
+                              hint, shot, account_id, call_id)
                 a = act.get("action")
                 why = act.get("why", "")[:120]
 
@@ -3151,6 +3196,7 @@ def _run_checkout(jid: int, account_id: int, site: str):
     card = (db.query(PaymentCard).filter_by(id=order.card_id).first()
             if order.card_id else None)
     acct = db.query(Account).filter_by(id=account_id).first()
+    order_call_id = order.call_id
     spec = {
         "site": order.site, "item": order.item, "quantity": order.quantity,
         "expected_price": order.expected_price,
@@ -3191,14 +3237,16 @@ def _run_checkout(jid: int, account_id: int, site: str):
 
     system = CHECKOUT_SYSTEM.replace("{spec}", json.dumps(spec, indent=1))
 
-    def decide(url, text, items, history):
+    def decide(url, text, items, history, shot=""):
         listing = "\n".join(f"[{i}] {it['desc']}"
                              for i, it in enumerate(items))
         msg = (f"URL: {url}\nSTEPS SO FAR:\n" +
                ("\n".join(history[-10:]) or "(none)") +
                f"\n\nELEMENTS:\n{listing}\n\nPAGE TEXT:\n{text}")
         d = _openai_chat([{"role": "system", "content": system},
-                          {"role": "user", "content": msg}])
+                          _user_turn(msg, shot)],
+                         model=MODEL_BROWSER, account_id=account_id,
+                         call_id=order_call_id, cheap=False)
         raw = (d["choices"][0]["message"].get("content") or "").strip()
         raw = raw.replace("```json", "").replace("```", "").strip()
         try:
@@ -3217,7 +3265,8 @@ def _run_checkout(jid: int, account_id: int, site: str):
 
             for step in range(30):
                 items, text = _page_snapshot(page, limit=80)
-                act = decide(page_url(page), text, items, history)
+                shot = page_shot(page) if BROWSER_VISION else ""
+                act = decide(page_url(page), text, items, history, shot)
                 a = act.get("action")
                 why = act.get("why", "")[:120]
 
@@ -3375,7 +3424,7 @@ def _summarise_page(text: str, question: str) -> str:
     if not OPENAI_API_KEY:
         return text[:600]
     try:
-        d = _openai_chat([
+        d = _openai_chat(model=MODEL_SUMMARY, messages=[
             {"role": "system",
              "content": ("You turn a scraped web page into a short answer to "
                          "be read aloud on a phone call. Two or three "
@@ -3464,6 +3513,19 @@ def _card_brand(num: str) -> str:
 # ------------------------------------------------------- text brain (SMS)
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+
+# Which model does which job. All three are Railway variables, so you can
+# change the browser's brain without a code change or a deploy.
+#   MODEL_BROWSER  decides every click on a website - the one that matters
+#   MODEL_SUMMARY  turns a finished page into a spoken sentence - easy work
+#   MODEL_TEXT     answers incoming text messages
+# GET /models lists what your OpenAI account can actually use.
+MODEL_BROWSER = os.environ.get("MODEL_BROWSER", "gpt-4o")
+MODEL_SUMMARY = os.environ.get("MODEL_SUMMARY", "gpt-4o-mini")
+MODEL_TEXT = os.environ.get("MODEL_TEXT", "gpt-4o-mini")
+# Send the browser a picture of the page as well as its text. Set to 0 to
+# go back to text only.
+BROWSER_VISION = os.environ.get("BROWSER_VISION", "1") not in ("0", "false")
 
 TEXT_TOOLS = [
     {"type": "function", "function": {
@@ -3680,8 +3742,11 @@ def _run_text_tool(account_id: int, name: str, args: dict):
     return {"error": "unknown tool"}
 
 
-def _openai_chat(messages: list, tools=None) -> dict:
-    payload = {"model": "gpt-4o-mini", "messages": messages}
+def _openai_chat(messages: list, tools=None, model: str = "",
+                 account_id=None, call_id=None, cheap: bool = True) -> dict:
+    """One chat call. 'cheap' decides which column the tokens are billed to,
+    so the Costs tab separates the browser's brain from the helpers."""
+    payload = {"model": model or MODEL_TEXT, "messages": messages}
     if tools:
         payload["tools"] = tools
     req = urllib.request.Request(
@@ -3689,8 +3754,22 @@ def _openai_chat(messages: list, tools=None) -> dict:
         data=json.dumps(payload).encode(),
         headers={"Authorization": f"Bearer {OPENAI_API_KEY}",
                  "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=40) as r:
-        return json.loads(r.read().decode())
+    with urllib.request.urlopen(req, timeout=90) as r:
+        data = json.loads(r.read().decode())
+
+    # Until now these tokens were never counted anywhere.
+    try:
+        u = data.get("usage") or {}
+        got_in = int(u.get("prompt_tokens", 0) or 0)
+        got_out = int(u.get("completion_tokens", 0) or 0)
+        if got_in or got_out:
+            fields = ({"mini_in": got_in, "mini_out": got_out} if cheap
+                      else {"brain_in": got_in, "brain_out": got_out})
+            record_usage(account_id=account_id, call_id=call_id,
+                         kind="browser", **fields)
+    except Exception:
+        pass
+    return data
 
 
 def text_brain(account_id: int, incoming: str) -> str:
@@ -3713,7 +3792,8 @@ def text_brain(account_id: int, incoming: str) -> str:
 
     for _ in range(4):
         try:
-            data = _openai_chat(msgs, TEXT_TOOLS)
+            data = _openai_chat(msgs, TEXT_TOOLS, model=MODEL_TEXT,
+                                account_id=account_id)
         except Exception as e:
             return f"Something went wrong: {str(e)[:80]}"
 
@@ -4613,6 +4693,8 @@ class UsageBody(BaseModel):
     cached_in: int = 0
     mini_in: int = 0
     mini_out: int = 0
+    brain_in: int = 0
+    brain_out: int = 0
     call_seconds: int = 0
     browser_seconds: int = 0
     searches: int = 0
@@ -4695,6 +4777,31 @@ def usage_summary(request: Request, days: int = 30):
                             per_account.items(),
                             key=lambda x: -x[1]["cost_usd"])},
     }
+
+
+@app.get("/models")
+def models_list(request: Request):
+    """What each job uses now, and what your OpenAI account can actually
+    run. Change MODEL_BROWSER in Railway to switch - no deploy needed."""
+    require_auth(request)
+    out = {"in_use": {"browser": MODEL_BROWSER, "summary": MODEL_SUMMARY,
+                      "text": MODEL_TEXT,
+                      "browser_sees_pictures": BROWSER_VISION},
+           "rates_per_million": {"browser_in": RATES["brain_in"],
+                                 "browser_out": RATES["brain_out"]}}
+    try:
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/models",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            d = json.loads(r.read().decode())
+        names = sorted(m.get("id", "") for m in d.get("data", []))
+        out["available"] = [n for n in names
+                            if n.startswith(("gpt", "o1", "o3", "o4", "chatgpt"))]
+        out["browser_model_exists"] = MODEL_BROWSER in names
+    except Exception as e:
+        out["error"] = f"could not list models: {str(e)[:200]}"
+    return out
 
 
 @app.get("/browser/proxy_status")
