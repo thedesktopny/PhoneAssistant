@@ -484,6 +484,16 @@ def price_usage(u) -> tuple:
     return round(sum(parts.values()), 6), parts
 
 
+# The fields that mean "how much" and can be added up across reports.
+# Anything not in here (call_id, account_id, kind) identifies the row and
+# must never be arithmetic.
+USAGE_COUNTERS = {
+    "audio_in", "audio_out", "text_in", "text_out", "cached_in",
+    "mini_in", "mini_out", "brain_in", "brain_out",
+    "call_seconds", "browser_seconds", "searches", "texts",
+}
+
+
 def record_usage(**kw):
     """Add or update the usage row for a call. Never raises."""
     try:
@@ -496,11 +506,19 @@ def record_usage(**kw):
                            if hasattr(Usage, k)})
             db.add(row)
         else:
+            # Add up the counters only. This used to add EVERY number,
+            # including call_id - so a second report for the same call
+            # turned call_id 41 into 82 and the whole cost of that call
+            # vanished. And kind must not flip: the browser reporting its
+            # tokens against a call must not stop it being a voice call.
             for k, v in kw.items():
-                if hasattr(Usage, k) and isinstance(v, (int, float)):
+                if not hasattr(Usage, k) or v is None:
+                    continue
+                if k in USAGE_COUNTERS and isinstance(v, (int, float)):
                     setattr(row, k, (getattr(row, k) or 0) + v)
-                elif hasattr(Usage, k) and v is not None:
-                    setattr(row, k, v)
+                elif k in ("call_id", "account_id", "kind"):
+                    if not getattr(row, k, None):
+                        setattr(row, k, v)
         db.flush()
         dollars, parts = price_usage(row)
         row.cost_cents = round(dollars * 100, 4)

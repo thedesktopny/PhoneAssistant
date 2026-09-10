@@ -36,6 +36,20 @@ LOCAL_TZ = os.environ.get("LOCAL_TZ", "America/New_York")
 RESULTS = []
 
 
+class SetupProblem(Exception):
+    """Something about how this was RUN is wrong - the token, the URL, the
+    account. Never a fault in the phone system, and never reported as one."""
+
+
+def looks_unset(token: str) -> bool:
+    """A token that was never really supplied. '<your token>' pasted from
+    an instruction counts - that wasted a real person's evening once."""
+    t = (token or "").strip()
+    return (not t or "<" in t or ">" in t or " " in t
+            or t.lower() in ("your token", "token", "changeme")
+            or len(t) < 20)
+
+
 def _tz():
     from zoneinfo import ZoneInfo
     try:
@@ -54,8 +68,14 @@ def call(path, method="GET", body=None, **params):
         url, data=data, method=method,
         headers={"Authorization": f"Bearer {TOKEN}",
                  "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        raw = r.read().decode()
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            raw = r.read().decode()
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            raise SetupProblem(
+                "the backend refused the token (401)") from None
+        raise
     return json.loads(raw) if raw else {}
 
 
@@ -69,6 +89,8 @@ def scenario(name, because):
             fn()
             print(f"  ok   {name}")
             RESULTS.append(True)
+        except SetupProblem as e:
+            stop(str(e))
         except Exception as e:
             print(f"  FAIL {name}")
             print(f"       {e}")
@@ -80,11 +102,33 @@ def scenario(name, because):
 
 import urllib.parse            # noqa: E402  (used by call())
 
+
+def stop(why: str):
+    """Nothing was tested. Say exactly that - never imply the phone system
+    is at fault when the problem is how this was run."""
+    print()
+    print(f"NOTHING WAS TESTED - {why}.")
+    print("This is about how the check was run, not about the phone system.")
+    print()
+    print("SERVICE_TOKEN must be the real token from the BACKEND service in")
+    print("Railway. For this terminal only:")
+    print('    $env:SERVICE_TOKEN = "paste-the-real-token-here"')
+    print("Or once, so every future terminal already has it:")
+    print('    setx SERVICE_TOKEN "paste-the-real-token-here"')
+    raise SystemExit(2)
+
+
 print(f"replaying real problems against {BACKEND}\n")
 
-if not TOKEN:
-    print("SERVICE_TOKEN is not set - nothing can be checked.")
-    raise SystemExit(2)
+if looks_unset(TOKEN):
+    stop(f"SERVICE_TOKEN is not a real token (got {TOKEN!r})")
+
+try:
+    call("/models")
+except SetupProblem as _e:
+    stop(str(_e))
+except Exception as _e:
+    stop(f"could not reach the backend: {str(_e)[:120]}")
 
 
 # ----------------------------------------------------------------- email
@@ -177,6 +221,23 @@ def _():
     back = call("/usage/call", call_id=probe)
     assert back.get("cost_usd", 0) > 0, f"nothing stored: {back}"
     assert "voice model in" in back.get("breakdown_usd", {}), back
+
+
+@scenario("costs: reporting twice for one call doesn't lose the call",
+          "found by running this suite twice - the second report added "
+          "call_id to itself and orphaned the whole row")
+def _():
+    probe = 990003
+    first = call("/usage", "POST",
+                 body={"call_id": probe, "account_id": ACCOUNT,
+                       "audio_in": 1000, "call_seconds": 60})
+    call("/usage", "POST", body={"call_id": probe, "account_id": ACCOUNT,
+                                 "audio_in": 1000, "call_seconds": 60})
+    back = call("/usage/call", call_id=probe)
+    assert back.get("cost_usd", 0) > 0,         f"the call disappeared after a second report: {back}"
+    assert back["tokens"]["audio_in"] >= 2000,         f"the second report was lost: {back['tokens']}"
+    assert back["minutes"] >= 2.0, f"seconds not added up: {back}"
+    assert first.get("cost_usd", 0) > 0
 
 
 @scenario("costs: the browser's model is counted separately",

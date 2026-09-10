@@ -479,6 +479,28 @@ def _():
     assert not missing, f"posted without the token: {missing}"
 
 
+@check("a second cost report doesn't destroy the first")
+def _():
+    """Merging two reports for one call added EVERY number together -
+    including call_id, so call 41 became call 82 and its cost vanished.
+    Found by running scenarios.py twice."""
+    from fastapi.testclient import TestClient
+    c = TestClient(main.app, raise_server_exceptions=False, base_url="https://t")
+    c.post("/admin/login", json={"password": os.environ.get(
+        "ADMIN_PASSWORD", "changeme")})
+    body = {"call_id": 970001, "account_id": 7, "kind": "voice",
+            "audio_in": 1000, "call_seconds": 60}
+    c.post("/usage", json=body)
+    c.post("/usage", json=dict(body, kind="browser"))
+    d = c.get("/usage/call?call_id=970001").json()
+    assert d.get("cost_usd", 0) > 0, f"the call was lost on merge: {d}"
+    assert d["tokens"]["audio_in"] == 2000, \
+        f"counters should add up: {d['tokens']}"
+    assert d["minutes"] == 2.0, f"seconds should add up: {d}"
+    rows = c.get("/usage/summary?days=1").json()
+    assert rows["calls"] >= 1, "a voice call stopped counting as one"
+
+
 @check("caller country routing")
 def _():
     assert main._where_for_phone("+13476752334")[0] == "US"
