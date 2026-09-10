@@ -375,25 +375,42 @@ _ensure_columns()
 # Nothing that reaches storage or the live log is trusted to be clean.
 
 _SECRET_PATTERNS = [
-    _re_scrub.compile(r"(?i)\b(pass(?:word|wd|code)|pwd|pin|otp|code|secret|"
-                      r"token|cvv|card\s*number)\b\s*(?:is|:|=|was)?\s*"
-                      r"['\"]?([^\s'\",.;]{3,64})['\"]?"),
-    _re_scrub.compile(r"(?i)\bthe password\b[^.]{0,20}?['\"]([^'\"]{3,64})"
-                      r"['\"]"),
+    # password: X   password is X   password = "X"
+    _re_scrub.compile(
+        r"(?i)\b(pass(?:word|wd|code)|pwd|passphrase|cvv)\b"
+        r"\s*(?:is|was|=|:)\s*['\"]?([^\s'\",.;]{3,64})['\"]?"),
+    # the password 'X'
+    _re_scrub.compile(
+        r"(?i)\b(pass(?:word|wd|code)|pwd)\b\s+['\"]([^'\"]{3,64})['\"]"),
+    # pin: 1234   pin is 1234   code = 483920
+    _re_scrub.compile(
+        r"(?i)\b(pin|otp|passcode|security code|verification code|"
+        r"one[- ]time code)\b\s*(?:is|was|=|:)\s*['\"]?(\d{3,10})"
+        r"['\"]?"),
+    # card numbers
+    _re_scrub.compile(r"\b(?:\d[ -]?){13,19}\b"),
 ]
+
+# "capital D, e, s, k, t, o, p, two, zero" — a password being spelled out
+_SPELLED = _re_scrub.compile(
+    r"(?i)\b(?:capital|uppercase|lowercase)\s+\w\b"
+    r"(?:\s*,\s*(?:capital\s+|lowercase\s+)?"
+    r"(?:[a-z0-9]|zero|one|two|three|four|five|six|seven|eight|nine|"
+    r"exclamation(?:\s+mark)?|dot|period|dash|underscore|at|hash|star)\b)"
+    r"{3,}")
 
 
 def scrub(text: str) -> str:
-    """Remove anything that looks like a credential."""
+    """Remove credentials. Deliberately narrow: it must never eat ordinary
+    words like 'before' in 'verify your PIN before we continue'."""
     if not text:
         return text
-    out = text
+    out = _SPELLED.sub("[password removed]", text)
     for pat in _SECRET_PATTERNS:
-        out = pat.sub(lambda m: f"{m.group(1)} [removed]", out)
-    # long runs of spelled-out characters, e.g. "capital D, e, s, k, t, o, p"
-    out = _re_scrub.sub(
-        r"(?i)(capital\s+\w\b\s*,?\s*)(?:[a-z0-9]\s*,\s*){3,}[a-z0-9]",
-        "[password removed]", out)
+        if pat.groups >= 2:
+            out = pat.sub(lambda m: f"{m.group(1)} [removed]", out)
+        else:
+            out = pat.sub("[number removed]", out)
     return out
 
 
@@ -630,6 +647,37 @@ def tool_unread_summary(account_id: int, limit: int = 5, which: str = "",
 
     total = res.get("resultSizeEstimate", len(items))
     return {"unread_count": total, "messages": items}
+
+
+SIGNED_OUT_MARKS = _re_scrub.compile(
+    r"(?i)(sign in or create account|sign in to do more|"
+    r"create your account|please sign in|log in to your account|"
+    r"you.re signed out|track your order status)")
+
+
+def _browser_error(e) -> str:
+    """Say what an HTTP failure from Browserbase actually means."""
+    t = str(e)
+    if "401" in t:
+        return ("Browserbase rejected the API key (401). Check "
+                "BROWSERBASE_API_KEY and BROWSERBASE_PROJECT_ID in Railway.")
+    if "402" in t:
+        return ("Browserbase says payment required (402) - the plan limit "
+                "or a paid feature. Check the Browserbase dashboard.")
+    if "429" in t:
+        return "Too many browser sessions at once. Try again in a minute."
+    if "timeout" in t.lower():
+        return "The site took too long to respond."
+    return f"Browser error: {t[:200]}"
+
+
+def looks_signed_out(text: str) -> bool:
+    """A page that shows sign-in prompts and no account name."""
+    if not text:
+        return False
+    if SIGNED_OUT_MARKS.search(text):
+        return True
+    return False
 
 
 def _category(labels) -> str:
@@ -2391,18 +2439,35 @@ def _run_site_orders(jid: int, account_id: int, site: str):
             do_goto(page, url, 5000)
 
             cfg = SITES.get(site, {})
+            body_now = page_text(page, 3000)
+            if looks_signed_out(body_now):
+                emit("job", f"job {jid}",
+                     f"{site} is signed out - signing in before reading "
+                     f"orders", "warn")
+                _job_set(jid, "failed",
+                         f"Not signed in to {site}. The saved session has "
+                         f"expired. Sign in again first.")
+                browser.close()
+                return
             if cfg.get("user_sel") and q(page, cfg["user_sel"]):
                 _job_set(jid, "failed",
                          f"Signed out of {site}. Sign in again first.")
                 browser.close()
                 return
 
-            _job_set(jid, "done", page_text(page, 1800))
+            result = page_text(page, 1800)
+            if looks_signed_out(result):
+                _job_set(jid, "failed",
+                         f"{site} showed the signed-out page, so there are "
+                         f"no orders to read. Sign in to {site} first.")
+                browser.close()
+                return
+            _job_set(jid, "done", result)
             if ctx_id:
                 _save_context(account_id, site, ctx_id)
             browser.close()
     except Exception as e:
-        _job_set(jid, "failed", f"Browser error: {str(e)[:200]}")
+        _job_set(jid, "failed", _browser_error(e))
         try:
             if browser:
                 browser.close()
@@ -2431,12 +2496,19 @@ def _run_site_search(jid: int, account_id: int, site: str):
             browser, page, ctx_id = _open_with_session(p, account_id, site)
             _job_set(jid, "opening", f"Searching {site} for {query}.")
             do_goto(page, base + urllib.parse.quote_plus(query), 5000)
-            _job_set(jid, "done", page_text(page, 1800))
+            result = page_text(page, 1800)
+            if looks_signed_out(result):
+                _job_set(jid, "failed",
+                         f"{site} showed the signed-out page, so there are "
+                         f"no orders to read. Sign in to {site} first.")
+                browser.close()
+                return
+            _job_set(jid, "done", result)
             if ctx_id:
                 _save_context(account_id, site, ctx_id)
             browser.close()
     except Exception as e:
-        _job_set(jid, "failed", f"Browser error: {str(e)[:200]}")
+        _job_set(jid, "failed", _browser_error(e))
         try:
             if browser:
                 browser.close()
@@ -2818,7 +2890,7 @@ def _run_browse(jid: int, account_id: int, site: str):
                 _save_context(account_id, site_key, ctx_id)
             browser.close()
     except Exception as e:
-        _job_set(jid, "failed", f"Browser error: {str(e)[:200]}")
+        _job_set(jid, "failed", _browser_error(e))
         _record_request(site_key, task, goal, path_used, "failed",
                         time.time() - t0, jid)
         try:

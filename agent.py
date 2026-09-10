@@ -184,6 +184,12 @@ RECENT HISTORY (shared with their text messages — you already know this)
 {history or "Nothing recent."}
 
 
+NEVER ASK THE CALLER TO WAIT
+Do not ask "would you like to keep waiting" or "should we try something
+else" while a job runs. Do not offer them a choice about waiting. Say one
+sentence when it starts, then say nothing until I give you an update.
+
+
 WHILE SOMETHING IS RUNNING
 When a sign-in, search or order is running in the background, say ONE
 sentence telling them it is running, then STAY SILENT. Do not say "still
@@ -510,6 +516,11 @@ FINDING EMAIL
                 return ("Say it's done, then get the details with "
                         "get_site_result or check_site_login.")
             if st == "failed":
+                if "not signed in" in msg.lower() or \
+                        "signed-out" in msg.lower():
+                    return ("Tell them the saved session has expired and "
+                            "offer to sign in again now. Then call "
+                            "site_login.")
                 return f"Say it didn't work: {msg}."
             return None
 
