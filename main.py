@@ -77,6 +77,19 @@ PROXY_COUNTRY = os.environ.get("PROXY_COUNTRY", "US")
 PROXY_STATE = os.environ.get("PROXY_STATE", "NY")
 PROXY_CITY = os.environ.get("PROXY_CITY", "")
 
+# The clock your customers are on. Every spoken date and time is converted
+# into this. Change it in Railway if you move markets.
+LOCAL_TZ = os.environ.get("LOCAL_TZ", "America/New_York")
+
+
+def _tz():
+    from zoneinfo import ZoneInfo
+    try:
+        return ZoneInfo(LOCAL_TZ)
+    except Exception:
+        return timezone.utc
+
+
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/calendar",
@@ -717,26 +730,34 @@ def gmail_client(account_id: int, which: str = ""):
 # These are the functions the voice agent will call later.
 
 
+def _clock(t) -> str:
+    """4:07 PM. Written out rather than %-I, which is Linux-only."""
+    return t.strftime("%I:%M %p").lstrip("0")
+
+
 def _when(internal_ms) -> str:
-    """Turn Gmail's timestamp into something worth saying out loud."""
+    """Turn Gmail's timestamp into something worth saying out loud, in the
+    CALLER'S clock. This used to format UTC as if it were local, so every
+    time the assistant said was four or five hours ahead of the customer."""
     try:
-        t = datetime.utcfromtimestamp(int(internal_ms) / 1000)
+        t = datetime.fromtimestamp(int(internal_ms) / 1000,
+                                   tz=timezone.utc).astimezone(_tz())
     except Exception:
         return ""
-    now = datetime.utcnow()
+    now = datetime.now(_tz())
     delta = now - t
     mins = int(delta.total_seconds() // 60)
     if mins < 1:
         return "just now"
     if mins < 60:
         return f"{mins} minutes ago"
-    if delta.days < 1:
-        return t.strftime("today at %-I:%M %p")
-    if delta.days < 2:
-        return t.strftime("yesterday at %-I:%M %p")
+    if t.date() == now.date():
+        return f"today at {_clock(t)}"
+    if (now.date() - t.date()).days == 1:
+        return f"yesterday at {_clock(t)}"
     if delta.days < 7:
-        return t.strftime("%A at %-I:%M %p")
-    return t.strftime("%b %-d at %-I:%M %p")
+        return f"{t:%A} at {_clock(t)}"
+    return f"{t:%b} {t.day} at {_clock(t)}"
 
 
 def tool_unread_summary(account_id: int, limit: int = 5, which: str = "",
@@ -799,6 +820,64 @@ def _browser_error(e) -> str:
     if "timeout" in t.lower():
         return "The site took too long to respond."
     return f"Browser error: {t[:200]}"
+
+
+SIGNED_IN_MARKS = _re_scrub.compile(
+    r"(?i)(deliver to|hello,\s*\w|your orders|account & lists|sign out|"
+    r"my account|order history)")
+
+
+def looks_signed_in(text: str) -> bool:
+    """Fast path only: obvious English wording that needs no thinking.
+    Never the last word - see signed_in()."""
+    if not text:
+        return False
+    return bool(SIGNED_IN_MARKS.search(text)) and not looks_signed_out(text)
+
+
+def signed_in(page, why_for: str = "") -> tuple:
+    """Is this page showing the customer their own account? Returns
+    (yes_or_no, reason).
+
+    Deliberately not a list of phrases. Word lists only ever describe the
+    shops someone has already added, in the language they added them in.
+    This works in three stages, cheapest first:
+
+      1. A password box on the page means we are still at the door.
+      2. Wording that obviously settles it either way - no model call.
+      3. Anything else: the model looks at the page, in any language.
+
+    When it genuinely cannot tell, it answers YES. Wrongly claiming a
+    session expired sends the customer through a sign-in they didn't need
+    and files a job for the office; wrongly proceeding just reads a page
+    that turns out to have nothing on it. The first mistake is worse."""
+    text = page_text(page, 1500)
+    if q(page, 'input[type="password"]'):
+        return False, "there is still a password box on the page"
+    if looks_signed_out(text):
+        return False, "the page is asking them to sign in"
+    if looks_signed_in(text):
+        return True, "the page is showing their account"
+    if not OPENAI_API_KEY or not text:
+        return True, "no clear sign either way - carrying on"
+
+    msg = (f"URL: {page_url(page)}\n\nPAGE TEXT:\n{text}\n\n"
+           f"Is this person signed in to their own account on this site?\n"
+           f"Seeing anything personal - their name, address, orders, "
+           f"balance, saved details - means yes. A sign-in, registration "
+           f"or password form means no. The page may be in any language, "
+           f"and may be a site you have never seen.\n"
+           f'Reply with JSON only: {{"signed_in": true, "why": "..."}}')
+    try:
+        d = _openai_chat(model=MODEL_BROWSER, cheap=False, messages=[
+            _user_turn(msg, page_shot(page) if BROWSER_VISION else "")])
+        got = _first_json(d["choices"][0]["message"].get("content") or "")
+        if "signed_in" in got:
+            return bool(got["signed_in"]), str(got.get("why", ""))[:160]
+    except Exception as e:
+        emit("browser", "signed_in", f"could not judge the page "
+                                     f"({why_for}): {str(e)[:120]}", "warn")
+    return True, "could not tell - carrying on rather than blocking them"
 
 
 def looks_signed_out(text: str) -> bool:
@@ -903,8 +982,13 @@ def tool_send_email(account_id: int, to: str, subject: str,
     return {"sent": True, "id": sent.get("id")}
 
 
-def tool_search_email(account_id: int, query: str, limit: int = 5, which: str = "") -> dict:
-    """Search the whole mailbox, not just unread."""
+def tool_search_email(account_id: int, query: str, limit: int = 5,
+                      which: str = "", newest_first: bool = False) -> dict:
+    """Search the whole mailbox, not just unread.
+
+    Gmail orders search results by its own relevance, which is not the same
+    as by date - asking for "the five most recent" and reading them back in
+    Gmail's order gave people a list that wasn't newest first."""
     svc = gmail_client(account_id, which)
     res = svc.users().messages().list(
         userId="me", q=query, maxResults=limit).execute()
@@ -920,10 +1004,13 @@ def tool_search_email(account_id: int, query: str, limit: int = 5, which: str = 
             "to": h.get("To", ""),
             "subject": h.get("Subject", "(no subject)"),
             "when": _when(d.get("internalDate")),
+            "at_ms": int(d.get("internalDate") or 0),
             "category": _category(d.get("labelIds") or []),
             "unread": "UNREAD" in (d.get("labelIds") or []),
             "snippet": d.get("snippet", "")[:200],
         })
+    if newest_first:
+        items.sort(key=lambda x: -x["at_ms"])
     return {"found": len(items), "messages": items}
 
 
@@ -2505,7 +2592,7 @@ def _run_site_login(jid: int, account_id: int, site: str):
             do_goto(page, cfg["login_url"], 4000)
 
             # Already signed in from a previous session?
-            if q(page, cfg["ok_sel"]):
+            if signed_in(page, f"{site} already open")[0]:
                 if ctx_id:
                     _save_context(account_id, site.lower(), ctx_id)
                 _job_set(jid, "done", f"Already signed in to {site}.")
@@ -2571,15 +2658,16 @@ def _run_site_login(jid: int, account_id: int, site: str):
                     return
 
             settle(page, 3000)
-            if q(page, cfg["ok_sel"]):
+            ok, why = signed_in(page, f"{site} sign-in")
+            if ok:
                 if ctx_id:
                     _save_context(account_id, site.lower(), ctx_id)
                 _job_set(jid, "done",
                          f"Signed in to {site} and saved the session.")
             else:
                 _job_set(jid, "failed",
-                         f"Sign-in didn't complete. "
-                         f"screen: {page_text(page, 250)}")
+                         f"Sign-in didn't complete - {why}. "
+                         f"screen: {page_text(page, 220)}")
             browser.close()
     except Exception as e:
         detail = " url=" + page_url(page)[:100] if page else ""
@@ -2636,31 +2724,16 @@ def _run_site_orders(jid: int, account_id: int, site: str):
             _job_set(jid, "opening", f"Opening {site} orders.")
             do_goto(page, url, 5000)
 
-            cfg = SITES.get(site, {})
-            body_now = page_text(page, 3000)
-            if looks_signed_out(body_now):
-                emit("job", f"job {jid}",
-                     f"{site} is signed out - signing in before reading "
-                     f"orders", "warn")
+            ok, why = signed_in(page, f"{site} orders")
+            if not ok:
+                emit("job", f"job {jid}", f"{site} is signed out - {why}",
+                     "warn")
                 _job_set(jid, "failed",
-                         f"Not signed in to {site}. The saved session has "
-                         f"expired. Sign in again first.")
+                         f"Not signed in to {site} - {why}. The saved "
+                         f"session has expired. Sign in again first.")
                 browser.close()
                 return
-            if cfg.get("user_sel") and q(page, cfg["user_sel"]):
-                _job_set(jid, "failed",
-                         f"Signed out of {site}. Sign in again first.")
-                browser.close()
-                return
-
-            result = page_text(page, 1800)
-            if looks_signed_out(result):
-                _job_set(jid, "failed",
-                         f"{site} showed the signed-out page, so there are "
-                         f"no orders to read. Sign in to {site} first.")
-                browser.close()
-                return
-            _job_set(jid, "done", result)
+            _job_set(jid, "done", page_text(page, 1800))
             if ctx_id:
                 _save_context(account_id, site, ctx_id)
             browser.close()
@@ -2704,8 +2777,8 @@ def _run_site_search(jid: int, account_id: int, site: str):
             result = page_text(page, 1800)
             if looks_signed_out(result):
                 _job_set(jid, "failed",
-                         f"{site} showed the signed-out page, so there are "
-                         f"no orders to read. Sign in to {site} first.")
+                         f"{site} wants them signed in before it will "
+                         f"search. Sign in to {site} first.")
                 browser.close()
                 return
             _job_set(jid, "done", result)
@@ -4125,9 +4198,9 @@ def test_read(request: Request, account_id: int, msg_id: str,
 
 @app.get("/test/search")
 def test_search(request: Request, account_id: int, q: str, limit: int = 5,
-                which: str = ""):
+                which: str = "", newest_first: bool = False):
     require_auth(request)
-    return tool_search_email(account_id, q, limit, which)
+    return tool_search_email(account_id, q, limit, which, newest_first)
 
 
 @app.get("/test/contact")
@@ -4657,8 +4730,18 @@ class JobCode(BaseModel):
 def job_code(b: JobCode, request: Request):
     require_auth(request)
     if b.job_id in _JOBS:
-        _JOBS[b.job_id]["code"] = "".join(
-            ch for ch in b.code if ch.isalnum())
+        # ASCII only. isalnum() is true for Chinese numerals and the like,
+        # and speech-to-text does produce those from a spoken code - we
+        # were typing them into the site verbatim.
+        clean = "".join(ch for ch in b.code
+                        if ("0" <= ch <= "9") or ("a" <= ch <= "z")
+                        or ("A" <= ch <= "Z"))
+        if not clean:
+            emit("job", f"job {b.job_id}",
+                 "the code came through unreadable - ask them to say the "
+                 "digits again, slowly", "warn")
+            return {"ok": False, "reason": "unreadable"}
+        _JOBS[b.job_id]["code"] = clean
         return {"ok": True}
     raise HTTPException(400, "That job is no longer running.")
 

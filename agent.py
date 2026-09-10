@@ -722,7 +722,8 @@ Never pick one for them silently.
             data = await backend_get("/test/search",
                                      account_id=self.account_id,
                                      q="in:inbox", limit=how_many,
-                                     which=mailbox or self.mailbox)
+                                     which=mailbox or self.mailbox,
+                                     newest_first=True)
         except Exception as e:
             log.error(f"recent failed: {e}")
             return "I couldn't reach the mailbox just now."

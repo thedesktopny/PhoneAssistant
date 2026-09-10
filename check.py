@@ -248,6 +248,76 @@ def _():
     assert main._first_json("") == {}
 
 
+@check("spoken times are the caller's clock, not UTC")
+def _():
+    """Every time the assistant ever said was 4-5 hours ahead: it formatted
+    UTC as if it were local. A 3pm email was read out as 7pm."""
+    from datetime import datetime, timedelta, timezone as _tz
+    import time as _time
+    now = datetime.now(_tz.utc)
+    two_h = now - timedelta(hours=2)
+    said = main._when(int(two_h.timestamp() * 1000))
+    want = two_h.astimezone(main._tz())
+    hour = want.strftime("%I:%M %p").lstrip("0")
+    assert hour in said, \
+        f"said {said!r}, but the caller's clock says {hour}"
+    # and the relative wording still works
+    assert "minutes ago" in main._when(
+        int((now - timedelta(minutes=5)).timestamp() * 1000))
+    assert main._when(int(now.timestamp() * 1000)) == "just now"
+    assert main._when("nonsense") == ""
+
+
+@check("a one-time code is cleaned to ASCII before it's typed in")
+def _():
+    """Speech-to-text turned a spoken code into Chinese numerals, and
+    isalnum() let them straight through to the site."""
+    from fastapi.testclient import TestClient
+    c = TestClient(main.app, raise_server_exceptions=False, base_url="https://t")
+    c.post("/admin/login", json={"password": os.environ.get(
+        "ADMIN_PASSWORD", "changeme")})
+    main._JOBS[424242] = {"code": None}
+    r = c.post("/jobs/code", json={"job_id": 424242, "code": "二九二二二六"})
+    assert r.json().get("ok") is False, "unreadable code was accepted"
+    c.post("/jobs/code", json={"job_id": 424242, "code": " 29-22 26 "})
+    assert main._JOBS[424242]["code"] == "292226", main._JOBS[424242]
+    main._JOBS.pop(424242, None)
+
+
+@check("knowing you're signed in doesn't depend on a word list")
+def _():
+    """A list of English retailer phrases only ever covers the shops
+    someone already added. signed_in() must settle the obvious cases with
+    no model call, and must never block a customer when it can't tell."""
+    class Page:
+        def __init__(self, body, pw=False, url="https://x/account"):
+            self.body, self.pw, self.url = body, pw, url
+
+        def query_selector(self, sel):
+            return "EL" if ('password' in sel and self.pw) else None
+
+        def inner_text(self, _):
+            return self.body
+
+        def wait_for_load_state(self, *a, **k): pass
+
+        def wait_for_timeout(self, ms): pass
+
+    # a password box is decisive, whatever else the page says
+    ok, why = main.signed_in(Page("Deliver to David Your Orders", pw=True))
+    assert ok is False, why
+    # obvious wording, settled without spending anything
+    assert main.signed_in(Page("Deliver to David Airmont 10952"))[0] is True
+    assert main.signed_in(Page("Sign in or create account"))[0] is False
+    # a page in a language no word list covers, and no key to ask with
+    key, main.OPENAI_API_KEY = main.OPENAI_API_KEY, ""
+    try:
+        ok, why = main.signed_in(Page("ההזמנות שלי - שלום דוד"))
+        assert ok is True, f"blocked a customer it could not read: {why}"
+    finally:
+        main.OPENAI_API_KEY = key
+
+
 @check("caller country routing")
 def _():
     assert main._where_for_phone("+13476752334")[0] == "US"
