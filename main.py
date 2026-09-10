@@ -1072,6 +1072,12 @@ def is_blocked(text: str) -> bool:
     return False
 
 
+# What a tool returns when a blocked topic comes up. The browser path has to
+# refuse exactly like web search does - the rule is not the prompt's job.
+BLOCKED_REPLY = ("BLOCKED. Say exactly: I am not allowed to talk to you "
+                 "about this. Nothing else.")
+
+
 def _search_serper(q: str) -> dict:
     payload = json.dumps({"q": q, "num": 5}).encode()
     req = urllib.request.Request(
@@ -1623,6 +1629,17 @@ def do_fill(page, el, value: str, press_enter: bool = False,
 def do_goto(page, url: str, wait_ms: int = 3500) -> bool:
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    except Exception as e:
+        if not _is_nav_error(e):
+            return False
+    settle(page, wait_ms)
+    return True
+
+
+def do_back(page, wait_ms: int = 3000) -> bool:
+    """Back out of a dead end instead of getting stuck on it."""
+    try:
+        page.go_back(wait_until="domcontentloaded", timeout=30000)
     except Exception as e:
         if not _is_nav_error(e):
             return False
@@ -2396,18 +2413,44 @@ def _new_browserbase_context() -> str:
         return ""
 
 
+def _agent_fallback(jid: int, account_id: int, site: str, goal: str,
+                    url: str = ""):
+    """No hand-written setup for this site - hand it to the general agent
+    and let it work the page out. This is what stops every new site the
+    customers ask for needing someone to configure it first."""
+    emit("job", f"job {jid}",
+         f"no saved setup for {site or 'this site'} - working it out")
+    db = Session()
+    row = db.query(Job).filter_by(id=jid).first()
+    if row:
+        payload = json.loads(row.payload or "{}")
+        payload["goal"] = goal
+        if url:
+            payload["url"] = url
+        row.payload = json.dumps(payload)
+        db.commit()
+    db.close()
+    _run_browse(jid, account_id, site)
+
+
 def _run_site_login(jid: int, account_id: int, site: str):
     """Log this customer into a site and keep the session for next time."""
     from playwright.sync_api import sync_playwright
 
-    cfg = SITES.get(site.lower())
-    if not cfg:
-        _job_set(jid, "failed", f"No setup for '{site}' yet.")
-        return
-
     creds = use_site_login(account_id, site, purpose=f"job {jid} login")
     if not creds or not creds.get("password"):
         _job_set(jid, "failed", "No saved login for that site.")
+        return
+
+    cfg = SITES.get(site.lower())
+    if not cfg:
+        # never seen this site - the agent signs in the way a person would
+        _agent_fallback(
+            jid, account_id, site,
+            f"sign in to {site} with the saved username and password, then "
+            f"confirm you are signed in by naming what you can see on the "
+            f"account page",
+            f"https://www.{site}.com")
         return
 
     ctx_id = _get_context(account_id, site.lower()) or \
@@ -2544,7 +2587,11 @@ def _run_site_orders(jid: int, account_id: int, site: str):
     from playwright.sync_api import sync_playwright
     url = ORDER_PAGES.get(site)
     if not url:
-        _job_set(jid, "failed", f"No order page known for {site}.")
+        _agent_fallback(
+            jid, account_id, site,
+            "find my recent orders and read back what was ordered, the "
+            "status of each, and the date",
+            f"https://www.{site}.com")
         return
 
     browser = page = None
@@ -2601,9 +2648,16 @@ def _run_site_search(jid: int, account_id: int, site: str):
     payload = json.loads(row.payload or "{}") if row else {}
     db.close()
     query = (payload.get("query") or "").strip()
-    base = SEARCH_PAGES.get(site)
-    if not base or not query:
+    if not query:
         _job_set(jid, "failed", "Nothing to search for.")
+        return
+    base = SEARCH_PAGES.get(site)
+    if not base:
+        _agent_fallback(
+            jid, account_id, site,
+            f"search this site for {query} and read back the best few "
+            f"matches with their prices",
+            f"https://www.{site}.com")
         return
 
     browser = page = None
@@ -2647,6 +2701,9 @@ Actions:
 {"action":"click","index":N,"why":"..."}
 {"action":"type","index":N,"text":"...","enter":true,"why":"..."}
 {"action":"goto","url":"https://...","why":"..."}
+{"action":"back","why":"..."}                         the last step led
+                                                      nowhere - go back and
+                                                      try a different way
 {"action":"scroll","why":"..."}
 {"action":"wait","why":"..."}
 {"action":"ask_user","question":"...","why":"..."}   when you need a code,
@@ -2660,7 +2717,10 @@ Rules:
 - Never buy, pay, submit an order, or send anything irreversible. If the goal
   needs that, stop with ask_user and describe exactly what you would do.
 - If the page wants a login and there are saved details, use them; if it
-  wants a one-time code, use ask_user.
+  wants a one-time code, use ask_user. Signing in is a normal step towards
+  the goal on any site - work it out from the page in front of you.
+- If a click led somewhere useless, use back rather than repeating it. If
+  the same approach has failed twice, try a different route to the goal.
 - If you can already answer the goal from the page, use done.
 - The answer field is read aloud, so keep it to two or three sentences with
   plain names, prices and dates. Never include a URL."""
@@ -2847,6 +2907,8 @@ def _replay_recipe(page, steps: list, creds: dict, log_fn):
                     do_fill(page, el, val, bool(st.get("enter")))
             elif a == "goto":
                 do_goto(page, st["url"])
+            elif a == "back":
+                do_back(page)
             elif a == "scroll":
                 page.mouse.wheel(0, 1400)
                 settle(page, 2000)
@@ -2871,7 +2933,8 @@ def _run_browse(jid: int, account_id: int, site: str):
     goal = payload.get("goal", "")
     start = payload.get("url") or (f"https://www.{site}.com"
                                    if site else "https://www.google.com")
-    max_steps = int(payload.get("max_steps", 12))
+    # a sign-in plus a lookup does not fit in twelve
+    max_steps = int(payload.get("max_steps", 24))
     site_key = site or "generic"
     task = _task_label(goal)
     t0 = time.time()
@@ -2907,6 +2970,10 @@ def _run_browse(jid: int, account_id: int, site: str):
                                           log_fn)
                 if ok and text:
                     answer = _summarise_page(text, goal)
+                    if is_blocked(answer):
+                        _job_set(jid, "done", BLOCKED_REPLY)
+                        browser.close()
+                        return
                     if answer and "nothing relevant" not in answer.lower():
                         _recipe_result(recipe["id"], True)
                         _job_set(jid, "done", answer[:1500])
@@ -2932,7 +2999,11 @@ def _run_browse(jid: int, account_id: int, site: str):
                 why = act.get("why", "")[:120]
 
                 if a == "done":
-                    _job_set(jid, "done", act.get("answer", "")[:1500])
+                    answer = act.get("answer", "")[:1500]
+                    if is_blocked(answer):
+                        _job_set(jid, "done", BLOCKED_REPLY)
+                        break
+                    _job_set(jid, "done", answer)
                     outcome = "ok"
                     if recorded:
                         _save_recipe(site_key, task, goal, recorded)
@@ -2981,6 +3052,9 @@ def _run_browse(jid: int, account_id: int, site: str):
                     elif a == "goto":
                         do_goto(page, act["url"])
                         recorded.append({"action": "goto", "url": act["url"]})
+                    elif a == "back":
+                        do_back(page)
+                        # a dead end is not worth recording as a step
                     elif a == "scroll":
                         page.mouse.wheel(0, 1400)
                         recorded.append({"action": "scroll"})
@@ -4291,6 +4365,10 @@ def job_site_orders(request: Request, account_id: int, site: str,
 def job_site_search(request: Request, account_id: int, site: str,
                     query: str, call_id: int = 0):
     require_auth(request)
+    if is_blocked(query) or is_blocked(site):
+        emit("browse", "blocked", f"refused: {query[:120]}", "warn",
+             account_id)
+        return {"blocked": True, "answer": BLOCKED_REPLY}
     if not BROWSERBASE_API_KEY:
         raise HTTPException(400, "Browserbase isn't configured.")
     return {"job_id": start_job(account_id, "site_search", site,
@@ -4303,6 +4381,11 @@ def job_browse(request: Request, account_id: int, goal: str,
                site: str = "", url: str = "", call_id: int = 0):
     """Pursue any goal on any site. No per-site setup."""
     require_auth(request)
+    # checked before anything opens a browser - a blocked topic must not be
+    # reachable just because it's on a web page rather than in a search
+    if is_blocked(goal) or is_blocked(site):
+        emit("browse", "blocked", f"refused: {goal[:120]}", "warn", account_id)
+        return {"blocked": True, "answer": BLOCKED_REPLY}
     if not BROWSERBASE_API_KEY:
         raise HTTPException(400, "Browserbase isn't configured.")
     return {"job_id": start_job(account_id, "browse", site,
@@ -4378,10 +4461,12 @@ def job_answer(request: Request, job_id: int, question: str = ""):
         return {"state": row.state, "message": row.message}
     if row.kind == "browse":
         return {"state": "done", "answer": row.message}
-    q = question or ("their recent orders" if row.kind == "site_orders"
-                     else "the search results")
-    return {"state": "done",
-            "answer": _summarise_page(row.message or "", q)}
+    asked = question or ("their recent orders" if row.kind == "site_orders"
+                         else "the search results")
+    answer = _summarise_page(row.message or "", asked)
+    if is_blocked(answer):
+        return {"state": "done", "answer": BLOCKED_REPLY}
+    return {"state": "done", "answer": answer}
 
 
 class JobCode(BaseModel):

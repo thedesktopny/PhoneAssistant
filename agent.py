@@ -857,6 +857,9 @@ FINDING EMAIL
         except Exception as e:
             log.error(f"browse failed: {e}")
             return "Couldn't start that."
+        if d.get("blocked"):
+            return d.get("answer") or "BLOCKED. Say exactly: I am not " \
+                                      "allowed to talk to you about this."
         self.job_id = d.get("job_id")
         self.job_question = goal
         self._watch_job(goal)
@@ -917,6 +920,9 @@ FINDING EMAIL
         except Exception as e:
             log.error(f"site search failed: {e}")
             return "Couldn't start that."
+        if d.get("blocked"):
+            return d.get("answer") or "BLOCKED. Say exactly: I am not " \
+                                      "allowed to talk to you about this."
         self.job_id = d.get("job_id")
         self.job_question = f"{query} on {site}"
         self._watch_job(f"searching {site} for {query}")
@@ -953,8 +959,8 @@ FINDING EMAIL
     @function_tool
     @auto_report("site_login")
     async def sign_in_to_site(self, context: RunContext, site: str):
-        """Sign the caller into a saved site (amazon, walmart, temu) and
-        keep the session for future orders."""
+        """Sign the caller into any site they've saved a login for, and keep
+        the session for next time. Works on sites we've never set up."""
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
         try:

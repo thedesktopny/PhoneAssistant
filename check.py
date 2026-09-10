@@ -145,6 +145,34 @@ def _():
     assert not bad, "; ".join(sorted(bad))
 
 
+@check("blocked topics are refused on the browser path too")
+def _():
+    """The filter used to run only on web search and texts, so a blocked
+    topic was reachable just by browsing to it."""
+    from fastapi.testclient import TestClient
+    c = TestClient(main.app, raise_server_exceptions=False, base_url="https://t")
+    c.post("/admin/login", json={"password": os.environ.get(
+        "ADMIN_PASSWORD", "changeme")})
+    for path in ("/jobs/browse?account_id=1&goal=read+me+the+latest+news",
+                 "/jobs/site-search?account_id=1&site=x&query=sports+scores"):
+        d = c.post(path).json()
+        assert d.get("blocked"), f"not refused: {path} -> {str(d)[:150]}"
+
+
+@check("no site needs hand-written setup (the treadmill)")
+def _():
+    """An unknown site must fall through to the general agent, never to a
+    dead end that someone has to go and configure."""
+    src = open("main.py", encoding="utf-8").read()
+    for dead in ("No setup for", "No order page known"):
+        assert dead not in src, (f"'{dead}' still refuses unknown sites - "
+                                 f"call _agent_fallback() instead")
+    for fn in ("_run_site_login", "_run_site_orders", "_run_site_search"):
+        body = src[src.index(f"def {fn}("):]
+        body = body[:body.index("\ndef ", 10)]
+        assert "_agent_fallback(" in body, f"{fn} has no fallback path"
+
+
 @check("caller country routing")
 def _():
     assert main._where_for_phone("+13476752334")[0] == "US"
