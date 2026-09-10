@@ -413,6 +413,72 @@ def _():
         "the agent never tells the backend the call ended"
 
 
+@check("RULE: no stored time is formatted by hand")
+def _():
+    """Everything in the database is UTC. Formatting one directly shows it
+    hours out - in the admin panel, the live log, and the history handed to
+    the model. They all go through local_str()."""
+    src = open("main.py", encoding="utf-8").read()
+    import re as _re
+    bad = _re.findall(r"\.(?:at|last_ok|started_at|done_at|placed_at|"
+                      r"linked_at)\.strftime\(", src)
+    assert not bad, f"{len(bad)} timestamp(s) formatted by hand - use " \
+                    f"local_str()"
+    from datetime import datetime as _dt, timezone as _tzc
+    noon = _dt(2026, 9, 10, 16, 7, tzinfo=_tzc.utc)
+    got = main.local_str(noon)
+    assert "12:07 PM" in got, f"UTC 4:07pm should read 12:07pm in NY: {got}"
+    assert main.local_str(None) == ""
+
+
+@check("RULE: nothing decides what to do by reading English")
+def _():
+    """A message that merely contained the word 'password' made the agent
+    ask a customer to read their password out again. Anything that DECIDES
+    reads a reason code; prose is for people."""
+    src = open("agent.py", encoding="utf-8").read()
+    import re as _re
+    for phrase in ('"password is wrong" in', '"password" in msg',
+                   '"check out" in str(e)', '"not signed in" in msg'):
+        assert phrase not in src, \
+            f"still branching on prose: {phrase} - use the reason code"
+    main_src = open("main.py", encoding="utf-8").read()
+    for model in ("class Job(", "class Onboard("):
+        body = main_src[main_src.index(model):]
+        body = body[:body.index("\nclass ")]
+        assert "reason = Column" in body, f"{model} has no reason code"
+
+
+@check("RULE: nothing keeps running after the caller hangs up")
+def _():
+    """A Target job ran for twenty minutes after the call ended, and a
+    half-finished Google sign-in did the same."""
+    paths = {r.path for r in main.app.routes}
+    for p in ("/jobs/cancel_for_call", "/onboard/cancel"):
+        assert p in paths, f"no way to stop work at {p}"
+    src = open("main.py", encoding="utf-8").read()
+    for fn in ("_run_browse", "_run_checkout", "_run_signin"):
+        body = src[src.index(f"def {fn}("):]
+        body = body[:body.index("\ndef ", 10)]
+        assert "cancelled" in body, f"{fn} never notices a hang-up"
+    agent_src = open("agent.py", encoding="utf-8").read()
+    for p in ("/jobs/cancel_for_call", "/onboard/cancel"):
+        assert p in agent_src, f"the agent never calls {p} when a call ends"
+
+
+@check("RULE: every call the agent makes carries the service token")
+def _():
+    """/calls/end was posted without it for months, so no call duration or
+    PIN result was ever saved."""
+    import re as _re
+    src = open("agent.py", encoding="utf-8").read()
+    calls = _re.findall(r"await c\.(?:post|request)\((.{0,220}?)\)\n",
+                        src, _re.S)
+    missing = [c.split("\n")[0].strip()[:60] for c in calls
+               if "headers=AUTH" not in c]
+    assert not missing, f"posted without the token: {missing}"
+
+
 @check("caller country routing")
 def _():
     assert main._where_for_phone("+13476752334")[0] == "US"

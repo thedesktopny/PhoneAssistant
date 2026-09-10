@@ -868,8 +868,8 @@ Never pick one for them silently.
                 "account_id": self.account_id, "number": number,
                 "exp": exp, "cvv": cvv, "name_on_card": name_on_card})
         except Exception as e:
-            if "check out" in str(e):
-                return ("That number doesn't check out. Ask them to read "
+            if "400" in str(e):
+                return ("That card number wasn't accepted. Ask them to read "
                         "it again in groups of four.")
             raise
         return (f"Saved a {d.get('brand')} ending {d.get('last4')}. "
@@ -1486,7 +1486,7 @@ Never pick one for them silently.
                         f"offer to read new messages.")
             if st == "failed":
                 self.password_confirmed = False
-                if "password is wrong" in msg.lower():
+                if d.get("reason") == "bad_password":
                     return ("Tell them Google didn't accept the password, "
                             "and offer to try once more, spelling it out "
                             "one character at a time.")
@@ -1532,8 +1532,7 @@ Never pick one for them silently.
                 })
             except Exception:
                 pass
-            low = (msg or "").lower()
-            if "password is wrong" in low:
+            if d.get("reason") == "bad_password":
                 self.pw_attempts = getattr(self, "pw_attempts", 0) + 1
                 if self.pw_attempts < 3:
                     return (f"Google didn't accept that password. Say you "
@@ -1812,6 +1811,11 @@ async def entrypoint(ctx: JobContext):
                     # a browser to finish an answer no one will hear
                     await c.post(f"{BACKEND}/jobs/cancel_for_call",
                                  headers=AUTH, params={"call_id": call_id})
+                    if getattr(agent_obj, "onboard_sid", None):
+                        await c.post(f"{BACKEND}/onboard/cancel",
+                                     headers=AUTH,
+                                     params={"session_id":
+                                             agent_obj.onboard_sid})
             except Exception:
                 pass
 

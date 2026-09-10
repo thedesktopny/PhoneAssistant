@@ -188,6 +188,8 @@ class Onboard(Base):
     email = Column(String(200), default="")
     state = Column(String(30), default="starting")
     message = Column(Text, default="")
+    # same rule as Job.reason: code branches on this, never on the prose
+    reason = Column(String(40), default="")
     history = Column(Text, default="")
     at = Column(DateTime, default=datetime.utcnow)
 
@@ -389,6 +391,7 @@ def _ensure_columns():
         ],
         "onboard": [
             ("history", "TEXT DEFAULT ''"),
+            ("reason", "VARCHAR(40) DEFAULT ''"),
         ],
         "usage": [
             ("brain_in", "INTEGER DEFAULT 0"),
@@ -765,6 +768,29 @@ def _when(internal_ms) -> str:
     if delta.days < 7:
         return f"{t:%A} at {_clock(t)}"
     return f"{t:%b} {t.day} at {_clock(t)}"
+
+
+def local_str(dt, style: str = "stamp") -> str:
+    """A stored UTC timestamp written in the caller's clock.
+
+    Everything in the database is UTC. Every one of these used to be
+    strftime'd straight out, so the admin panel, the live log and the
+    history handed to the model were all hours off - the same mistake that
+    made the assistant read out an email as 7pm when it arrived at 3pm.
+    Nothing formats a stored time by hand any more; it comes through here.
+    Also avoids %-d and %-I, which don't exist on Windows."""
+    if not dt:
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    t = dt.astimezone(_tz())
+    if style == "seconds":
+        return t.strftime("%I:%M:%S %p").lstrip("0")
+    if style == "day":
+        return f"{t:%b} {t.day}"
+    if style == "full":
+        return f"{t:%b} {t.day} " + t.strftime("%I:%M:%S %p").lstrip("0")
+    return f"{t:%b} {t.day} {_clock(t)}"
 
 
 def tool_unread_summary(account_id: int, limit: int = 5, which: str = "",
@@ -1375,7 +1401,7 @@ def mem_recent(account_id: int, limit: int = 20) -> list:
               .order_by(Memory.id.desc()).limit(limit).all())
     db.close()
     return [{"channel": r.channel, "who": r.who, "text": r.text,
-             "at": r.at.strftime("%b %-d %-I:%M %p") if r.at else ""}
+             "at": local_str(r.at) if r.at else ""}
             for r in reversed(rows)]
 
 
@@ -1822,7 +1848,7 @@ def do_back(page, wait_ms: int = 3000) -> bool:
 _PENDING = {}          # session_id -> {"password": str, "code": str|None}
 
 
-def _ob_set(sid: int, state: str, message: str = ""):
+def _ob_set(sid: int, state: str, message: str = "", reason: str = ""):
     emit("signin", f"signin {sid}", f"{state}: {message}",
          "error" if state == "failed" else "info")
     db = Session()
@@ -1830,6 +1856,7 @@ def _ob_set(sid: int, state: str, message: str = ""):
     if row:
         row.state = state
         row.message = message[:500]
+        row.reason = reason[:40]
         stamp = datetime.utcnow().strftime("%H:%M:%S")
         line = f"[{stamp}] {state}: {message[:300]}"
         row.history = ((row.history or "") + line + "\n")[-6000:]
@@ -1962,6 +1989,8 @@ def _run_signin(sid: int, account_id: int, email: str):
             time.sleep(3)
             waited += 3
             st = _PENDING.get(sid) or {}
+            if st.get("cancelled"):
+                return "cancelled"
             if st.get("other_way"):
                 _PENDING[sid]["other_way"] = False
                 if pick_another_method(page):
@@ -2048,7 +2077,8 @@ def _run_signin(sid: int, account_id: int, email: str):
                      "warn")
                 _ob_set(sid, "failed",
                         "Google says the password is wrong. Ask them to say "
-                        "it again slowly, or have someone call them back.")
+                        "it again slowly, or have someone call them back.",
+                        reason="bad_password")
                 browser.close()
                 return
 
@@ -2126,6 +2156,11 @@ def _run_signin(sid: int, account_id: int, email: str):
                     while waited < 200:
                         time.sleep(4)
                         waited += 4
+                        if (_PENDING.get(sid) or {}).get("cancelled"):
+                            _ob_set(sid, "failed", "The caller hung up.",
+                                    reason="cancelled")
+                            browser.close()
+                            return
                         # the number sometimes renders after the first look
                         if not num:
                             num = tap_number(page)
@@ -2157,6 +2192,11 @@ def _run_signin(sid: int, account_id: int, email: str):
 
                 if q(page, CODE_SEL):
                     res = wait_for_code(page, sid, describe_code_screen(page))
+                    if res == "cancelled":
+                        _ob_set(sid, "failed", "The caller hung up.",
+                                reason="cancelled")
+                        browser.close()
+                        return
                     if res == "timeout":
                         _ob_set(sid, "failed", "Timed out waiting for a code.")
                         browser.close()
@@ -2444,7 +2484,7 @@ def list_site_logins(account_id: int) -> list:
     db = Session()
     rows = db.query(SiteLogin).filter_by(account_id=account_id).all()
     out = [{"site": r.site, "username": r.username,
-            "saved": r.at.strftime("%b %-d") if r.at else "",
+            "saved": local_str(r.at, "day") if r.at else "",
             "used": r.use_count or 0} for r in rows]
     db.close()
     return out
@@ -3263,7 +3303,7 @@ def _run_browse(jid: int, account_id: int, site: str):
                         _job_set(jid, "done", BLOCKED_REPLY)
                         browser.close()
                         return
-                    if answer and "nothing relevant" not in answer.lower():
+                    if answer and "NOTHING_RELEVANT" not in answer:
                         _recipe_result(recipe["id"], True)
                         _job_set(jid, "done", answer[:1500])
                         _record_request(site_key, task, goal, "recipe", "ok",
@@ -3705,8 +3745,9 @@ def _summarise_page(text: str, question: str) -> str:
              "content": ("You turn a scraped web page into a short answer to "
                          "be read aloud on a phone call. Two or three "
                          "sentences. Give names, prices and dates plainly. "
-                         "No URLs. If the page shows nothing relevant, say "
-                         "so.")},
+                         "No URLs. If the page does not answer the question, "
+                         "reply with exactly NOTHING_RELEVANT and nothing "
+                         "else.")},
             {"role": "user",
              "content": f"Question: {question}\n\nPage text:\n{text[:6000]}"},
         ])
@@ -4389,7 +4430,7 @@ def dlr_list(request: Request, limit: int = 30):
     require_auth(request)
     db = Session()
     rows = db.query(Dlr).order_by(Dlr.id.desc()).limit(limit).all()
-    out = [{"at": r.at.strftime("%b %-d %-I:%M:%S %p") if r.at else "",
+    out = [{"at": local_str(r.at, "full") if r.at else "",
             "ref_id": r.ref_id, "to": r.to_number,
             "status": r.status, "raw": r.raw} for r in rows]
     db.close()
@@ -4602,7 +4643,7 @@ def calls_list(request: Request, limit: int = 50, q: str = ""):
             "call_id": r.id,
             "who": names.get(r.account_id) or "unknown",
             "from": r.from_number,
-            "started": r.started_at.strftime("%b %-d %-I:%M %p")
+            "started": local_str(r.started_at)
                        if r.started_at else "",
             "seconds": r.duration_sec,
             "verified": bool(r.verified),
@@ -4661,7 +4702,7 @@ def call_detail(call_id: int, request: Request):
                .order_by(CallTurn.id).all())
     out = [{"who": t.who, "text": t.text, "tool": t.tool,
             "latency_ms": t.latency_ms,
-            "at": t.at.strftime("%-I:%M:%S %p") if t.at else ""}
+            "at": local_str(t.at, "seconds") if t.at else ""}
            for t in turns]
     db.close()
     return out
@@ -4700,7 +4741,7 @@ def logins_audit(request: Request, limit: int = 50):
     rows = (db.query(SecretAccess).order_by(SecretAccess.id.desc())
               .limit(limit).all())
     names = {a.id: a.name for a in db.query(Account).all()}
-    out = [{"at": r.at.strftime("%b %-d %-I:%M %p") if r.at else "",
+    out = [{"at": local_str(r.at) if r.at else "",
             "who": names.get(r.account_id) or "?", "site": r.site,
             "purpose": r.purpose} for r in rows]
     db.close()
@@ -4794,7 +4835,7 @@ def sites_report(request: Request, days: int = 30):
                 "example": r.example_goal, "steps": json.loads(r.steps or "[]"),
                 "ok": r.times_ok or 0, "failed": r.times_failed or 0,
                 "retired": bool(r.retired),
-                "last_ok": r.last_ok.strftime("%b %-d %-I:%M %p")
+                "last_ok": local_str(r.last_ok)
                            if r.last_ok else ""} for r in recipes]
     return {"sites": sorted(by_site.values(), key=lambda x: -x["requests"]),
             "recipes": rec_out}
@@ -4807,7 +4848,7 @@ def sites_events(request: Request, limit: int = 60):
     db = Session()
     rows = (db.query(SiteRequest).order_by(SiteRequest.id.desc())
               .limit(limit).all())
-    out = [{"at": r.at.strftime("%b %-d %-I:%M %p") if r.at else "",
+    out = [{"at": local_str(r.at) if r.at else "",
             "site": r.site, "task": r.task, "goal": r.goal,
             "path": r.path, "outcome": r.outcome, "seconds": r.seconds,
             "job_id": r.job_id} for r in rows]
@@ -4917,7 +4958,7 @@ def sessions_list(request: Request, limit: int = 100):
         limit).all()
     names = {a.id: a.name for a in db.query(Account).all()}
     out = [{"who": names.get(r.account_id) or "?", "site": r.site,
-            "last_ok": r.last_ok.strftime("%b %-d %-I:%M %p")
+            "last_ok": local_str(r.last_ok)
                        if r.last_ok else "never"} for r in rows]
     db.close()
     return out
@@ -4932,7 +4973,7 @@ def jobs_list(request: Request, limit: int = 30):
     out = [{"job_id": r.id, "who": names.get(r.account_id) or "?",
             "kind": r.kind, "site": r.site, "state": r.state,
             "message": r.message, "history": r.history or "",
-            "at": r.at.strftime("%b %-d %-I:%M %p") if r.at else ""}
+            "at": local_str(r.at) if r.at else ""}
            for r in rows]
     db.close()
     return out
@@ -4952,7 +4993,7 @@ def events_list(request: Request, after_id: int = 0, limit: int = 200,
     rows = q.order_by(Event.id.desc()).limit(limit).all()
     names = {a.id: a.name for a in db.query(Account).all()}
     out = [{"id": r.id,
-            "at": r.at.strftime("%-I:%M:%S %p") if r.at else "",
+            "at": local_str(r.at, "seconds") if r.at else "",
             "kind": r.kind, "ref": r.ref, "level": r.level,
             "who": names.get(r.account_id, "") if r.account_id else "",
             "text": r.text} for r in reversed(rows)]
@@ -5136,7 +5177,7 @@ def proxy_status(request: Request):
     require_auth(request)
     st = dict(PROXY_STATUS)
     if st.get("checked"):
-        st["checked"] = st["checked"].strftime("%b %-d %-I:%M %p")
+        st["checked"] = local_str(st["checked"])
     st["default"] = {"country": PROXY_COUNTRY, "state": PROXY_STATE}
     return st
 
@@ -5434,7 +5475,7 @@ def orders_list(request: Request, account_id: int = 0, limit: int = 50):
             "expected_price": r.expected_price, "state": r.state,
             "confirmation": r.confirmation, "final_total": r.final_total,
             "message": r.message, "history": r.history or "",
-            "at": r.at.strftime("%b %-d %-I:%M %p") if r.at else ""}
+            "at": local_str(r.at) if r.at else ""}
            for r in rows]
     db.close()
     return out
@@ -5482,7 +5523,7 @@ def followups_list(request: Request, include_done: int = 0,
             "phone": phones.get(r.account_id, ""),
             "call_id": r.call_id, "reason": r.reason, "note": r.note,
             "channel": r.channel, "done": bool(r.done),
-            "at": r.at.strftime("%b %-d %-I:%M %p") if r.at else ""}
+            "at": local_str(r.at) if r.at else ""}
            for r in rows]
     db.close()
     return out
@@ -6429,6 +6470,16 @@ def onboard_code(b: OnboardCode, request: Request):
     raise HTTPException(400, "That sign-in is no longer running.")
 
 
+@app.post("/onboard/cancel")
+def onboard_cancel(request: Request, session_id: int):
+    """The caller hung up mid sign-in - stop driving the browser."""
+    require_auth(request)
+    if session_id in _PENDING:
+        _PENDING[session_id]["cancelled"] = True
+        return {"cancelled": True}
+    return {"cancelled": False}
+
+
 @app.get("/onboard/status")
 def onboard_status(request: Request, session_id: int):
     require_auth(request)
@@ -6439,7 +6490,7 @@ def onboard_status(request: Request, session_id: int):
         raise HTTPException(404, "Unknown session.")
     return {"session_id": row.id, "state": row.state,
             "message": row.message, "email": row.email,
-            "history": row.history or ""}
+            "reason": row.reason or "", "history": row.history or ""}
 
 
 @app.get("/onboard/sessions")
@@ -6451,7 +6502,7 @@ def onboard_sessions(request: Request, limit: int = 20):
     out = [{"session_id": r.id, "who": names.get(r.account_id) or "?",
             "email": r.email, "state": r.state, "message": r.message,
             "history": r.history or "",
-            "at": r.at.strftime("%b %-d %-I:%M %p") if r.at else ""}
+            "at": local_str(r.at) if r.at else ""}
            for r in rows]
     db.close()
     return out
