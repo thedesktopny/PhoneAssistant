@@ -38,6 +38,15 @@ MAX_CALL_SECONDS = int(os.environ.get("MAX_CALL_SECONDS", "900"))    # 15 min
 SILENCE_WARN = int(os.environ.get("SILENCE_WARN", "20"))
 SILENCE_HANGUP = int(os.environ.get("SILENCE_HANGUP", "45"))
 SERVICE_TOKEN = os.environ.get("SERVICE_TOKEN", "")
+
+# The voice model is ~94% of what a call costs, so this is the one dial
+# worth watching. "gpt-realtime" is the full-price model and the plugin's
+# default; "gpt-realtime-mini" is the cheaper one. Changing this is a
+# Railway variable, not a code change - and if you change it, update
+# RATE_RT_AUDIO_IN / RATE_RT_AUDIO_OUT on the backend to match, or the
+# Costs page will keep quoting you the old price.
+REALTIME_MODEL = os.environ.get("REALTIME_MODEL", "gpt-realtime")
+REALTIME_VOICE = os.environ.get("REALTIME_VOICE", "alloy")
 AUTH = {"Authorization": f"Bearer {SERVICE_TOKEN}"} if SERVICE_TOKEN else {}
 
 server = AgentServer()
@@ -1621,8 +1630,10 @@ async def entrypoint(ctx: JobContext):
     except Exception as e:
         log.warning(f"could not open call record: {e}")
 
+    log.info(f"voice model: {REALTIME_MODEL} ({REALTIME_VOICE})")
     session = AgentSession(
-        llm=openai.realtime.RealtimeModel(voice="alloy"),
+        llm=openai.realtime.RealtimeModel(model=REALTIME_MODEL,
+                                          voice=REALTIME_VOICE),
         vad=silero.VAD.load(),
     )
 

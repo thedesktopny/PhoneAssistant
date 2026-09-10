@@ -230,6 +230,24 @@ def _():
     assert "Browserbase" in plain, plain
 
 
+@check("a decision is read even when the model chats around it")
+def _():
+    """Swapping the browser model is a Railway variable, so the parser has
+    to cope with whatever style the new model replies in."""
+    cases = [
+        '{"action":"click","index":2}',
+        '```json\n{"action":"click","index":2}\n```',
+        'Sure - here is the next step:\n{"action":"click","index":2}\nThat '
+        'should open the orders page.',
+        '{"action":"type","index":1,"text":"a }{ brace in a string"}',
+    ]
+    for raw in cases:
+        got = main._first_json(raw)
+        assert got.get("action"), f"could not read a decision from: {raw!r}"
+    assert main._first_json("no json at all here") == {}
+    assert main._first_json("") == {}
+
+
 @check("caller country routing")
 def _():
     assert main._where_for_phone("+13476752334")[0] == "US"
@@ -341,6 +359,16 @@ def _():
     found = [b for b in banned if b in src]
     assert not found, (f"polling chatter still in agent.py: {found} - "
                        f"say 'I will tell you when it changes' instead")
+
+
+@check("the voice model is a variable, not hard-coded")
+def _():
+    """It is ~94% of the cost of a call. Changing it must not need a code
+    change, so you can try a cheaper one and change back in a minute."""
+    src = open("agent.py", encoding="utf-8").read()
+    assert "RealtimeModel(model=REALTIME_MODEL" in src, \
+        "the voice model is hard-coded again - use REALTIME_MODEL"
+    assert agent.REALTIME_MODEL, "REALTIME_MODEL is empty"
 
 
 @check("required tools exist")

@@ -2798,6 +2798,43 @@ def _page_snapshot(page, limit: int = 60):
     return items, page_text(page, 4000)
 
 
+def _first_json(raw: str) -> dict:
+    """Pull the first JSON object out of a model's reply.
+
+    The old code demanded the whole reply be nothing but JSON. Newer models
+    often add a sentence before or after it, and that used to be read as
+    'I have no idea what to do' - the agent gave up on a good answer."""
+    if not raw:
+        return {}
+    s = raw.replace("```json", " ").replace("```", " ")
+    start = s.find("{")
+    while start != -1:
+        depth, in_str, esc = 0, False, False
+        for i in range(start, len(s)):
+            ch = s[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(s[start:i + 1])
+                    except Exception:
+                        break
+        start = s.find("{", start + 1)
+    return {}
+
+
 def _user_turn(msg: str, shot: str = ""):
     """A user message, with a picture of the page attached when we have one."""
     if not shot:
@@ -2824,12 +2861,13 @@ def _decide(goal: str, url: str, text: str, items: list, history: list,
                      model=MODEL_BROWSER, account_id=account_id,
                      call_id=call_id, cheap=False)
     raw = (d["choices"][0]["message"].get("content") or "").strip()
-    raw = raw.replace("```json", "").replace("```", "").strip()
-    try:
-        return json.loads(raw)
-    except Exception:
-        return {"action": "give_up",
-                "answer": "I couldn't work out what to do next."}
+    act = _first_json(raw)
+    if act.get("action"):
+        return act
+    emit("browse", "decide", f"{MODEL_BROWSER} gave no usable action: "
+                             f"{raw[:200]}", "warn", account_id)
+    return {"action": "give_up",
+            "answer": "I couldn't work out what to do next."}
 
 
 _TASK_CACHE = {}
@@ -3297,11 +3335,12 @@ def _run_checkout(jid: int, account_id: int, site: str):
                          model=MODEL_BROWSER, account_id=account_id,
                          call_id=order_call_id, cheap=False)
         raw = (d["choices"][0]["message"].get("content") or "").strip()
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        try:
-            return json.loads(raw)
-        except Exception:
-            return {"action": "give_up", "answer": "Lost track of the page."}
+        act = _first_json(raw)
+        if act.get("action"):
+            return act
+        emit("order", f"order {oid}", f"{MODEL_BROWSER} gave no usable "
+                                      f"action: {raw[:200]}", "warn")
+        return {"action": "give_up", "answer": "Lost track of the page."}
 
     browser = page = None
     history = []
