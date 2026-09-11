@@ -751,6 +751,39 @@ def _():
         "checkout is never told the card can't be typed into a form"
 
 
+@check("a card still saves while Stripe approval is pending")
+def _():
+    """Stripe refuses card digits from a server until the account is
+    approved for phone orders. With the key set but approval pending, the
+    caller's card must still save - not fail on the phone."""
+    def refuses(path, fields):
+        raise main.HTTPException(
+            400, "Sending credit card numbers directly to the Stripe API "
+                 "is generally unsafe.")
+
+    real_key, real_post = main.STRIPE_SECRET_KEY, main._stripe
+    main.STRIPE_SECRET_KEY, main._stripe = "sk_test_probe", refuses
+    try:
+        from fastapi.testclient import TestClient
+        c = TestClient(main.app, raise_server_exceptions=False,
+                       base_url="https://t")
+        c.post("/admin/login", json={"password": os.environ.get(
+            "ADMIN_PASSWORD", "changeme")})
+        r = c.post("/cards", json={"account_id": 960002,
+                                   "number": "4242 4242 4242 4242",
+                                   "exp": "12/34", "cvv": "123"})
+        assert r.status_code == 200, \
+            f"a caller's card failed to save: {r.status_code} {r.text[:160]}"
+        assert r.json().get("last4") == "4242", r.json()
+    finally:
+        main.STRIPE_SECRET_KEY, main._stripe = real_key, real_post
+    db = main.Session()
+    for row in db.query(main.PaymentCard).filter_by(account_id=960002).all():
+        db.delete(row)
+    db.commit()
+    db.close()
+
+
 @check("caller country routing")
 def _():
     assert main._where_for_phone("+13476752334")[0] == "US"

@@ -4099,6 +4099,12 @@ def _stripe(path: str, fields: dict) -> dict:
         raise HTTPException(400, said or f"Stripe said {e.code}.")
 
 
+class StripeNeedsRawCardAccess(Exception):
+    """Stripe will not take card digits from a server until the account is
+    approved for it. Phone orders have no browser to collect a card in, so
+    this has to be requested - until then we keep storing cards ourselves."""
+
+
 def stripe_hold_card(number: str, exp: str, cvv: str, name: str) -> dict:
     """Give the card to Stripe, get back a token. We never store the digits.
 
@@ -4113,7 +4119,13 @@ def stripe_hold_card(number: str, exp: str, cvv: str, name: str) -> dict:
         fields["card[cvc]"] = cvv
     if name:
         fields["billing_details[name]"] = name
-    pm = _stripe("payment_methods", fields)
+    try:
+        pm = _stripe("payment_methods", fields)
+    except HTTPException as e:
+        said = str(getattr(e, "detail", ""))
+        if "raw card" in said.lower() or "directly to the stripe api"                 in said.lower():
+            raise StripeNeedsRawCardAccess(said) from None
+        raise
     card = pm.get("card", {})
     return {"id": pm.get("id", ""), "brand": (card.get("brand") or "").title(),
             "last4": card.get("last4", ""),
@@ -5592,6 +5604,15 @@ def stripe_status(request: Request):
                         "token_looks_like": held["id"][:8] + "..."}
         out["verdict"] = ("Stripe is holding cards. The digits no longer "
                           "reach this database.")
+    except StripeNeedsRawCardAccess:
+        out["needs"] = "raw card data API access"
+        out["verdict"] = (
+            "The key works, but Stripe has not approved this account to "
+            "accept card numbers from a server. That is the normal state - "
+            "ask Stripe support to enable raw card data APIs and explain "
+            "that customers read their card out over the phone, so there "
+            "is no browser to collect it in. Until then cards keep being "
+            "stored encrypted here, and nothing is broken.")
     except HTTPException as e:
         out["verdict"] = f"Stripe refused: {e.detail}"
     except Exception as e:
@@ -5758,8 +5779,19 @@ def card_add(b: CardBody, request: Request):
     if not _luhn_ok(num):
         raise HTTPException(400, "That card number doesn't check out.")
 
+    held = None
     if STRIPE_SECRET_KEY:
-        held = stripe_hold_card(num, b.exp, b.cvv, b.name_on_card)
+        try:
+            held = stripe_hold_card(num, b.exp, b.cvv, b.name_on_card)
+        except StripeNeedsRawCardAccess:
+            # Never fail a caller's card save over this - keep the old way
+            # until Stripe approves the account for phone orders.
+            emit("cards", "stripe",
+                 "Stripe has not approved this account for card numbers "
+                 "taken over the phone, so the card was stored here "
+                 "instead. Request raw card data API access from Stripe.",
+                 "warn", b.account_id)
+    if held:
         blob = vault_put({"stripe_pm": held["id"]})
         brand, last4 = held["brand"], held["last4"]
         exp = held["exp"] or b.exp[:7]
