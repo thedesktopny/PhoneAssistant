@@ -1828,8 +1828,8 @@ def page_text(page, limit: int = 4000) -> str:
     """The visible text, trimmed INSIDE the browser. Pulling a whole shop
     page across the network and then keeping the first 4000 characters was
     costing seconds per step."""
-    js = ("(n) => (document.body ? document.body.innerText : '')"
-          ".replace(/\s+/g, ' ').slice(0, n)")
+    js = (r"(n) => (document.body ? document.body.innerText : '')"
+          r".replace(/\s+/g, ' ').slice(0, n)")
     got = page_eval(page, js, limit)
     if got:
         return got
