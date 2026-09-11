@@ -697,6 +697,60 @@ def _():
         assert main.is_blocked(t), f"this should still be blocked: {t}"
 
 
+@check("a card held by Stripe never reaches the database")
+def _():
+    """Storing real card numbers puts this business inside PCI. With Stripe
+    configured, only the token is kept - and the checkout must say so
+    rather than silently typing an empty card number into a form."""
+    import json as _json
+    calls = []
+
+    def fake_stripe(path, fields):
+        calls.append((path, fields))
+        return {"id": "pm_test_123",
+                "card": {"brand": "visa", "last4": "4242",
+                         "exp_month": 12, "exp_year": 2034}}
+
+    real_key, real_post = main.STRIPE_SECRET_KEY, main._stripe
+    main.STRIPE_SECRET_KEY, main._stripe = "sk_test_probe", fake_stripe
+    try:
+        from fastapi.testclient import TestClient
+        c = TestClient(main.app, raise_server_exceptions=False,
+                       base_url="https://t")
+        c.post("/admin/login", json={"password": os.environ.get(
+            "ADMIN_PASSWORD", "changeme")})
+        r = c.post("/cards", json={"account_id": 960001,
+                                   "number": "4242 4242 4242 4242",
+                                   "exp": "12/34", "cvv": "123",
+                                   "name_on_card": "D Tester"}).json()
+        assert r.get("last4") == "4242", r
+        assert r.get("brand") == "Visa", f"brand should come from Stripe: {r}"
+        assert calls and calls[0][0] == "payment_methods", calls
+        assert calls[0][1]["card[exp_year]"] == 2034, calls[0][1]
+        listed = c.get("/cards?account_id=960001").json()
+        assert listed and listed[0]["last4"] == "4242"
+    finally:
+        main.STRIPE_SECRET_KEY, main._stripe = real_key, real_post
+
+    # the digits must not be anywhere in the stored secret
+    db = main.Session()
+    row = (db.query(main.PaymentCard)
+             .filter_by(account_id=960001).order_by(
+                 main.PaymentCard.id.desc()).first())
+    blob = row.secret_blob
+    held = main.vault_get(blob)
+    db.delete(row)
+    db.commit()
+    db.close()
+    assert "4242424242424242" not in _json.dumps(held), \
+        "the full card number is still being stored"
+    assert held.get("stripe_pm") == "pm_test_123", held
+    assert not held.get("number"), "a number was kept alongside the token"
+    src = open("main.py", encoding="utf-8").read()
+    assert "NOT\n" in src or "available to type in" in src, \
+        "checkout is never told the card can't be typed into a form"
+
+
 @check("caller country routing")
 def _():
     assert main._where_for_phone("+13476752334")[0] == "US"

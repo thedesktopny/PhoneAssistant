@@ -59,6 +59,11 @@ AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 AZURE_KEY_ID = os.environ.get("AZURE_KEY_ID", "")
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
 
+# Stripe. When this is set, a card is handed to Stripe and we keep only the
+# token it gives back - the digits never reach the database. Without it,
+# nothing changes and cards are stored encrypted as before.
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
+
 # SMS — set SMS_PROVIDER to "twilio" or "bulkvs"
 SMS_PROVIDER = os.environ.get("SMS_PROVIDER", "").lower()
 SMS_FROM = os.environ.get("SMS_FROM", "")           # your sending number
@@ -3786,6 +3791,14 @@ def _run_checkout(jid: int, account_id: int, site: str):
         secret = vault_get(card.secret_blob)
         values["CARD_NUMBER"] = secret.get("number", "")
         values["CARD_CVV"] = secret.get("cvv", "")
+        if secret.get("stripe_pm") and not values["CARD_NUMBER"]:
+            # Held by Stripe, so there are no digits to type into a form.
+            # Say so plainly rather than silently typing nothing.
+            spec["pay_with"] = (
+                f"{card.brand} ending {card.last4}, held securely and NOT "
+                f"available to type in. Use a card the site already has "
+                f"saved for them. If the site has none, stop with ask_user "
+                f"and say the card cannot be entered on this site.")
         mm, _, yy = (card.exp or "").partition("/")
         values["CARD_EXP_MM"] = mm.strip()
         values["CARD_EXP_YY"] = yy.strip()[-2:]
@@ -4063,6 +4076,49 @@ def _order_set(oid: int, state: str, message: str = "", **fields):
 def _fmt_address(a) -> str:
     parts = [a.line1, a.line2, f"{a.city}, {a.state} {a.zip}".strip(", ")]
     return ", ".join(p for p in parts if p)
+
+
+def _stripe(path: str, fields: dict) -> dict:
+    """One form-encoded call to Stripe. Same plain-urllib style as every
+    other service here - no extra dependency to install or keep current."""
+    body = urllib.parse.urlencode(fields).encode()
+    req = urllib.request.Request(
+        f"https://api.stripe.com/v1/{path}", data=body,
+        headers={"Authorization": f"Bearer {STRIPE_SECRET_KEY}",
+                 "Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        said = ""
+        try:
+            said = (json.loads(e.read().decode()).get("error", {})
+                    .get("message", ""))
+        except Exception:
+            pass
+        raise HTTPException(400, said or f"Stripe said {e.code}.")
+
+
+def stripe_hold_card(number: str, exp: str, cvv: str, name: str) -> dict:
+    """Give the card to Stripe, get back a token. We never store the digits.
+
+    Stripe is also the authority on the brand and last four, so we stop
+    guessing those ourselves."""
+    mm, _, yy = (exp or "").partition("/")
+    yy = yy.strip()
+    year = int(yy) + 2000 if len(yy) == 2 else int(yy or 0)
+    fields = {"type": "card", "card[number]": number,
+              "card[exp_month]": (mm.strip() or "0"), "card[exp_year]": year}
+    if cvv:
+        fields["card[cvc]"] = cvv
+    if name:
+        fields["billing_details[name]"] = name
+    pm = _stripe("payment_methods", fields)
+    card = pm.get("card", {})
+    return {"id": pm.get("id", ""), "brand": (card.get("brand") or "").title(),
+            "last4": card.get("last4", ""),
+            "exp": f"{card.get('exp_month', '')}/"
+                   f"{str(card.get('exp_year', ''))[-2:]}"}
 
 
 def _luhn_ok(num: str) -> bool:
@@ -5515,6 +5571,34 @@ def browser_account(request: Request):
     return out
 
 
+@app.get("/stripe/status")
+def stripe_status(request: Request):
+    """Is Stripe wired up, is it the test key, and does it answer?"""
+    require_auth(request)
+    key = STRIPE_SECRET_KEY
+    out = {"configured": bool(key),
+           "mode": ("test" if key.startswith("sk_test_")
+                    else "LIVE" if key.startswith("sk_live_")
+                    else "restricted/unknown" if key else "none")}
+    if not key:
+        out["verdict"] = ("No STRIPE_SECRET_KEY on the backend. Cards are "
+                          "still stored encrypted here instead of at "
+                          "Stripe.")
+        return out
+    try:
+        # a real tokenisation with Stripe's own test card
+        held = stripe_hold_card("4242424242424242", "12/34", "123", "Probe")
+        out["probe"] = {"brand": held["brand"], "last4": held["last4"],
+                        "token_looks_like": held["id"][:8] + "..."}
+        out["verdict"] = ("Stripe is holding cards. The digits no longer "
+                          "reach this database.")
+    except HTTPException as e:
+        out["verdict"] = f"Stripe refused: {e.detail}"
+    except Exception as e:
+        out["verdict"] = f"Could not reach Stripe: {str(e)[:200]}"
+    return out
+
+
 @app.get("/browser/proxy_status")
 def proxy_status(request: Request):
     require_auth(request)
@@ -5673,14 +5757,27 @@ def card_add(b: CardBody, request: Request):
     num = "".join(ch for ch in b.number if ch.isdigit())
     if not _luhn_ok(num):
         raise HTTPException(400, "That card number doesn't check out.")
+
+    if STRIPE_SECRET_KEY:
+        held = stripe_hold_card(num, b.exp, b.cvv, b.name_on_card)
+        blob = vault_put({"stripe_pm": held["id"]})
+        brand, last4 = held["brand"], held["last4"]
+        exp = held["exp"] or b.exp[:7]
+        emit("cards", "saved", f"card held by Stripe ({brand} {last4})",
+             "info", b.account_id)
+    else:
+        blob = vault_put({"number": num, "cvv": b.cvv})
+        brand, last4, exp = _card_brand(num), num[-4:], b.exp[:7]
+    del num
+
     db = Session()
     if b.make_default:
         for c in db.query(PaymentCard).filter_by(account_id=b.account_id).all():
             c.is_default = 0
     row = PaymentCard(account_id=b.account_id, label=b.label[:40],
-                      last4=num[-4:], brand=_card_brand(num),
-                      exp=b.exp[:7], name_on_card=b.name_on_card[:120],
-                      secret_blob=vault_put({"number": num, "cvv": b.cvv}),
+                      last4=last4, brand=brand,
+                      exp=exp, name_on_card=b.name_on_card[:120],
+                      secret_blob=blob,
                       is_default=1 if b.make_default else 0)
     db.add(row)
     db.commit()
