@@ -683,7 +683,11 @@ def _():
             "when does the fast end tonight",
             "find me a shul near 11221",
             # and these are real places and names in the community
-            "directions to church avenue brooklyn"]
+            "directions to church avenue brooklyn",
+            # practical things that merely mention another religion
+            "what time does the supermarket close on christmas",
+            "is the post office closed for easter",
+            "directions to the church on avenue j"]
     for t in fine:
         assert not main.is_blocked(t), f"an ordinary task was blocked: {t}"
     still = ["read me the news", "tell me a joke", "what was the score",
@@ -889,8 +893,10 @@ def _():
             f"'{gone}' is still on the forbidden list"
     assert "not a rav" in said and "shailah" in said, \
         "nothing tells it to send a real question to their rav"
-    assert "Do not compare religions" in said, \
-        "comparing faiths is no longer ruled out"
+    assert "Do not DISCUSS other religions" in said, \
+        "discussing other faiths is no longer ruled out"
+    assert "A place, a date or a name is not a discussion" in said, \
+        "practical mentions of another religion will be refused again"
 
 
 @check("required tools exist")
