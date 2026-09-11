@@ -507,7 +507,9 @@ def _():
     times and never noticed the page hadn't moved."""
     first = main._stuck_note(1)
     assert "changed nothing" in first, first
-    assert "not the same step" in main._stuck_note(2)
+    second = main._stuck_note(2)
+    assert "same thing a third time" in second, second
+    assert "goto" in second, "it should be told to navigate directly instead"
     assert "Stop repeating" in main._stuck_note(3)
     src = open("main.py", encoding="utf-8").read()
     body = src[src.index("def _run_browse("):]
