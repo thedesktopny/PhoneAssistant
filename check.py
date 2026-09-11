@@ -784,6 +784,28 @@ def _():
     db.close()
 
 
+@check("a blocked page falls through to the next result by itself")
+def _():
+    """Searching a fridge model puts the manufacturer's support page first,
+    and manufacturers block robots. Going back to the agent to choose the
+    second result cost the caller half a minute of silence, which is when
+    he hung up."""
+    src = open("main.py", encoding="utf-8").read()
+    body = src[src.index("def _run_browse("):]
+    body = body[:body.index("\ndef ", 10)]
+    assert "spares" in body, "no fallback list is carried into the job"
+    i = body.index("looks_like_bot_check(text)")
+    window = body[i:i + 500]
+    assert "spares.pop(0)" in window, \
+        "a bot check still ends the job instead of trying the next source"
+    assert "do_goto(page, nxt" in window, window[:200]
+    agent_src = open("agent.py", encoding="utf-8").read()
+    rp = agent_src[agent_src.index("async def read_page("):]
+    rp = rp[:rp.index("\n    @function_tool")]
+    assert '"urls": spares' in rp, \
+        "read_page doesn't pass the other results as fallbacks"
+
+
 @check("caller country routing")
 def _():
     assert main._where_for_phone("+13476752334")[0] == "US"

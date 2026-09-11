@@ -3476,6 +3476,11 @@ def _run_browse(jid: int, account_id: int, site: str):
     goal = payload.get("goal", "")
     start = payload.get("url") or (f"https://www.{site}.com"
                                    if site else "https://www.google.com")
+    # Other pages to try if this one turns out to refuse robots. A
+    # manufacturer's own support page is usually the first search result
+    # and usually the one that blocks, so going back to the agent to pick
+    # again costs the caller half a minute of silence.
+    spares = [u for u in (payload.get("urls") or []) if u and u != start]
     # a sign-in plus a lookup does not fit in twelve
     max_steps = int(payload.get("max_steps", 24))
     site_key = site or "generic"
@@ -3546,6 +3551,13 @@ def _run_browse(jid: int, account_id: int, site: str):
                     break
                 items, text = _page_snapshot(page)
                 if looks_like_bot_check(text):
+                    if spares:
+                        nxt = spares.pop(0)
+                        _job_set(jid, "working",
+                                 "that page wants a human check - trying "
+                                 "another source")
+                        do_goto(page, nxt, 4000)
+                        continue
                     _job_set(jid, "failed",
                              f"{site_key} is asking for a human check that "
                              f"we can't and shouldn't do for them.",
@@ -5129,7 +5141,7 @@ def job_site_search(request: Request, account_id: int, site: str,
 @app.post("/jobs/browse")
 def job_browse(request: Request, account_id: int, goal: str,
                site: str = "", url: str = "", call_id: int = 0,
-               max_steps: int = 0):
+               max_steps: int = 0, urls: str = ""):
     """Pursue any goal on any site. No per-site setup. max_steps lets a
     quick probe stay quick."""
     require_auth(request)
@@ -5141,6 +5153,9 @@ def job_browse(request: Request, account_id: int, goal: str,
     if not BROWSERBASE_API_KEY:
         raise HTTPException(400, "Browserbase isn't configured.")
     payload = {"goal": goal, "url": url}
+    if urls:
+        # space separated - a URL can't contain a space
+        payload["urls"] = [u for u in urls.split() if u]
     if max_steps:
         payload["max_steps"] = max(3, min(int(max_steps), 30))
     return {"job_id": start_job(account_id, "browse", site,

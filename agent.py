@@ -1836,11 +1836,17 @@ Never pick one for them silently.
                     f"search results.")
         try:
             async with httpx.AsyncClient(timeout=25) as c:
+                # hand over the other results too, so a page that blocks
+                # robots falls through to the next one without coming back
+                # to ask - the manufacturer's own page is usually first and
+                # usually the one that refuses
+                spares = " ".join(u for u in urls[which:] if u)
                 r = await c.post(f"{BACKEND}/jobs/browse", headers=AUTH,
                                  params={"account_id": self.account_id,
                                          "goal": looking_for,
                                          "url": urls[which - 1],
-                                         "max_steps": 6,
+                                         "urls": spares,
+                                         "max_steps": 8,
                                          "call_id": self.call_id or 0})
                 d = r.json()
         except Exception as e:
