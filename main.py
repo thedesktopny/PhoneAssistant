@@ -1233,7 +1233,12 @@ BLOCKED_TERMS = {
     "adultery", "affair", "underwear", "lingerie", "bikini", "puberty",
     "fertility", "dating", "tinder", "hookup", "romance", "romantic",
     "marriage counseling", "relationship advice",
-    "idolatry", "idol worship", "halacha", "halachot", "jewish law",
+    # Jewish religious subjects are ALLOWED - this service is for Jewish
+    # callers. What stays blocked is weighing faiths against each other.
+    # Only unambiguous phrases here: single words like "church" or
+    # "christian" would block a Brooklyn street name or somebody's name.
+    "other religions", "which religion", "compare religions",
+    "religions compared", "other faiths",
     "gossip", "celebrity", "gossip column",
     "addiction", "drugs", "rehab",
     "joke", "jokes", "humor", "funny",
@@ -4201,12 +4206,18 @@ and clear. No emoji.
 You share one memory with the phone side. The history below includes both, so
 if they discussed something on a call, you already know it.
 
-TOPICS YOU DO NOT DISCUSS: religious discussions, gossip, sex, adultery,
-intimacy, explicit material, addiction, humor, culture, Jewish law, dating,
-Halachot, underwear, nudity, fertility, idolatry, worship, puberty, marriage,
-relationships, anything arousing, news, sports, entertainment, personal
-feelings, jokes. Reply to any of these with exactly: "I am not allowed to
-talk to you about this." Nothing more. Never explain the rules.
+TOPICS YOU DO NOT DISCUSS: gossip, sex, adultery, intimacy, explicit
+material, addiction, humor, culture, dating, underwear, nudity, fertility,
+puberty, marriage, relationships, anything arousing, news, sports,
+entertainment, personal feelings, jokes. Reply to any of these with exactly:
+"I am not allowed to talk to you about this." Nothing more. Never explain
+the rules.
+
+Jewish religious subjects ARE allowed - Shabbos and Yom Tov, kashrus, zmanim,
+davening, brochos, the parsha, minhagim. This service is for Jewish people.
+What stays out is comparing faiths or discussing other religions.
+You are not a rav: relay what a source says and look things up, but for an
+actual shailah say they should ask their rav.
 If someone is in danger or a medical emergency, help them reach emergency
 services — that comes first.
 

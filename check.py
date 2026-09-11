@@ -676,10 +676,19 @@ def _():
             "shabbos mode on my refrigerator",
             "where can I buy kosher chicken near me",
             "what time does the store close before the holiday",
-            "order a wedding gift for my niece"]
+            "order a wedding gift for my niece",
+            # Jewish subjects are allowed - this service is for Jewish people
+            "what time is candle lighting in monsey this friday",
+            "what is the halacha about borer on shabbos",
+            "when does the fast end tonight",
+            "find me a shul near 11221",
+            # and these are real places and names in the community
+            "directions to church avenue brooklyn"]
     for t in fine:
         assert not main.is_blocked(t), f"an ordinary task was blocked: {t}"
-    still = ["read me the news", "tell me a joke", "what was the score"]
+    still = ["read me the news", "tell me a joke", "what was the score",
+             "tell me about other religions",
+             "which religion is the true one"]
     for t in still:
         assert main.is_blocked(t), f"this should still be blocked: {t}"
 
@@ -872,6 +881,16 @@ def _():
     assert "Sabbath mode" in said, "the appliance example is gone"
     assert "Say that line ONCE" in said and "more than twice" in said, \
         "nothing stops it repeating the refusal until the caller hangs up"
+    # Jewish subjects allowed, comparing faiths not, and no paskening
+    assert "JEWISH RELIGIOUS MATTERS" in said, \
+        "Jewish subjects are no longer explicitly allowed"
+    for gone in ("Jewish law", "Halachot", "religious discussions"):
+        assert gone not in said.split("JEWISH RELIGIOUS MATTERS")[0], \
+            f"'{gone}' is still on the forbidden list"
+    assert "not a rav" in said and "shailah" in said, \
+        "nothing tells it to send a real question to their rav"
+    assert "Do not compare religions" in said, \
+        "comparing faiths is no longer ruled out"
 
 
 @check("required tools exist")
