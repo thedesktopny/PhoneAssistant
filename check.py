@@ -631,6 +631,24 @@ def _():
         "a captcha question is still passed on to the caller"
 
 
+@check("element [0] can be clicked")
+def _():
+    """`0 or -1` is -1 in Python, so the first link on every page was
+    unclickable. On Kohl's it was the sign-in link; the agent burned every
+    step being told 'there is no [-1]'."""
+    assert main._action_index({"index": 0}) == 0, "zero became -1 again"
+    assert main._action_index({"index": "3"}) == 3
+    assert main._action_index({"index": 12}) == 12
+    assert main._action_index({}) == -1
+    assert main._action_index({"index": None}) == -1
+    assert main._action_index({"index": "abc"}) == -1
+    assert main._action_index({"index": True}) == -1
+    src = open("main.py", encoding="utf-8").read()
+    assert 'act.get("index", -1) or -1' not in src, "the or-trap is back"
+    assert src.count("_action_index(act)") >= 2, \
+        "browse and checkout must both use the safe reader"
+
+
 @check("caller country routing")
 def _():
     assert main._where_for_phone("+13476752334")[0] == "US"

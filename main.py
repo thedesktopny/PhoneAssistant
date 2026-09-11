@@ -3217,6 +3217,22 @@ def _decide(goal: str, url: str, text: str, items: list, history: list,
 _TASK_CACHE = {}
 
 
+def _action_index(act: dict) -> int:
+    """Which numbered element the model chose, or -1 if it didn't say.
+
+    This used to read the index with an `or -1` fallback, and in Python
+    `0 or -1` is -1 - so element [0], the first link on every page, could
+    never be clicked. On Kohl's that was the sign-in link, and the agent
+    spent seven steps being told "there is no [-1]"."""
+    raw = act.get("index")
+    if isinstance(raw, bool):
+        return -1
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return -1
+
+
 def _stuck_note(n: int) -> str:
     """What to tell the agent when the page hasn't reacted.
 
@@ -3549,7 +3565,7 @@ def _run_browse(jid: int, account_id: int, site: str):
                     continue
 
                 if a in ("click", "type"):
-                    idx = int(act.get("index", -1) or -1)
+                    idx = _action_index(act)
                     if idx < 0 or idx >= len(items):
                         note = (f"There is no [{idx}] - the page offers "
                                 f"{len(items)} things you can use."
@@ -3814,7 +3830,7 @@ def _run_checkout(jid: int, account_id: int, site: str):
                     history.append(f"asked: {question} -> they said: {reply}")
                     continue
                 if a in ("click", "type", "place_order"):
-                    idx = int(act.get("index", -1) or -1)
+                    idx = _action_index(act)
                     if idx < 0 or idx >= len(items):
                         note = (f"There is no [{idx}] - the page offers "
                                 f"{len(items)} things you can use.")
