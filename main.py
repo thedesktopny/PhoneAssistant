@@ -864,8 +864,13 @@ def _browser_error(e) -> str:
         return ("Browserbase rejected the API key (401). Check "
                 "BROWSERBASE_API_KEY and BROWSERBASE_PROJECT_ID in Railway.")
     if "402" in t:
-        return ("Browserbase says payment required (402) - the plan limit "
-                "or a paid feature. Check the Browserbase dashboard.")
+        return ("Browserbase says payment required (402) - the account is "
+                "out of sessions or minutes. Check the Browserbase "
+                "dashboard; no code change will fix it.")
+    if "500" in t and "connect.browserbase" in t:
+        return ("Browserbase could not start a browser (500). This normally "
+                "follows the account running out of sessions or minutes - "
+                "check the Browserbase dashboard.")
     if "429" in t:
         return "Too many browser sessions at once. Try again in a minute."
     if "timeout" in t.lower():
@@ -1629,6 +1634,33 @@ def _flag_proxy_unavailable(wanted: str):
         pass
 
 
+_LAST_LIMIT_FLAG = {"at": None}
+
+
+def _flag_account_limit(detail: str):
+    """Browserbase refused a plain browser. Out of sessions, out of minutes,
+    or a billing problem - nothing in this code can fix it."""
+    msg = ("Browserbase will not start a browser at all (402). The account "
+           "is out of sessions or minutes, or billing needs attention. "
+           "Every browser job - site sign-ins, order lookups, ordering - "
+           "will fail until it is sorted out in the Browserbase dashboard. "
+           "Email, calendar, texts and normal conversation are unaffected.")
+    emit("browser", "ACCOUNT LIMIT", f"{msg} ({detail[:120]})", "error")
+    now = datetime.utcnow()
+    last = _LAST_LIMIT_FLAG.get("at")
+    if last and (now - last).total_seconds() < 1800:
+        return
+    _LAST_LIMIT_FLAG["at"] = now
+    try:
+        db = Session()
+        db.add(Followup(reason="browser_account_limit", note=msg,
+                        channel="system"))
+        db.commit()
+        db.close()
+    except Exception:
+        pass
+
+
 def _flag_proxy_fallback(reason: str):
     """Loud: browsers are running outside the US until this is fixed."""
     msg = (f"Browser is not in the expected country. Sign-ins may look "
@@ -1694,10 +1726,16 @@ def _bb_session(context_id: str = "", country: str = "",
                 return sid
         except Exception as e:
             detail = str(e)[:300]
-            if wants_proxy and ("402" in detail
-                                or "Payment Required" in detail):
+            paid = "402" in detail or "Payment Required" in detail
+            if wants_proxy and paid:
                 _flag_proxy_unavailable(country)
                 continue        # keep the session, drop the proxy
+            if paid:
+                # We asked for a plain browser and were still refused. That
+                # is the ACCOUNT, not the geography - saying "wrong country"
+                # here sent someone looking in completely the wrong place.
+                _flag_account_limit(detail)
+                return ""
             _flag_proxy_fallback(f"{detail} (wanted {country})")
             return ""
     return ""

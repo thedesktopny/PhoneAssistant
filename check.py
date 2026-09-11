@@ -553,6 +553,23 @@ def _():
         "nothing records when the agent finished a turn"
 
 
+@check("running out of browser credit says so, not 'wrong country'")
+def _():
+    """Browserbase refused a plain browser with 402, and the log said the
+    browser was in the wrong country - which sent someone hunting through
+    proxy settings for an account that had simply run out."""
+    said = main._browser_error(Exception("HTTP Error 402: Payment Required"))
+    assert "out of sessions or minutes" in said, said
+    five = main._browser_error(Exception(
+        "WebSocket error: wss://connect.browserbase.com/ 500 Internal"))
+    assert "Browserbase" in five and "dashboard" in five, five
+    src = open("main.py", encoding="utf-8").read()
+    body = src[src.index("def _bb_session("):]
+    body = body[:body.index("\ndef ", 10)]
+    assert "_flag_account_limit(" in body, \
+        "a 402 without a proxy request is still blamed on geography"
+
+
 @check("caller country routing")
 def _():
     assert main._where_for_phone("+13476752334")[0] == "US"
