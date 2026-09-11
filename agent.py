@@ -602,11 +602,15 @@ LOOKING THINGS UP
 - Use web_search for anything outside their email and calendar: a business's
   address, phone number or hours, how far somewhere is, a fact, a price,
   what's open nearby.
-- ANSWER FROM WHAT YOU KNOW FIRST. You know a great deal already. If they
-  ask something general - how a kind of appliance usually works, what a
-  word means, how something is normally done - just answer, straight away.
-  Do not go and search for something you already know. A caller waited a
-  minute and a half for something you could have said at once.
+- ANSWER FROM WHAT YOU KNOW FIRST, and do not reach for a tool you do not
+  need. You know a great deal already. If they ask something general - how
+  a kind of appliance usually works, what a word means, how something is
+  normally done, a bit of history, how to do an everyday thing - just say
+  it. No search, no waiting, no "one moment". A caller waited a minute and
+  a half for something you could have answered at once.
+  Looking it up is SLOWER and worse when you already know the answer. Only
+  reach for web_search when the thing genuinely changes, when being wrong
+  would matter, or when they ask you to check.
 
 - BE STRAIGHT ABOUT HOW SURE YOU ARE. There are three kinds of question
   and they are handled differently:
@@ -1804,8 +1808,13 @@ Never pick one for them silently.
     @auto_report("search")
     async def web_search(self, context: RunContext, query: str,
                          near: str = ""):
-        """Search the web for anything not in their email or calendar —
-        addresses, phone numbers, business hours, travel time, facts, prices.
+        """Look something up ONLY when you don't already know it, or when
+        it changes: today's prices, opening hours now, a phone number, an
+        address, whether something is in stock, how far somewhere is, a
+        specific model's exact steps.
+
+        Do NOT use this for ordinary knowledge you already have - it costs
+        the caller a wait for nothing. Answer those yourself, straight away.
         Set near to a place name for local questions."""
         try:
             data = await backend_get("/web/search", q=query, near=near)

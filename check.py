@@ -1024,6 +1024,13 @@ def _():
     # that made it browse for a minute and a half over something it knew.
     assert "ANSWER FROM WHAT YOU KNOW FIRST" in said, \
         "it is being made to search for things it already knows"
+    assert "Looking it up is SLOWER" in said, \
+        "nothing tells it that searching what it knows wastes the call"
+    # the tool's own description must not invite needless lookups either
+    tools = {getattr(t, "__name__", ""): t for t in inst.tools}
+    doc = (tools["web_search"].__doc__ or "")
+    assert "ONLY when you don't already know it" in doc, \
+        "web_search still reads as 'search for any fact'"
     # but never guess about the caller's own things, and never fake a source
     assert "never from memory, always from a tool" in said, \
         "it may now guess about the caller's own email and orders"
