@@ -2701,6 +2701,24 @@ def _get_context(account_id: int, site: str):
     return ctx_id
 
 
+def _forget_context(account_id: int, site: str) -> bool:
+    """Throw away a saved browser identity so the next run starts clean.
+
+    A context keeps cookies - including whatever the site decided about
+    you at the time. Ours were created from a datacenter in Seattle, so
+    Target kept showing a Seattle store to a New York customer long after
+    the proxy was fixed."""
+    db = Session()
+    rows = (db.query(SiteSession)
+              .filter_by(account_id=account_id, site=(site or "").lower())
+              .all())
+    for r in rows:
+        db.delete(r)
+    db.commit()
+    db.close()
+    return bool(rows)
+
+
 def _save_context(account_id: int, site: str, ctx_id: str):
     db = Session()
     row = (db.query(SiteSession)
@@ -3551,9 +3569,16 @@ def _run_browse(jid: int, account_id: int, site: str):
                     stuck += 1
                     history.append(_stuck_note(stuck))
                     if stuck >= STUCK_LIMIT:
+                        # drop the saved identity: a stale one is a common
+                        # reason a site quietly ignores everything
+                        fresh = _forget_context(account_id, site_key)
                         _job_set(jid, "failed",
                                  f"The page stopped responding to anything "
-                                 f"it tried. Last screen: {text[:200]}",
+                                 f"it tried"
+                                 + (" - the saved browser session has been "
+                                    "cleared, so trying again starts fresh"
+                                    if fresh else "")
+                                 + f". Last screen: {text[:200]}",
                                  reason="stuck")
                         break
                 else:
@@ -5095,6 +5120,24 @@ def job_status(request: Request, job_id: int):
 def jobs_health(request: Request):
     require_auth(request)
     return queue_health()
+
+
+@app.post("/sessions/forget")
+def sessions_forget(request: Request, account_id: int, site: str = ""):
+    """Discard saved browser identities, so the next run starts clean."""
+    require_auth(request)
+    db = Session()
+    rows = db.query(SiteSession).filter_by(account_id=account_id)
+    if site:
+        rows = rows.filter_by(site=site.lower())
+    sites = [r.site for r in rows.all()]
+    db.close()
+    for s in sites:
+        _forget_context(account_id, s)
+    emit("browser", "context", f"cleared saved browser session(s) for "
+                               f"{', '.join(sites) or 'nothing'}",
+         "info", account_id)
+    return {"cleared": sites}
 
 
 @app.get("/sessions")
