@@ -1020,15 +1020,23 @@ def _():
     assert "read_page" in names, \
         "nothing can open a search result and read the actual page"
     said = inst.instructions
-    assert "NEVER INVENT AN ANSWER" in said, "the no-guessing rule is gone"
+    # It must be free to answer general knowledge straight away - forbidding
+    # that made it browse for a minute and a half over something it knew.
+    assert "ANSWER FROM WHAT YOU KNOW FIRST" in said, \
+        "it is being made to search for things it already knows"
+    # but never guess about the caller's own things, and never fake a source
+    assert "never from memory, always from a tool" in said, \
+        "it may now guess about the caller's own email and orders"
+    assert "NEVER dress a guess up as a source" in said, \
+        "it can claim a page said something it invented"
     assert "read_page" in said, "it is never told how to get the real detail"
     src = open("agent.py", encoding="utf-8").read()
     body = src[src.index("async def web_search("):]
     body = body[:body.index("\n    @function_tool")]
     assert "log_turn(" in body, \
         "web_search leaves no trace, so nobody can tell if it ever ran"
-    assert "do NOT guess" in body, \
-        "the search result no longer warns against filling in the gaps"
+    assert "never say 'the " in body, \
+        "the search result no longer warns against faking a source"
 
 
 @check("a page that failed to load is never described")
