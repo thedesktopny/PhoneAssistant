@@ -4991,8 +4991,10 @@ def job_site_search(request: Request, account_id: int, site: str,
 
 @app.post("/jobs/browse")
 def job_browse(request: Request, account_id: int, goal: str,
-               site: str = "", url: str = "", call_id: int = 0):
-    """Pursue any goal on any site. No per-site setup."""
+               site: str = "", url: str = "", call_id: int = 0,
+               max_steps: int = 0):
+    """Pursue any goal on any site. No per-site setup. max_steps lets a
+    quick probe stay quick."""
     require_auth(request)
     # checked before anything opens a browser - a blocked topic must not be
     # reachable just because it's on a web page rather than in a search
@@ -5001,9 +5003,11 @@ def job_browse(request: Request, account_id: int, goal: str,
         return {"blocked": True, "answer": BLOCKED_REPLY}
     if not BROWSERBASE_API_KEY:
         raise HTTPException(400, "Browserbase isn't configured.")
+    payload = {"goal": goal, "url": url}
+    if max_steps:
+        payload["max_steps"] = max(3, min(int(max_steps), 30))
     return {"job_id": start_job(account_id, "browse", site,
-                                call_id=call_id or None,
-                                payload={"goal": goal, "url": url})}
+                                call_id=call_id or None, payload=payload)}
 
 
 @app.get("/sites/report")
