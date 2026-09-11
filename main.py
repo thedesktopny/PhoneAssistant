@@ -2483,10 +2483,31 @@ def delete_everything(account_id: int) -> dict:
 
 def save_site_login(account_id: int, site: str, username: str,
                     password: str) -> dict:
-    """Store or replace one site login."""
+    """Store or replace one site login.
+
+    A blank password NEVER overwrites a stored one. A caller asked to
+    change only his username; the assistant called this with an empty
+    password, and his real password was replaced with nothing - so the
+    next sign-in reported 'no saved login' for an account that was there
+    all along."""
     db = Session()
     row = (db.query(SiteLogin)
              .filter_by(account_id=account_id, site=site.lower()).first())
+
+    if not (password or "").strip():
+        if not row:
+            db.close()
+            raise HTTPException(
+                400, "A new login needs a password as well as a username.")
+        if username.strip():
+            row.username = username.strip()
+        row.at = datetime.utcnow()
+        db.commit()
+        out = {"saved": True, "site": site.lower(), "username": row.username,
+               "password_unchanged": True}
+        db.close()
+        return out
+
     blob = vault_put({"password": password})
     if row:
         row.username = username

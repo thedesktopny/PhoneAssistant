@@ -1224,9 +1224,13 @@ Never pick one for them silently.
     @function_tool
     @auto_report("logins")
     async def save_site_login(self, context: RunContext, site: str,
-                              username: str, password: str):
+                              username: str, password: str = ""):
         """Save a login for a site with no API, e.g. Amazon. Only after
-        reading the details back and getting a yes."""
+        reading the details back and getting a yes.
+
+        To change ONLY the username, pass the new username and leave
+        password empty - the stored password is kept. Never invent or
+        re-send a password you were not just given."""
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
 
@@ -1235,7 +1239,7 @@ Never pick one for them silently.
         # part before the @ without ever reading it back, then failed to
         # sign in with it across two calls.
         key = site.strip().lower()
-        if not self._login_confirmed.get(key):
+        if password and not self._login_confirmed.get(key):
             self._login_confirmed[key] = True
             warn = username_warning(username)
             if warn:
@@ -1251,14 +1255,23 @@ Never pick one for them silently.
                     f"save_site_login again unchanged; if not, call it "
                     f"again with the correction.")
         try:
-            await backend_post("/logins", {
+            saved = await backend_post("/logins", {
                 "account_id": self.account_id, "site": site,
                 "username": username, "password": password})
         except Exception as e:
             log.error(f"save login failed: {e}")
+            if "400" in str(e):
+                return (f"There is nothing saved for {site} yet, so a "
+                        f"password is needed too. Ask them for it, one "
+                        f"character at a time.")
             return "That didn't save."
+        kept = bool(saved.get("password_unchanged"))
         await log_turn(self.call_id, "tool", f"saved login for {site}",
                        "save_site_login")
+        if kept:
+            return (f"Updated their {site} username to '{username}'. The "
+                    f"password they already had is unchanged - say that, so "
+                    f"they know they don't need to give it again.")
         return (f"Saved their {site} login. Do not say the password again. "
                 f"Tell them it's stored encrypted and they can have it "
                 f"deleted whenever they want.")
@@ -1867,6 +1880,8 @@ async def entrypoint(ctx: JobContext):
             role = getattr(item, "role", "")
             text = getattr(item, "text_content", None) or ""
             if text:
+                if role != "user":
+                    last_heard["agent_done"] = time.monotonic()
                 who = "caller" if role == "user" else "agent"
                 asyncio.create_task(log_turn(call_id, who, text))
                 if account:
@@ -1903,7 +1918,12 @@ async def entrypoint(ctx: JobContext):
     # line ties up a browser session too.
     hangup = asyncio.Event()
     agent_obj._hangup = hangup
-    last_heard = {"at": time.monotonic()}
+    # "at" = the caller last said something. "agent_done" = the agent last
+    # finished saying something. The caller's turn starts at the LATER of
+    # the two - listening to a long answer is not the same as being absent,
+    # and a caller was hung up on for "no answer" while the agent was still
+    # talking.
+    last_heard = {"at": time.monotonic(), "agent_done": time.monotonic()}
     started_at = time.monotonic()
 
     try:
@@ -1914,11 +1934,13 @@ async def entrypoint(ctx: JobContext):
         log.warning(f"could not watch for silence: {e}")
 
     async def watchdog():
-        warned = False
+        warned_at = 0.0
         while not hangup.is_set():
             await asyncio.sleep(5)
-            quiet = time.monotonic() - last_heard["at"]
-            total = time.monotonic() - started_at
+            now = time.monotonic()
+            # measured from whenever it last became the caller's turn
+            quiet = now - max(last_heard["at"], last_heard["agent_done"])
+            total = now - started_at
             busy = bool(getattr(agent_obj, "onboard_sid", None)
                         or getattr(agent_obj, "job_id", None)
                         or getattr(agent_obj, "order_id", None))
@@ -1946,8 +1968,9 @@ async def entrypoint(ctx: JobContext):
                 hangup.set()
                 return
 
-            if quiet > warn_at and not warned:
-                warned = True
+            # warn once per silence, and not again until they speak
+            if quiet > warn_at and warned_at < last_heard["at"]:
+                warned_at = now
                 try:
                     await session.generate_reply(
                         instructions=("In English: ask once, gently, if "
@@ -1955,8 +1978,6 @@ async def entrypoint(ctx: JobContext):
                                       "sentence."))
                 except Exception:
                     pass
-            elif quiet < warn_at:
-                warned = False
 
     async def hangup_when_asked():
         await hangup.wait()

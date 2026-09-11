@@ -516,6 +516,43 @@ def _():
     assert 'reason="stuck"' in body, "a stuck page needs its own reason code"
 
 
+@check("changing a username never wipes the saved password")
+def _():
+    """Call 43: the caller asked to change only his Target username. The
+    assistant sent an empty password, we stored it over the real one, and
+    the next sign-in said 'no saved login' for an account that was there."""
+    acct = 970777
+    main.save_site_login(acct, "testsite", "old@x.com", "realpassword")
+    out = main.save_site_login(acct, "testsite", "new@x.com", "")
+    assert out.get("password_unchanged"), f"password was overwritten: {out}"
+    creds = main.use_site_login(acct, "testsite", purpose="check")
+    assert creds.get("password") == "realpassword", \
+        "the stored password did not survive a username change"
+    assert creds.get("username") == "new@x.com", "the username didn't change"
+    # and a brand-new login still demands one
+    try:
+        main.save_site_login(acct, "brandnew", "a@b.com", "")
+    except Exception as e:
+        assert "password" in str(e).lower(), e
+    else:
+        raise AssertionError("a new login was saved with no password")
+    main.forget_site_login(acct, "testsite")
+
+
+@check("listening to the agent doesn't count as the caller being absent")
+def _():
+    """Call 43 was cut off for 'no answer' 13 seconds after the agent
+    stopped talking, because the clock ran from the caller's last words
+    through the agent's own 30-second reply."""
+    src = open("agent.py", encoding="utf-8").read()
+    body = src[src.index("async def watchdog("):]
+    body = body[:body.index("\n    async def ", 10)]
+    assert 'max(last_heard["at"], last_heard["agent_done"])' in body, \
+        "the silence clock still ignores when the agent was speaking"
+    assert 'last_heard["agent_done"] = time.monotonic()' in src, \
+        "nothing records when the agent finished a turn"
+
+
 @check("caller country routing")
 def _():
     assert main._where_for_phone("+13476752334")[0] == "US"
