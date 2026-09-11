@@ -1726,6 +1726,15 @@ def _bb_session(context_id: str = "", country: str = "",
                 return sid
         except Exception as e:
             detail = str(e)[:300]
+            # urllib throws the response body away, and the body is where
+            # Browserbase explains itself. Read it.
+            try:
+                if isinstance(e, urllib.error.HTTPError):
+                    said = e.read().decode("utf-8", "replace")[:300]
+                    if said:
+                        detail = f"{detail} - {said}"
+            except Exception:
+                pass
             paid = "402" in detail or "Payment Required" in detail
             if wants_proxy and paid:
                 _flag_proxy_unavailable(country)
@@ -5308,6 +5317,53 @@ def models_list(request: Request):
         out["browser_model_exists"] = MODEL_BROWSER in names
     except Exception as e:
         out["error"] = f"could not list models: {str(e)[:200]}"
+    return out
+
+
+@app.get("/browser/account")
+def browser_account(request: Request):
+    """Ask Browserbase for a plain browser and report exactly what it says.
+    Turns 'browsing is broken' into the actual reason, in their words."""
+    require_auth(request)
+    out = {"api_key_set": bool(BROWSERBASE_API_KEY),
+           "project_set": bool(BROWSERBASE_PROJECT_ID)}
+    if not BROWSERBASE_API_KEY:
+        out["verdict"] = "No BROWSERBASE_API_KEY on the backend."
+        return out
+    try:
+        req = urllib.request.Request(
+            "https://api.browserbase.com/v1/sessions",
+            data=json.dumps({"projectId": BROWSERBASE_PROJECT_ID}).encode(),
+            headers={"X-BB-API-Key": BROWSERBASE_API_KEY,
+                     "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=25) as r:
+            body = json.loads(r.read().decode())
+        out["status"] = 200
+        out["session_id"] = body.get("id", "")
+        out["verdict"] = ("Browserbase started a browser - the account is "
+                          "fine right now.")
+    except urllib.error.HTTPError as e:
+        try:
+            out["browserbase_said"] = e.read().decode("utf-8", "replace")[:600]
+        except Exception:
+            out["browserbase_said"] = ""
+        out["status"] = e.code
+        if e.code == 402:
+            out["verdict"] = ("Browserbase is refusing to start a browser "
+                              "(402). The account is out of sessions or "
+                              "minutes, or billing needs attention. Check "
+                              "usage and billing at browserbase.com. No "
+                              "code change will fix this.")
+        elif e.code == 401:
+            out["verdict"] = ("Browserbase rejected the API key (401). Check "
+                              "BROWSERBASE_API_KEY on the backend service.")
+        elif e.code == 429:
+            out["verdict"] = ("Too many browsers at once (429). Lower "
+                              "MAX_BROWSERS or wait for jobs to finish.")
+        else:
+            out["verdict"] = f"Browserbase returned {e.code}."
+    except Exception as e:
+        out["verdict"] = f"Could not reach Browserbase: {str(e)[:200]}"
     return out
 
 
