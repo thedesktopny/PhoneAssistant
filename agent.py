@@ -270,6 +270,7 @@ class Assistant(Agent):
         self._mailboxes = None
         self.job_username = ""
         self._login_confirmed = {}
+        self.last_search = []
 
         # %-d is Linux-only and raises on Windows, where check.py is run
         _now = datetime.now(ZoneInfo("America/New_York"))
@@ -594,6 +595,15 @@ LOOKING THINGS UP
 - Use web_search for anything outside their email and calendar: a business's
   address, phone number or hours, how far somewhere is, a fact, a price,
   what's open nearby.
+- NEVER INVENT AN ANSWER. A search gives you short summaries, not the
+  pages. If they want steps, button names, settings, part numbers, prices
+  or anything exact, and the summary does not contain it, you do not know
+  it. Do not offer a likely-sounding answer, do not say "it might be", and
+  do not ask them to check their appliance and tell you what they see -
+  they rang you to be told. Say you will read the page properly, then call
+  read_page with the number of the best result.
+- A caller was given three different made-up button combinations for his
+  fridge and hung up. Reading one page would have answered him.
 - The caller is in the New York area. For anything local, pass their area in
   the "near" field.
 - Give the answer in one or two spoken sentences. Read a phone number in
@@ -1769,10 +1779,61 @@ Never pick one for them silently.
             return ("BLOCKED. Say exactly: I am not allowed to talk to you "
                     "about this. Nothing else.")
         ans = data.get("answer") or ""
-        extra = " ".join(r.get("snippet", "") for r in data.get("results", []))
-        if not ans and not extra:
+        results = data.get("results", [])
+        if not ans and not results:
             return f"Nothing useful came back for '{query}'."
-        return (ans + " " + extra)[:1200]
+
+        self.last_search = [r.get("url", "") for r in results]
+        await log_turn(self.call_id, "tool", f"searched: {query}",
+                       "web_search", backend_get.last_ms)
+        lines = []
+        if ans:
+            lines.append(f"Summary: {ans}")
+        for i, r in enumerate(results, 1):
+            lines.append(f"{i}. {r.get('title', '')} — {r.get('snippet', '')}")
+        lines.append(
+            "Say ONLY what is written above. These are short search "
+            "summaries, not the pages themselves, so they usually stop "
+            "short of the actual steps. If the caller wants detail that is "
+            "not here - which buttons to press, exact instructions, a price "
+            "- do NOT guess and do NOT offer a likely-sounding answer. Tell "
+            "them you'll read the page properly, then call read_page with "
+            "that result's number.")
+        return "\n".join(lines)[:2000]
+
+    @function_tool
+    @auto_report("search")
+    async def read_page(self, context: RunContext, which: int,
+                        looking_for: str):
+        """Open one of the search results and read the real page, when the
+        search summary doesn't have the detail the caller needs. 'which' is
+        the number from the search list. Use this instead of guessing at
+        steps, buttons, prices or instructions."""
+        urls = getattr(self, "last_search", [])
+        if not urls:
+            return "No search results to open. Do a web_search first."
+        if which < 1 or which > len(urls) or not urls[which - 1]:
+            return (f"Pick a number between 1 and {len(urls)} from the "
+                    f"search results.")
+        try:
+            async with httpx.AsyncClient(timeout=25) as c:
+                r = await c.post(f"{BACKEND}/jobs/browse", headers=AUTH,
+                                 params={"account_id": self.account_id,
+                                         "goal": looking_for,
+                                         "url": urls[which - 1],
+                                         "max_steps": 6,
+                                         "call_id": self.call_id or 0})
+                d = r.json()
+        except Exception as e:
+            log.error(f"read page failed: {e}")
+            return "Couldn't open that page."
+        if d.get("blocked"):
+            return d.get("answer") or "BLOCKED."
+        self.job_id = d.get("job_id")
+        self.job_question = looking_for
+        self._watch_job(f"reading a page about {looking_for}")
+        return ("Reading the page now. Tell them that in one sentence, then "
+                "say nothing until I tell you what it says.")
 
     @function_tool
     @auto_report("calendar")

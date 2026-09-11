@@ -899,6 +899,29 @@ def _():
         "practical mentions of another religion will be refused again"
 
 
+@check("a half-answer from search can be turned into a real one")
+def _():
+    """Call 46: asked how to switch Shabbos mode on a Thermador fridge, the
+    assistant invented three different button combinations and then said it
+    couldn't identify the brand. The answer was the first search result -
+    but search returns summaries, not pages, so it filled the gap itself."""
+    inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                           "+1555", 1)
+    names = {getattr(t, "__name__", "") for t in inst.tools}
+    assert "read_page" in names, \
+        "nothing can open a search result and read the actual page"
+    said = inst.instructions
+    assert "NEVER INVENT AN ANSWER" in said, "the no-guessing rule is gone"
+    assert "read_page" in said, "it is never told how to get the real detail"
+    src = open("agent.py", encoding="utf-8").read()
+    body = src[src.index("async def web_search("):]
+    body = body[:body.index("\n    @function_tool")]
+    assert "log_turn(" in body, \
+        "web_search leaves no trace, so nobody can tell if it ever ran"
+    assert "do NOT guess" in body, \
+        "the search result no longer warns against filling in the gaps"
+
+
 @check("required tools exist")
 def _():
     inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
