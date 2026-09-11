@@ -649,6 +649,23 @@ def _():
         "browse and checkout must both use the safe reader"
 
 
+@check("an A-B-A-B loop is spotted, not just a page that won't change")
+def _():
+    """Home Depot went search, error, refresh, search, error, refresh six
+    times. The page changed on every step, so 'did anything happen?' never
+    tripped."""
+    circle = ["type:3:pen", "goto:https://x", "type:3:pen", "goto:https://x",
+              "type:3:pen", "goto:https://x"]
+    assert main._going_in_circles(circle), "missed an alternating loop"
+    progress = ["type:3:pen", "click:5:", "click:9:", "goto:https://y",
+                "click:2:", "done:0:"]
+    assert not main._going_in_circles(progress), "real progress flagged"
+    assert not main._going_in_circles([]), "empty history flagged"
+    assert main._action_sig({"action": "goto", "url": "https://a"}) \
+        != main._action_sig({"action": "goto", "url": "https://b"})
+    assert main._action_sig({"action": "click", "index": 0}) == "click:0:"
+
+
 @check("caller country routing")
 def _():
     assert main._where_for_phone("+13476752334")[0] == "US"

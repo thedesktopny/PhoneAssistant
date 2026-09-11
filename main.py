@@ -3233,6 +3233,27 @@ def _action_index(act: dict) -> int:
         return -1
 
 
+def _action_sig(act: dict) -> str:
+    """A short fingerprint of what the model just decided to do, so the
+    same decision can be recognised when it comes round again."""
+    a = act.get("action", "")
+    if a == "goto":
+        return f"goto:{act.get('url', '')}"
+    return f"{a}:{_action_index(act)}:{str(act.get('text', ''))[:20]}"
+
+
+def _going_in_circles(sigs: list, window: int = 6, times: int = 3) -> bool:
+    """Is it doing the same thing over and over?
+
+    Comparing the page before and after an action misses a loop that
+    alternates - Home Depot went search, error, refresh, search, error,
+    refresh six times, and the page 'changed' on every single step."""
+    if len(sigs) < times:
+        return False
+    recent = sigs[-window:]
+    return any(recent.count(s) >= times for s in set(recent))
+
+
 def _stuck_note(n: int) -> str:
     """What to tell the agent when the page hasn't reacted.
 
@@ -3471,6 +3492,7 @@ def _run_browse(jid: int, account_id: int, site: str):
     history = []
     path_used = "agent"
     stuck = 0              # actions in a row that changed nothing
+    sigs = []              # what it has been trying, to spot a loop
     try:
         with sync_playwright() as p:
             browser, page, ctx_id = _open_with_session(p, account_id, site_key)
@@ -3609,6 +3631,23 @@ def _run_browse(jid: int, account_id: int, site: str):
                 except Exception as e:
                     history.append(f"{a} failed: {str(e)[:90]}")
                     _job_set(jid, "working", f"Retrying after: {str(e)[:80]}")
+                    continue
+
+                sigs.append(_action_sig(act))
+                if _going_in_circles(sigs):
+                    stuck += 1
+                    history.append(
+                        "You have done that same thing several times now "
+                        "and are going round in circles. Try a completely "
+                        "different route, or give_up and say what you saw.")
+                    _job_set(jid, "working", "going round in circles")
+                    if stuck >= STUCK_LIMIT:
+                        _job_set(jid, "failed",
+                                 f"It kept repeating the same steps without "
+                                 f"getting anywhere. Last screen: "
+                                 f"{text[:200]}", reason="stuck")
+                        break
+                    sigs.clear()
                     continue
 
                 # Did any of that actually do something?

@@ -36,6 +36,18 @@ ACCOUNT = int(os.environ.get("TEST_ACCOUNT_ID", "1"))
 DEFAULT = ["macys", "bestbuy", "homedepot", "cvs", "walgreens", "kohls",
            "costco", "wayfair", "etsy", "lowes"]
 
+GOAL_GUEST = (
+    "Do NOT sign in and do NOT go anywhere near a sign-in page. Pretend you "
+    "are a shopper who has never had an account here. Search for a cheap "
+    "everyday item, open it, add it to the basket, then open the basket and "
+    "try to start checkout as a guest. Stop as soon as you know one of these "
+    "and reply with done, answer being EXACTLY one word: BLOCKED if a robot "
+    "or human-verification check appears at any point; GUEST_OK if you reach "
+    "a checkout page that asks for a delivery address or payment without "
+    "demanding an account; LOGIN_WALL if it will not let you check out "
+    "without signing in or creating an account. Never buy anything and never "
+    "enter payment details.")
+
 GOAL = ("Find out how this site treats you. Try to reach the sign-in page, "
         "then try to put any one item in the cart and get to checkout WITHOUT "
         "signing in. Stop as soon as you know one of these and reply with "
@@ -44,7 +56,7 @@ GOAL = ("Find out how this site treats you. Try to reach the sign-in page, "
         "reach a cart or checkout without signing in; SIGN_IN if you find a "
         "normal sign-in form and are not blocked. Never buy anything.")
 
-STEPS = 7
+STEPS = int(os.environ.get('PROBE_STEPS', '12'))
 
 
 def call(path, method="GET", **params):
@@ -67,6 +79,8 @@ def verdict(job: dict) -> str:
             return "GUEST_OK"
         if "SIGN_IN" in up:
             return "SIGN_IN"
+        if "LOGIN_WALL" in up:
+            return "LOGIN_WALL"
     return "UNCLEAR"
 
 
@@ -74,12 +88,18 @@ def main():
     if not TOKEN or "<" in TOKEN:
         print("SERVICE_TOKEN is not set to a real token.")
         return 2
-    sites = [s.lower().strip() for s in sys.argv[1:]] or DEFAULT
+    args = [a for a in sys.argv[1:]]
+    guest = "--guest" in args
+    args = [a for a in args if not a.startswith("--")]
+    sites = [s.lower().strip() for s in args] or DEFAULT
+    goal = GOAL_GUEST if guest else GOAL
+    if guest:
+        print("GUEST-ONLY probe: never touches a sign-in page")
     print(f"probing {len(sites)} sites, {STEPS} steps each, via {BACKEND}\n")
 
     started = {}
     for s in sites:
-        d = call("/jobs/browse", "POST", account_id=ACCOUNT, goal=GOAL,
+        d = call("/jobs/browse", "POST", account_id=ACCOUNT, goal=goal,
                  site=s, max_steps=STEPS)
         if d.get("blocked"):
             print(f"  {s:<12} refused by our own topic filter")
@@ -113,6 +133,7 @@ def main():
         "BLOCKED": "refuses robots - needs ACP / partner API / concierge",
         "GUEST_OK": "ordering may work today with no login",
         "SIGN_IN": "login needed, but the site isn't fighting us",
+        "LOGIN_WALL": "guest checkout not allowed - an account is required",
         "UNCLEAR": "look at the job in the admin panel",
     }
     for s in sites:
