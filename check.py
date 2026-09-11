@@ -1009,6 +1009,35 @@ def _():
         "the search result no longer warns against filling in the gaps"
 
 
+@check("a page that failed to load is never described")
+def _():
+    """Call 48: the Frigidaire support page was blocked by a bot check, and
+    twenty seconds later the assistant said "the page says that depending
+    on your model..." - describing a page it had never read."""
+    src = open("agent.py", encoding="utf-8").read()
+    body = src[src.index("async def get_site_result("):]
+    body = body[:body.index("\n    @function_tool")]
+    assert "nothing from that page" in body, \
+        "a failed page read no longer tells it that it has nothing"
+    assert "do not describe its contents" in body, body[-200:]
+    watcher = src[src.index("def _watch_job("):]
+    watcher = watcher[:watcher.index("\n    @function_tool")]
+    assert 'kind == "browse"' in watcher and "NOTHING" in watcher, \
+        "the watcher lets a failed page read pass as an answer"
+
+
+@check("one garbled turn doesn't switch the language")
+def _():
+    """Call 48 opened with a mangled transcription and the assistant
+    answered in Hebrew, so the caller had to ask for English."""
+    inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                           "+1555", 1)
+    said = inst.instructions
+    assert "Greet them in English" in said, "it can drift on the greeting"
+    assert "garbled turn is NOT that" in said, \
+        "nothing stops a misheard turn being read as a language choice"
+
+
 @check("required tools exist")
 def _():
     inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},

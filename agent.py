@@ -383,10 +383,17 @@ Two limits on that:
   wrong about this matters to them.
 
 LANGUAGE
-Speak English. Start every call in English and stay in English unless the
-caller clearly speaks to you in another language first — then answer in
-theirs and keep to it for the rest of the call. Never switch languages on
-your own, and never switch back mid-call unless they do.
+Speak English. Greet them in English and ask for the PIN in English, every
+single time, whatever the first thing you heard sounded like.
+
+Only change language when the caller has clearly and deliberately spoken to
+you in another one - a whole sentence you understood, or a plain request
+like "can you speak Yiddish". A single garbled turn is NOT that. The line
+is noisy and the transcription mangles things: one call opened with what
+looked like German, you answered in Hebrew, and the caller had to ask you
+to switch to English. When in doubt, stay in English and carry on.
+Once they have genuinely chosen a language, keep to it for the rest of the
+call. Never switch on your own.
 
 NEVER PROMISE WHAT YOU CAN'T DO
 Only say you have done something after the tool has actually done it. If you
@@ -728,6 +735,14 @@ Never pick one for them silently.
                 return ("Say it's done, then get the details with "
                         "get_site_result.")
             if st == "failed":
+                if kind == "browse":
+                    if d.get("reason") == "bot_check":
+                        return ("Say that page is blocking us and you'll "
+                                "try a different source. You have NOTHING "
+                                "from it - do not describe what it said.")
+                    return (f"Say you couldn't open that page: {msg}. You "
+                            f"have NOTHING from it - do not describe what "
+                            f"it said. Offer to try another source.")
                 if d.get("reason") == "signed_out":
                     return ("Tell them the saved session has expired and "
                             "that you'll sign in again with the login they "
@@ -1189,7 +1204,11 @@ Never pick one for them silently.
         if d.get("state") == "done":
             return d.get("answer") or "Nothing came back."
         if d.get("state") == "failed":
-            return f"It didn't work: {d.get('message', '')}"
+            return (f"That did NOT work: {d.get('message', '')}. You have "
+                    f"nothing from that page - not a summary, not a hint. "
+                    f"Do NOT say what it said, do not describe its contents "
+                    f"and do not produce an answer from it. Tell them you "
+                    f"couldn't open it and offer to try a different source.")
         if d.get("state") == "needs_input":
             return (d.get("message", "") +
                     " Ask them, then call answer_website_question.")
