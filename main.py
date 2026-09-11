@@ -937,9 +937,11 @@ def signed_in(page, why_for: str = "") -> tuple:
 
 
 BOT_CHECK_MARKS = _re_scrub.compile(
-    r"(?i)(press and hold|prove you.re (not a robot|human)|"
-    r"verify you are (a )?human|i.m not a robot|captcha|"
-    r"unusual traffic from your|are you a robot)")
+    r"(?i)(press(ing)?\s*(and|&)\s*hold|activat\w*\s+and\s+hold|"
+    r"hold\w*\s+(the\s+)?button|prove you.re (not a robot|human)|"
+    r"(confirm|verify) (that )?you.?re (a )?human|"
+    r"verify you are (a )?human|i.m not a robot|captcha|recaptcha|"
+    r"unusual traffic from your|are you a robot|human verification)")
 
 
 def looks_like_bot_check(text: str) -> bool:
@@ -2774,10 +2776,16 @@ def _run_site_login(jid: int, account_id: int, site: str):
     The handover happens HERE, after the browser work has finished and
     Playwright has closed. Starting a second Playwright inside the first
     one crashes with "Sync API inside the asyncio loop"."""
-    handover = _do_site_login(jid, account_id, site)
-    if handover:
-        goal, url = handover
-        _agent_fallback(jid, account_id, site, goal, url)
+    try:
+        handover = _do_site_login(jid, account_id, site)
+        if handover:
+            goal, url = handover
+            _agent_fallback(jid, account_id, site, goal, url)
+    finally:
+        # only once EVERYTHING is finished. _do_site_login used to drop it
+        # here, so a handed-over job could never be answered: the caller's
+        # reply came back "that job is no longer running".
+        _JOBS.pop(jid, None)
 
 
 def _do_site_login(jid: int, account_id: int, site: str):
@@ -2915,8 +2923,8 @@ def _do_site_login(jid: int, account_id: int, site: str):
                 browser.close()
         except Exception:
             pass
-    finally:
-        _JOBS.pop(jid, None)
+    # NB: the job is NOT removed from _JOBS here - the handover that may
+    # follow still needs to receive the caller's answers.
 
 
 def _open_with_session(p, account_id: int, site: str):
@@ -3517,6 +3525,13 @@ def _run_browse(jid: int, account_id: int, site: str):
                 if a == "ask_user":
                     # never name this 'q' - that shadows the page helper q()
                     question = act.get("question", "")[:300]
+                    if looks_like_bot_check(question):
+                        _job_set(jid, "failed",
+                                 f"{site_key} wants a human to complete a "
+                                 f"check by hand, which a caller on the "
+                                 f"phone cannot do for us.",
+                                 reason="bot_check")
+                        break
                     _job_set(jid, "needs_input", question)
                     waited, reply = 0, None
                     while waited < 240:

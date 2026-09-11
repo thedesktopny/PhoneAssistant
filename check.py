@@ -596,6 +596,41 @@ def _():
     assert "_agent_fallback(" in outer, "nothing performs the handover"
 
 
+@check("a handed-over job can still be answered")
+def _():
+    """_do_site_login dropped the job from _JOBS when it handed over, so
+    the caller's answer came back 'that job is no longer running' and
+    every handed-over job timed out waiting for a reply that was refused."""
+    src = open("main.py", encoding="utf-8").read()
+    inner = src[src.index("def _do_site_login("):]
+    inner = inner[:inner.index("\ndef ", 10)]
+    assert "_JOBS.pop(" not in inner, \
+        "the browser step still drops the job before the handover runs"
+    outer = src[src.index("def _run_site_login("):]
+    outer = outer[:outer.index("\ndef ", 10)]
+    assert "_JOBS.pop(" in outer, "nothing cleans the job up afterwards"
+
+
+@check("a captcha is not something a phone caller can be asked to do")
+def _():
+    """Walmart asked us to 'activate and hold the button to confirm you're
+    human'. We passed that on to a caller who cannot see the browser."""
+    for wording in ("press and hold to continue",
+                    "activating and holding the button to confirm you're "
+                    "human",
+                    "please complete the captcha",
+                    "confirm you're human"):
+        assert main.looks_like_bot_check(wording), f"missed: {wording!r}"
+    assert not main.looks_like_bot_check("hold on, your order is loading")
+    assert not main.looks_like_bot_check("")
+    src = open("main.py", encoding="utf-8").read()
+    body = src[src.index("def _run_browse("):]
+    body = body[:body.index("\ndef ", 10)]
+    i = body.index('a == "ask_user"')
+    assert "looks_like_bot_check(question)" in body[i:i + 400], \
+        "a captcha question is still passed on to the caller"
+
+
 @check("caller country routing")
 def _():
     assert main._where_for_phone("+13476752334")[0] == "US"
