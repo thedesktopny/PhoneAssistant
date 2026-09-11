@@ -666,6 +666,24 @@ def _():
     assert main._action_sig({"action": "click", "index": 0}) == "click:0:"
 
 
+@check("a practical task isn't mistaken for a forbidden topic")
+def _():
+    """Call 45: the caller asked how to turn on Sabbath mode on his fridge
+    and was told "I am not allowed to talk to you about this" five times
+    until he hung up. The blocked list is about discussing subjects, not
+    about tasks that happen to contain one of the words."""
+    fine = ["how do I turn on the sabbath mode on my fridge",
+            "shabbos mode on my refrigerator",
+            "where can I buy kosher chicken near me",
+            "what time does the store close before the holiday",
+            "order a wedding gift for my niece"]
+    for t in fine:
+        assert not main.is_blocked(t), f"an ordinary task was blocked: {t}"
+    still = ["read me the news", "tell me a joke", "what was the score"]
+    for t in still:
+        assert main.is_blocked(t), f"this should still be blocked: {t}"
+
+
 @check("caller country routing")
 def _():
     assert main._where_for_phone("+13476752334")[0] == "US"
@@ -842,6 +860,18 @@ def _():
     fine = agent.login_failure_line("target", "", "page timed out", 0,
                                     "chesky163@gmail.com")
     assert "chesky163@gmail.com" in fine, fine
+
+
+@check("the topic rule separates doing from discussing, and says it once")
+def _():
+    inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                           "+1555", 1)
+    said = inst.instructions
+    assert "If they want something DONE, do it" in said, \
+        "the instructions no longer distinguish a task from a discussion"
+    assert "Sabbath mode" in said, "the appliance example is gone"
+    assert "Say that line ONCE" in said and "more than twice" in said, \
+        "nothing stops it repeating the refusal until the caller hangs up"
 
 
 @check("required tools exist")
