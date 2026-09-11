@@ -570,6 +570,22 @@ def _():
         "a 402 without a proxy request is still blamed on geography"
 
 
+@check("a rotted selector hands over to the agent instead of giving up")
+def _():
+    """Walmart swapped its email box for a combined phone-or-email field.
+    The hand-written selector missed and the job just failed - the exact
+    treadmill the fallback exists to stop. Config is an optimisation; the
+    agent is the plan."""
+    src = open("main.py", encoding="utf-8").read()
+    body = src[src.index("def _run_site_login("):]
+    body = body[:body.index("\ndef ", 10)]
+    for dead in ("No username box", "No password box"):
+        assert dead not in body, \
+            f"'{dead}' still ends the job - call _agent_fallback() instead"
+    assert body.count("_agent_fallback(") >= 3, \
+        "not every selector miss falls through to the agent"
+
+
 @check("caller country routing")
 def _():
     assert main._where_for_phone("+13476752334")[0] == "US"

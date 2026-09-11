@@ -2814,9 +2814,17 @@ def _run_site_login(jid: int, account_id: int, site: str):
             _job_set(jid, "signing_in", "Entering their details.")
             user_el = q(page, cfg["user_sel"])
             if not user_el:
-                _job_set(jid, "failed",
-                         f"No username box. {page_text(page, 220)}")
+                # The hand-written selectors are an optimisation, not the
+                # plan. Walmart swapped its email box for a combined
+                # phone-or-email one and this simply gave up; sites change
+                # their pages and nobody should have to notice.
                 browser.close()
+                _agent_fallback(
+                    jid, account_id, site,
+                    f"sign in to {site} with the saved username and "
+                    f"password, then confirm you are signed in by naming "
+                    f"what you can see on the account page",
+                    cfg["login_url"])
                 return
             do_fill(page, user_el, creds["username"])
             nxt = q(page, cfg["next_sel"])
@@ -2831,9 +2839,12 @@ def _run_site_login(jid: int, account_id: int, site: str):
 
             pw_el = q(page, cfg["pass_sel"])
             if not pw_el:
-                _job_set(jid, "failed",
-                         f"No password box. {page_text(page, 220)}")
                 browser.close()
+                _agent_fallback(
+                    jid, account_id, site,
+                    f"finish signing in to {site} with the saved username "
+                    f"and password, then confirm you are signed in",
+                    page_url(page) or cfg["login_url"])
                 return
             do_fill(page, pw_el, creds["password"])
             nxt = q(page, cfg["next_sel"])
@@ -3202,9 +3213,10 @@ def _stuck_note(n: int) -> str:
     if n == 1:
         return "That changed nothing on the page."
     if n == 2:
-        return ("That changed nothing again. The field may not be taking "
-                "input, or the form may need a different button - try "
-                "something else, not the same step.")
+        return ("That changed nothing again. Do not click the same thing a "
+                "third time. If you were trying to reach a sign-in page, "
+                "use goto with the site's own sign-in address instead of "
+                "hunting for the link.")
     return ("Nothing you have tried has changed the page. Stop repeating "
             "these steps. Either go back, try a completely different route, "
             "or give_up and say what you could see.")
