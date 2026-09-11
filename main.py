@@ -2768,7 +2768,20 @@ def _agent_fallback(jid: int, account_id: int, site: str, goal: str,
 
 
 def _run_site_login(jid: int, account_id: int, site: str):
-    """Log this customer into a site and keep the session for next time."""
+    """Log this customer in, handing over to the general agent if the
+    hand-written setup doesn't fit the page any more.
+
+    The handover happens HERE, after the browser work has finished and
+    Playwright has closed. Starting a second Playwright inside the first
+    one crashes with "Sync API inside the asyncio loop"."""
+    handover = _do_site_login(jid, account_id, site)
+    if handover:
+        goal, url = handover
+        _agent_fallback(jid, account_id, site, goal, url)
+
+
+def _do_site_login(jid: int, account_id: int, site: str):
+    """Returns (goal, url) if the agent should take over, else None."""
     from playwright.sync_api import sync_playwright
 
     creds = use_site_login(account_id, site, purpose=f"job {jid} login")
@@ -2779,13 +2792,10 @@ def _run_site_login(jid: int, account_id: int, site: str):
     cfg = SITES.get(site.lower())
     if not cfg:
         # never seen this site - the agent signs in the way a person would
-        _agent_fallback(
-            jid, account_id, site,
-            f"sign in to {site} with the saved username and password, then "
-            f"confirm you are signed in by naming what you can see on the "
-            f"account page",
-            f"https://www.{site}.com")
-        return
+        return (f"sign in to {site} with the saved username and password, "
+                f"then confirm you are signed in by naming what you can see "
+                f"on the account page",
+                f"https://www.{site}.com")
 
     ctx_id = _get_context(account_id, site.lower()) or \
         _new_browserbase_context()
@@ -2819,13 +2829,10 @@ def _run_site_login(jid: int, account_id: int, site: str):
                 # phone-or-email one and this simply gave up; sites change
                 # their pages and nobody should have to notice.
                 browser.close()
-                _agent_fallback(
-                    jid, account_id, site,
-                    f"sign in to {site} with the saved username and "
-                    f"password, then confirm you are signed in by naming "
-                    f"what you can see on the account page",
-                    cfg["login_url"])
-                return
+                return (f"sign in to {site} with the saved username and "
+                        f"password, then confirm you are signed in by "
+                        f"naming what you can see on the account page",
+                        cfg["login_url"])
             do_fill(page, user_el, creds["username"])
             nxt = q(page, cfg["next_sel"])
             if nxt:
@@ -2839,13 +2846,11 @@ def _run_site_login(jid: int, account_id: int, site: str):
 
             pw_el = q(page, cfg["pass_sel"])
             if not pw_el:
+                where = page_url(page) or cfg["login_url"]
                 browser.close()
-                _agent_fallback(
-                    jid, account_id, site,
-                    f"finish signing in to {site} with the saved username "
-                    f"and password, then confirm you are signed in",
-                    page_url(page) or cfg["login_url"])
-                return
+                return (f"finish signing in to {site} with the saved "
+                        f"username and password, then confirm you are "
+                        f"signed in", where)
             do_fill(page, pw_el, creds["password"])
             nxt = q(page, cfg["next_sel"])
             if nxt:

@@ -579,13 +579,21 @@ def _():
     treadmill the fallback exists to stop. Config is an optimisation; the
     agent is the plan."""
     src = open("main.py", encoding="utf-8").read()
-    body = src[src.index("def _run_site_login("):]
-    body = body[:body.index("\ndef ", 10)]
+    inner = src[src.index("def _do_site_login("):]
+    inner = inner[:inner.index("\ndef ", 10)]
+    # (the Gmail sign-in has its own wording and no agent fallback - this
+    # is only about shop logins)
     for dead in ("No username box", "No password box"):
-        assert dead not in body, \
-            f"'{dead}' still ends the job - call _agent_fallback() instead"
-    assert body.count("_agent_fallback(") >= 3, \
-        "not every selector miss falls through to the agent"
+        assert dead not in inner, \
+            f"'{dead}' still ends the job - hand over to the agent instead"
+    assert "_agent_fallback(" not in inner, (
+        "the handover must not run inside the playwright block - starting a "
+        "second sync_playwright inside the first one crashes the job")
+    assert inner.count("return (f") >= 3, \
+        "not every selector miss hands over to the agent"
+    outer = src[src.index("def _run_site_login("):]
+    outer = outer[:outer.index("\ndef ", 10)]
+    assert "_agent_fallback(" in outer, "nothing performs the handover"
 
 
 @check("caller country routing")
