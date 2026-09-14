@@ -647,6 +647,14 @@ LOOKING THINGS UP
   page actually came back and said it. Do not give the same question three
   different confident answers - that is how they know you are guessing.
 
+- NOT SURE? ASK first, don't browse. ask_ai puts the question to a bigger
+  model and comes back in a couple of seconds. Use it the moment you are
+  less than certain about anything general - an appliance, a word, how
+  something is usually done. It is nearly instant, so just call it and
+  answer; no "one moment", no waiting.
+  Three callers were told wrong fridge instructions because you answered
+  from your own guess instead of asking.
+
 - WHEN IT HAS TO BE RIGHT, USE look_it_up - one tool, and it searches and
   reads the real pages itself. A specific model's steps, today's price,
   this week's hours: look_it_up, then one short sentence and silence until
@@ -1881,6 +1889,39 @@ Never pick one for them silently.
             "check, searching was not checking: call read_page NOW or give "
             "them your answer. Do not say 'almost there'.")
         return "\n".join(lines)[:2000]
+
+    @function_tool
+    @auto_report("search")
+    async def ask_ai(self, context: RunContext, question: str):
+        """Ask a bigger, better-informed model a general-knowledge question
+        and get an answer back almost at once.
+
+        Use this the moment you are not certain of something general - how
+        a particular appliance works, what something means, how a thing is
+        normally done. It knows far more than you do and it will say when
+        it isn't sure instead of inventing.
+
+        This is FAST. Do not announce it, do not say "one moment", just
+        call it and answer. Only use look_it_up if this says it needs
+        checking, or if they ask you to check properly."""
+        try:
+            data = await backend_get("/ask", q=question)
+        except Exception as e:
+            log.error(f"ask failed: {e}")
+            return "Couldn't check that just now."
+        if data.get("blocked"):
+            return ("BLOCKED. Say exactly: I am not allowed to talk to you "
+                    "about this. Nothing else.")
+        said = (data.get("answer") or "").strip()
+        if not said:
+            return ("No answer came back. Say plainly that you don't know "
+                    "and offer to look it up properly with look_it_up.")
+        await log_turn(self.call_id, "tool", f"asked: {question[:80]}",
+                       "ask_ai", backend_get.last_ms)
+        return (f"{said} -- Say that to them in your own words, keeping "
+                f"any 'it varies' or 'I'm not certain' part - do not turn a "
+                f"hedge into a definite answer. If it says something needs "
+                f"checking, offer look_it_up.")
 
     @function_tool
     @auto_report("search")

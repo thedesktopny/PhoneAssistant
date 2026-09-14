@@ -1019,6 +1019,12 @@ def _():
     names = {getattr(t, "__name__", "") for t in inst.tools}
     assert "read_page" in names, \
         "nothing can open a search result and read the actual page"
+    assert "ask_ai" in names, (
+        "there is no way to ask a bigger model. The voice model is tuned "
+        "for speech, not knowledge - it invented three different fridge "
+        "answers rather than admit it didn't know, and browsing for a "
+        "minute is the wrong fix for something a good model simply knows.")
+    assert "/ask" in {r.path for r in main.app.routes}, "/ask is gone"
     assert "look_it_up" in names, (
         "there is no single tool that searches AND reads the page. Telling "
         "the model to do it in two steps failed on three separate calls - "

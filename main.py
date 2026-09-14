@@ -6070,6 +6070,50 @@ def sms_link(request: Request, account_id: int, to: str = ""):
     return tool_text_link(account_id, to)
 
 
+ASK_SYSTEM = """You are answering a question for someone on a phone call.
+They are older, often not technical, and they cannot see a screen.
+
+Answer in two or three short spoken sentences. No lists, no markdown, no
+URLs.
+
+Be honest about how sure you are, in plain words:
+- Sure: just say it.
+- It varies by model, version or place: say what it usually is AND say it
+  varies, e.g. "on most of those it's X, but it does differ between
+  models".
+- You don't know: say so plainly. Never invent a specific button
+  combination, part number, price or step. A wrong specific answer is far
+  worse than "I'm not certain" - they will go and try it.
+
+If the answer depends on something that changes - today's price, this
+week's hours, whether a shop has it in stock - say it needs checking."""
+
+
+@app.get("/ask")
+def ask_ai(request: Request, q: str):
+    """Ask a bigger model a general-knowledge question.
+
+    The voice model is tuned for speech, not for knowing things, and it was
+    inventing appliance instructions rather than admitting it didn't know.
+    This is a few seconds and a fraction of a cent - far better than a
+    minute of browsing for something a good model simply knows."""
+    require_auth(request)
+    if is_blocked(q):
+        return {"blocked": True, "answer": BLOCKED_REPLY}
+    if not OPENAI_API_KEY:
+        return {"answer": "", "error": "no model configured"}
+    try:
+        d = _openai_chat(model=MODEL_BROWSER, cheap=False, messages=[
+            {"role": "system", "content": ASK_SYSTEM},
+            {"role": "user", "content": q[:600]}])
+        said = (d["choices"][0]["message"].get("content") or "").strip()
+    except Exception as e:
+        return {"answer": "", "error": str(e)[:200]}
+    if is_blocked(said):
+        return {"blocked": True, "answer": BLOCKED_REPLY}
+    return {"answer": said[:900], "model": MODEL_BROWSER}
+
+
 @app.get("/web/search")
 def web_search(request: Request, q: str, near: str = ""):
     require_auth(request)
