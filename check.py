@@ -1159,6 +1159,27 @@ def _():
         "the search result doesn't say it has already returned"
 
 
+@check("a lookup holds the call, so there's no gap to fill with chatter")
+def _():
+    """Three wordings of "say it once then be quiet" all failed - one
+    caller was told "this will take about a minute" three times in ten
+    seconds. The model cannot speak while it is inside a tool call, so the
+    lookup waits there instead of returning and leaving a silence."""
+    src = open("agent.py", encoding="utf-8").read()
+    body = src[src.index("async def look_it_up("):]
+    body = body[:body.index("\n    @function_tool")]
+    assert "LOOKUP_WAIT" in body, \
+        "look_it_up returns immediately again, leaving a gap to fill"
+    assert "sess.say(" in body, \
+        "the one announcement must be fixed words, not left to the model"
+    assert 'state == "done"' in body and "Tell them that now" in body, \
+        "the answer should come back from the tool, not a later update"
+    # and it must still hand over if it runs long, not hold the call for ever
+    assert "_watch_job(" in body, "a slow lookup would hold the call open"
+    assert agent.LOOKUP_WAIT >= 30, "the wait is too short to be useful"
+    assert agent.LOOKUP_WAIT <= 180, "that would hold a caller far too long"
+
+
 @check("required tools exist")
 def _():
     inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},

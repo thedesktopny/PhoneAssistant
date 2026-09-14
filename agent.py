@@ -38,6 +38,10 @@ MAX_CALL_SECONDS = int(os.environ.get("MAX_CALL_SECONDS", "900"))    # 15 min
 SILENCE_WARN = int(os.environ.get("SILENCE_WARN", "20"))
 SILENCE_HANGUP = int(os.environ.get("SILENCE_HANGUP", "45"))
 SERVICE_TOKEN = os.environ.get("SERVICE_TOKEN", "")
+# How long a lookup may hold the tool call open. While the model is inside
+# a tool call it cannot speak, which is the only reliable way found to stop
+# it saying "still checking" every five seconds at a waiting caller.
+LOOKUP_WAIT = int(os.environ.get("LOOKUP_WAIT", "75"))
 
 # The voice model is ~94% of what a call costs, so this is the one dial
 # worth watching. "gpt-realtime" is the full-price model and the plugin's
@@ -1973,10 +1977,50 @@ Never pick one for them silently.
         self.job_question = question
         await log_turn(self.call_id, "tool", f"looking up: {question[:120]}",
                        "look_it_up")
+
+        # Say it ONCE, in fixed words the model cannot embroider, and then
+        # hold this call open until there's an answer. Three different
+        # wordings of "say it once then be quiet" all failed - it told one
+        # caller it was checking three times in ten seconds. It cannot talk
+        # while it is waiting inside a tool.
+        sess = getattr(self, "session", None)
+        if sess:
+            try:
+                handle = sess.say("Let me look that up for you. "
+                                  "It takes about a minute.",
+                                  allow_interruptions=True)
+                if inspect.isawaitable(handle):
+                    await handle
+            except Exception as e:
+                log.warning(f"could not announce the lookup: {e}")
+
+        waited = 0
+        while waited < LOOKUP_WAIT:
+            await asyncio.sleep(3)
+            waited += 3
+            try:
+                st = await backend_get("/jobs/status", job_id=self.job_id)
+            except Exception:
+                continue
+            state = st.get("state", "")
+            if state == "done":
+                return (f"{st.get('message', '')} -- Tell them that now, in "
+                        f"your own words. Do not say you are still looking, "
+                        f"you have the answer.")
+            if state == "failed":
+                return (f"It didn't work: {st.get('message', '')}. You have "
+                        f"nothing from it - do not describe what it said. "
+                        f"Tell them you couldn't find it and offer another "
+                        f"way.")
+            if state == "needs_input":
+                return (st.get("message", "") + " Ask them, then call "
+                        "answer_website_question.")
+
+        # slower than expected - hand back to the watcher so the call
+        # doesn't sit inside a tool for ever
         self._watch_job(f"looking up {question}")
-        return ("Looking it up properly now. Say ONE short sentence telling "
-                "them that - about a minute - then stay silent. I will tell "
-                "you the answer.")
+        return ("Still going. Say NOTHING further about it - I will tell "
+                "you the moment it finishes.")
 
     @function_tool
     @auto_report("search")
