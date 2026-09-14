@@ -1223,6 +1223,46 @@ def _():
         assert must in rank, f"{must} isn't considered when ranking sources"
 
 
+@check("a document linked in an email can be read")
+def _():
+    """Call 53: an emailed receipt had links to the invoice and receipt as
+    PDFs, and the assistant said it couldn't open them - even though PDF
+    reading had been added the day before. Nothing connected an email to
+    it."""
+    inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                           "+1555", 1)
+    names = {getattr(t, "__name__", "") for t in inst.tools}
+    assert "read_document" in names, \
+        "an emailed invoice or statement still can't be opened"
+    src = open("agent.py", encoding="utf-8").read()
+    body = src[src.index("async def read_document("):]
+    body = body[:body.index("\n    @function_tool")]
+    # it must not be able to invent a web address
+    assert "last_email_body" in body and "wasn't in the message" in body, \
+        "it could be talked into opening a link the caller never sent"
+    assert "LOOKUP_WAIT" in body, "it would leave a gap to fill with chatter"
+
+
+@check("an etymology question isn't a religious discussion")
+def _():
+    """Call 53: "which religion is the name Raizi coming from" was refused
+    twice. The phrase "which religion" had been added to the blocked list
+    as unambiguous, and it isn't - that's a question about a word."""
+    fine = ["which religion is the name Raizi coming from",
+            "where does the name Raizi come from",
+            "what is the origin of the name Chaim"]
+    for t in fine:
+        assert not main.is_blocked(t), f"etymology was blocked: {t}"
+    still = ["which religion is the true one", "what is the best religion",
+             "tell me about other religions"]
+    for t in still:
+        assert main.is_blocked(t), f"this should still be blocked: {t}"
+    inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                           "+1555", 1)
+    assert "Where does the name Raizi come from" in inst.instructions, \
+        "the instructions don't say a name's origin is a fact about a word"
+
+
 @check("required tools exist")
 def _():
     inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},

@@ -1242,8 +1242,13 @@ BLOCKED_TERMS = {
     # callers. What stays blocked is weighing faiths against each other.
     # Only unambiguous phrases here: single words like "church" or
     # "christian" would block a Brooklyn street name or somebody's name.
-    "other religions", "which religion", "compare religions",
-    "religions compared", "other faiths",
+    # These must be phrases nobody says innocently. "which religion" is
+    # NOT one: "which religion is the name Raizi from" is etymology, and
+    # blocking it refused a caller twice.
+    "other religions", "compare religions", "religions compared",
+    "other faiths", "which religion is right", "which religion is true",
+    "which religion is the true", "which religion is better",
+    "best religion", "true religion",
     "gossip", "celebrity", "gossip column",
     "addiction", "drugs", "rehab",
     "joke", "jokes", "humor", "funny",

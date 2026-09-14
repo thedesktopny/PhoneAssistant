@@ -276,6 +276,7 @@ class Assistant(Agent):
         self._login_confirmed = {}
         self.last_search = []
         self._lookups = {}          # question -> how it went, this call
+        self.last_email_body = ""
 
         # %-d is Linux-only and raises on Windows, where check.py is run
         _now = datetime.now(ZoneInfo("America/New_York"))
@@ -359,6 +360,10 @@ do them without comment:
 - "What time does the store close before the holiday?" That is store hours.
 - "Order a wedding gift for my niece." That is an order.
 - Reading out an email from their shul about a meeting time.
+- "Where does the name Raizi come from?" That is where a WORD comes from.
+  Names, words and places have origins, and saying one is Yiddish or
+  Hebrew or Polish is a fact about language, not a discussion of faith.
+  A caller asked this twice and was refused twice.
 If they want something DONE, do it. Only refuse when they are asking you to
 discuss the subject itself. When you are unsure which it is, it is a task -
 help them.
@@ -904,7 +909,12 @@ Never pick one for them silently.
             log.error(f"read failed: {e}")
             return "I couldn't open that message."
         body = " ".join((data.get("body") or "").split())[:1500]
-        return f"From {data.get('from')}. Subject {data.get('subject')}. {body}"
+        self.last_email_body = " ".join((data.get("body") or "").split())
+        return (f"From {data.get('from')}. Subject {data.get('subject')}. "
+                f"{body}"
+                f" -- If there is a link to an invoice, receipt, statement "
+                f"or other document in here and they want to know what it "
+                f"says, call read_document with that exact link.")
 
     @function_tool
     @auto_report("email")
@@ -1912,6 +1922,71 @@ Never pick one for them silently.
             "check, searching was not checking: call read_page NOW or give "
             "them your answer. Do not say 'almost there'.")
         return "\n".join(lines)[:2000]
+
+    @function_tool
+    @auto_report("email")
+    async def read_document(self, context: RunContext, url: str,
+                            looking_for: str = "what this document says"):
+        """Open and read a document linked in an email - an invoice, a
+        receipt, a statement, a bill. Works on PDFs.
+
+        The link must be one that actually appeared in the email you just
+        read. Never type a link they did not send you."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        link = (url or "").strip().strip(".,)>\"'")
+        if not link.lower().startswith("http"):
+            return "That isn't a link. Read the email again and use the "                   "exact address from it."
+        seen = (self.last_email_body or "") + " " + " ".join(
+            self.last_search or [])
+        if link not in seen:
+            return ("That link wasn't in the message you read. Do not make "
+                    "up a web address - read the email again and use "
+                    "exactly what is written there.")
+        try:
+            async with httpx.AsyncClient(timeout=25) as c:
+                r = await c.post(f"{BACKEND}/jobs/browse", headers=AUTH,
+                                 params={"account_id": self.account_id,
+                                         "goal": looking_for,
+                                         "url": link, "max_steps": 6,
+                                         "call_id": self.call_id or 0})
+                d = r.json()
+        except Exception as e:
+            log.error(f"read document failed: {e}")
+            return "Couldn't open that document."
+        if d.get("blocked"):
+            return d.get("answer") or "BLOCKED."
+        self.job_id = d.get("job_id")
+        self.job_question = looking_for
+        await log_turn(self.call_id, "tool", f"reading document: {link[:90]}",
+                       "read_document")
+        sess = getattr(self, "session", None)
+        if sess:
+            try:
+                handle = sess.say("Let me open that and read it.",
+                                  allow_interruptions=True)
+                if inspect.isawaitable(handle):
+                    await handle
+            except Exception as e:
+                log.warning(f"could not announce the document: {e}")
+        waited = 0
+        while waited < LOOKUP_WAIT:
+            await asyncio.sleep(3)
+            waited += 3
+            try:
+                st = await backend_get("/jobs/status", job_id=self.job_id)
+            except Exception:
+                continue
+            if st.get("state") == "done":
+                return (f"{st.get('message', '')} -- Tell them what it says, "
+                        f"in plain spoken words.")
+            if st.get("state") == "failed":
+                return (f"Couldn't read it: {st.get('message', '')}. You "
+                        f"have nothing from it - do not describe what was "
+                        f"in it. Say so plainly.")
+        self._watch_job("reading the document")
+        return ("Still reading. Say NOTHING more - I will tell you what it "
+                "says.")
 
     @function_tool
     @auto_report("search")
