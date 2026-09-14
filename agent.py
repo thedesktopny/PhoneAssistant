@@ -647,6 +647,13 @@ LOOKING THINGS UP
   page actually came back and said it. Do not give the same question three
   different confident answers - that is how they know you are guessing.
 
+- WHEN YOU ASK OR LOOK SOMETHING UP, WRITE THE WHOLE QUESTION. Those
+  tools cannot see this call. Put the make, the model number and what they
+  actually want into the question every single time, even if they told you
+  ten seconds ago. A caller asked about his ice maker and the question
+  that went out was "how to turn on the icemaker for the" - so he got a
+  generic answer that missed the first step.
+
 - NOT SURE? ASK first, don't browse. ask_ai puts the question to a bigger
   model and comes back in a couple of seconds. Use it the moment you are
   less than certain about anything general - an appliance, a word, how
@@ -1901,6 +1908,13 @@ Never pick one for them silently.
         normally done. It knows far more than you do and it will say when
         it isn't sure instead of inventing.
 
+        IT CANNOT SEE THIS CONVERSATION. Write the whole question out,
+        every time: the make and model, the brand, what they actually want.
+        "How do I turn on the ice maker" gets a useless generic answer;
+        "how do I turn on the ice maker on a Frigidaire PRDF1922AF" gets a
+        real one. Never send a question with "the" or "it" standing in for
+        something they told you earlier.
+
         This is FAST. Do not announce it, do not say "one moment", just
         call it and answer. Only use look_it_up if this says it needs
         checking, or if they ask you to check properly."""
@@ -1934,6 +1948,11 @@ Never pick one for them silently.
         hours. It takes about a minute and runs in the background, so say
         one short sentence and then stay quiet until I tell you the answer.
 
+        IT CANNOT SEE THIS CONVERSATION. Write the whole question out,
+        every time - the make, the model number, exactly what they want.
+        A question like "how do I turn on the ice maker for the" searches
+        for nothing and comes back with nothing.
+
         Do NOT use web_search for these. A search on its own only gives you
         headlines, and answering from those is how people get told wrong
         instructions."""
@@ -1952,6 +1971,8 @@ Never pick one for them silently.
             return d.get("answer") or "BLOCKED."
         self.job_id = d.get("job_id")
         self.job_question = question
+        await log_turn(self.call_id, "tool", f"looking up: {question[:120]}",
+                       "look_it_up")
         self._watch_job(f"looking up {question}")
         return ("Looking it up properly now. Say ONE short sentence telling "
                 "them that - about a minute - then stay silent. I will tell "

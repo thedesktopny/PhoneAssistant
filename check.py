@@ -1045,6 +1045,17 @@ def _():
     names = {getattr(t, "__name__", "") for t in inst.tools}
     assert "read_page" in names, \
         "nothing can open a search result and read the actual page"
+    # the lookup tools run in another process and see none of the call
+    tools = {getattr(t, "__name__", ""): t for t in inst.tools}
+    for t in ("ask_ai", "look_it_up"):
+        if t in tools:
+            doc = tools[t].__doc__ or ""
+            assert "CANNOT SEE THIS CONVERSATION" in doc, (
+                f"{t} doesn't warn that it's blind to the call. A caller "
+                f"asked about his ice maker and the question sent was "
+                f"'how to turn on the icemaker for the'.")
+    assert "WRITE THE WHOLE QUESTION" in inst.instructions, \
+        "nothing tells it to put the model number into the question"
     assert "ask_ai" in names, (
         "there is no way to ask a bigger model. The voice model is tuned "
         "for speech, not knowledge - it invented three different fridge "
