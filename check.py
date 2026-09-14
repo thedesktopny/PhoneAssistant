@@ -1180,6 +1180,20 @@ def _():
     assert agent.LOOKUP_WAIT <= 180, "that would hold a caller far too long"
 
 
+@check("'search again' is a complaint, not an instruction")
+def _():
+    """A caller saying "search again" is saying the last answer was wrong -
+    they don't know the assistant has tools. On call 52 it took the word
+    literally and re-ran the browser search that had just failed."""
+    inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                           "+1555", 1)
+    said = inst.instructions
+    assert "NOT HOW TO GET IT" in said, \
+        "caller wording is still being read as a choice of tool"
+    assert "does NOT mean run" in said, \
+        "'search again' can still re-run a search that just failed"
+
+
 @check("the same failed lookup isn't run again")
 def _():
     """Call 52: the ice maker lookup failed, and the assistant ran the
