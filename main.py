@@ -5,7 +5,8 @@ Endpoints:
   GET  /                      health check
   POST /accounts              create an account  {"name": "...", "phone": "+1..."}
   GET  /accounts              list accounts
-  GET  /link/start?account_id=1     -> open in browser, links a Gmail account
+  GET  /link/new?account_id=1       -> a signed link for the customer
+  GET  /link/start?t=...            -> the page they open to connect Gmail
   GET  /link/callback               (Google redirects here, don't call it yourself)
   GET  /test/unread?account_id=1    -> what the voice agent will read out
   GET  /test/read?account_id=1&msg_id=...
@@ -681,6 +682,81 @@ def vault_get(blob: str) -> dict:
     return json.loads(fernet.decrypt(blob.encode()).decode())
 
 # ----------------------------------------------------------------- google
+
+LINK_LIFE_MIN = int(os.environ.get("LINK_LIFE_MIN", "30"))
+
+
+def _make_link_token(account_id: int, minutes: int = 0) -> str:
+    """A signed, expiring ticket for one customer to connect their email."""
+    import hmac
+    import hashlib
+    until = int(time.time()) + (minutes or LINK_LIFE_MIN) * 60
+    body = f"{account_id}.{until}"
+    sig = hmac.new(ENCRYPTION_KEY.encode(), body.encode(),
+                   hashlib.sha256).hexdigest()[:32]
+    return f"{body}.{sig}"
+
+
+def _check_link_token(t: str):
+    """The account this ticket is for, or None if it's bad or stale."""
+    import hmac
+    import hashlib
+    try:
+        acc, until, sig = (t or "").split(".")
+        body = f"{acc}.{until}"
+        want = hmac.new(ENCRYPTION_KEY.encode(), body.encode(),
+                        hashlib.sha256).hexdigest()[:32]
+        if not hmac.compare_digest(sig, want):
+            return None
+        if int(until) < int(time.time()):
+            return None
+        return int(acc)
+    except Exception:
+        return None
+
+
+LINK_PAGE_CSS = """
+ body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#f4f5f7;
+      color:#1c2331;display:flex;align-items:center;justify-content:center;
+      min-height:100vh;margin:0;padding:20px;}
+ .box{background:#fff;border-radius:14px;padding:32px;max-width:460px;
+      box-shadow:0 2px 18px rgba(0,0,0,.08);}
+ h1{font-size:20px;margin:0 0 14px;}
+ p{font-size:16px;line-height:1.6;color:#414a5c;}
+ .who{background:#eef3ff;border-radius:8px;padding:12px 14px;margin:18px 0;
+      font-size:17px;}
+ a.go{display:inline-block;margin-top:10px;padding:13px 22px;background:#2563eb;
+      color:#fff;text-decoration:none;border-radius:8px;font-size:16px;}
+ .small{font-size:13px;color:#6b7482;margin-top:20px;}
+"""
+
+LINK_CONFIRM_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Connect your email</title><style>""" + LINK_PAGE_CSS + """</style>
+</head><body><div class="box">
+<h1>Connect your email</h1>
+<p>This connects a Gmail account to the phone assistant, so it can read
+your messages to you and send replies when you ask it to.</p>
+<div class="who">You are connecting to the account for <b>{name}</b>.</div>
+<p>If that is not you or the person you are helping, close this page and
+do nothing else.</p>
+<p>Google will ask you to sign in and show you exactly what you are
+allowing. You can undo it at any time from your Google account.</p>
+<a class="go" href="/link/start?t={token}&go=1">Continue to Google</a>
+<div class="small">You will only be asked to do this once.</div>
+</div></body></html>"""
+
+LINK_BAD_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>This link has expired</title><style>""" + LINK_PAGE_CSS + """</style>
+</head><body><div class="box">
+<h1>This link has expired</h1>
+<p>Links to connect an email account are only good for a short time, so
+that nobody else can use one.</p>
+<p>Ring the assistant again and ask for a new link, and it will send you
+a fresh one.</p>
+</div></body></html>"""
+
 
 def _flow(state=None):
     cfg = {
@@ -1611,7 +1687,8 @@ def tool_send_sms(to: str, message: str) -> dict:
 
 def tool_text_link(account_id: int, to: str) -> dict:
     """Text the customer their personal Gmail-linking link."""
-    url = f"{PUBLIC_URL}/link/start?account_id={account_id}"
+    url = (f"{PUBLIC_URL}/link/start?t="
+           + urllib.parse.quote(_make_link_token(account_id)))
     msg = ("Tap this link to connect your email to your phone assistant. "
            "It only takes a moment: " + url)
     return tool_send_sms(to, msg)
@@ -2315,7 +2392,10 @@ def _run_signin(sid: int, account_id: int, email: str):
             db.close()
 
             _ob_set(sid, "signing_in", "Opening Google.")
-            do_goto(page, f"{PUBLIC_URL}/link/start?account_id={account_id}",
+            # trusted, server-side, so it mints its own ticket and skips
+            # the confirmation page a person would see
+            do_goto(page, f"{PUBLIC_URL}/link/start?go=1&t="
+                          + urllib.parse.quote(_make_link_token(account_id)),
                     4000)
 
             other = q(page, 'text=/Use another account/i')
@@ -4894,10 +4974,47 @@ def account_delete(request: Request, account_id: int, confirm: str = ""):
 
 
 @app.get("/link/start")
-def link_start(account_id: int):
-    url, _ = _flow(state=str(account_id)).authorization_url(
+def link_start(request: Request, t: str = "", account_id: int = 0):
+    """The page a customer lands on to connect their email.
+
+    It used to take account_id straight from the address, with nothing
+    checking it. Anyone could send someone a link with THEIR account
+    number in it: the customer would sign into their own Gmail, and the
+    mailbox would be attached to the sender's account instead. They could
+    then ring in and hear that person's email read to them.
+
+    Links are now signed and expire, and the customer is shown whose
+    account they are about to connect to before anything happens."""
+    acc = _check_link_token(t)
+    if not acc:
+        return HTMLResponse(LINK_BAD_HTML, status_code=400)
+    db = Session()
+    row = db.query(Account).filter_by(id=acc).first()
+    name = row.name if row else ""
+    db.close()
+    if not name:
+        return HTMLResponse(LINK_BAD_HTML, status_code=400)
+    if request.query_params.get("go") != "1":
+        return HTMLResponse(LINK_CONFIRM_HTML
+                            .replace("{name}", name)
+                            .replace("{token}", urllib.parse.quote(t)))
+    url, _ = _flow(state=str(acc)).authorization_url(
         access_type="offline", prompt="consent", include_granted_scopes="true")
     return RedirectResponse(url)
+
+
+@app.get("/link/new")
+def link_new(request: Request, account_id: int, minutes: int = 30):
+    """Make a signed link for one customer. Staff and the voice agent only."""
+    require_auth(request)
+    db = Session()
+    row = db.query(Account).filter_by(id=account_id).first()
+    db.close()
+    if not row:
+        raise HTTPException(404, "No such customer.")
+    t = _make_link_token(account_id, minutes)
+    return {"url": f"{PUBLIC_URL}/link/start?t={urllib.parse.quote(t)}",
+            "for": row.name, "valid_minutes": minutes}
 
 
 @app.get("/link/callback")
@@ -6959,8 +7076,8 @@ async function load(){
       return '<tr><td>'+a.account_id+'</td><td>'+esc(a.name)+'</td>'+
         '<td>'+esc((a.phones||[]).join(', '))+'</td>'+
         '<td>'+mboxes(a)+'</td>'+
-        '<td><a class="btn" target="_blank" href="/link/start?account_id='+
-        a.account_id+'">Link</a> '+
+        '<td><button class="sec" onclick="copyLink('+a.account_id+
+        ')">Link</button> '+
         '<button class="sec" onclick="copyLink('+a.account_id+')">Copy</button> '+
         '<button class="sec" onclick="textLink('+a.account_id+')">Text</button>'+
         '</td></tr>'; }).join('');
@@ -7256,9 +7373,15 @@ async function loadDlr(){
 }
 
 function copyLink(id){
-  const url = location.origin + '/link/start?account_id=' + id;
-  navigator.clipboard.writeText(url);
-  document.getElementById('msg').textContent = 'Copied: ' + url;
+  fetch('/link/new?account_id=' + id).then(function(r){ return r.json(); })
+   .then(function(d){
+     navigator.clipboard.writeText(d.url);
+     document.getElementById('msg').textContent =
+       'Copied a link for ' + d.for + ', good for ' + d.valid_minutes +
+       ' minutes.';
+   }).catch(function(e){
+     document.getElementById('msg').textContent = 'Could not make a link.';
+   });
 }
 async function textLink(id){
   const m = document.getElementById('msg');

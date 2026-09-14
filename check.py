@@ -855,6 +855,37 @@ def _():
         "the spoken answer must still be judged strictly"
 
 
+@check("an account-linking link can't be forged")
+def _():
+    """/link/start took account_id straight from the address with nothing
+    checking it. Anyone could send a customer a link carrying THEIR
+    account number - the customer would sign into their own Gmail and the
+    mailbox would attach to the sender's account, who could then ring in
+    and have that person's email read to them."""
+    from fastapi.testclient import TestClient
+    c = TestClient(main.app, raise_server_exceptions=False,
+                   base_url="https://t", follow_redirects=False)
+    # the old forgeable form must not work any more
+    r = c.get("/link/start?account_id=1")
+    assert r.status_code == 400, \
+        f"a bare account number still starts a link: {r.status_code}"
+    assert "expired" in r.text.lower(), r.text[:200]
+    # a tampered or stale ticket is refused
+    good = main._make_link_token(1, 30)
+    assert main._check_link_token(good) == 1
+    assert main._check_link_token(good[:-1] + "0") is None, \
+        "a changed signature was accepted"
+    assert main._check_link_token("2." + good.split(".", 1)[1]) is None, \
+        "the account number could be swapped"
+    assert main._check_link_token(main._make_link_token(1, -10)) is None, \
+        "an expired ticket was accepted"
+    assert main._check_link_token("") is None
+    # and nothing hands out a raw link any more
+    src = open("main.py", encoding="utf-8").read()
+    assert "/link/start?account_id=" not in src, \
+        "something still builds a forgeable link"
+
+
 @check("caller country routing")
 def _():
     assert main._where_for_phone("+13476752334")[0] == "US"
