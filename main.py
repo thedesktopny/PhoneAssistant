@@ -6121,7 +6121,8 @@ def token_permissions(request: Request, account_id: int = 0):
     q = db.query(Connection).filter_by(provider="google")
     if account_id:
         q = q.filter_by(account_id=account_id)
-    rows = [(r.account_id, r.email, r.secret_blob) for r in q.all()]
+    rows = [(r.account_id, r.email, r.secret_blob, r.linked_at)
+            for r in q.all()]
     db.close()
 
     plain = {
@@ -6134,8 +6135,22 @@ def token_permissions(request: Request, account_id: int = 0):
         "openid": "confirm who they are",
     }
     out = []
-    for acc, email, blob in rows:
-        row = {"account_id": acc, "email": email}
+    for acc, email, blob, linked in rows:
+        row = {"account_id": acc, "email": email,
+               "connected": local_str(linked)}
+        # While the Google app is unverified, refresh tokens die after
+        # seven days and the customer has to connect all over again.
+        if linked:
+            days = (datetime.utcnow() - linked).total_seconds() / 86400.0
+            row["days_connected"] = round(days, 1)
+            if days >= 7:
+                row["expiry_warning"] = ("PROBABLY DEAD - over 7 days, and "
+                                         "unverified apps lose the token "
+                                         "at 7 days. They must reconnect.")
+            elif days >= 5:
+                row["expiry_warning"] = (f"Expires in about "
+                                         f"{round(7 - days, 1)} days unless "
+                                         f"the app is verified.")
         try:
             tok = vault_get(blob)
             creds = Credentials(
@@ -6163,7 +6178,11 @@ def token_permissions(request: Request, account_id: int = 0):
         out.append(row)
     return {"mailboxes": out,
             "note": ("Google enforces these. A token without a scope is "
-                     "refused by that API, not merely unused here.")}
+                     "refused by that API, not merely unused here."),
+            "testing_mode_warning": (
+                "While the Google app is in Testing rather than published, "
+                "every connection dies after 7 days and the customer has "
+                "to sign in again. Publishing the app is what stops that.")}
 
 
 @app.get("/vault/status")
