@@ -1263,6 +1263,35 @@ def _():
         "the instructions don't say a name's origin is a fact about a word"
 
 
+@check("the silence prompt can't turn into a repeat of the last answer")
+def _():
+    """Call 53: the assistant explained how to build a sukkah, then said
+    the identical paragraph again 32 seconds later. The silence watchdog
+    had asked the model to check if they were still there, and instead of
+    asking, it repeated itself."""
+    src = open("agent.py", encoding="utf-8").read()
+    body = src[src.index("async def watchdog("):]
+    body = body[:body.index("\n    async def ", 10)]
+    assert "Are you still there?" in body, \
+        "the prompt is still left to the model to word"
+    assert "generate_reply" not in body.split("warned_at = now")[1][:400], \
+        "the silence prompt can still come back as anything the model likes"
+    assert agent.SILENCE_WARN >= 30, \
+        "20 seconds isn't long enough for an older caller to think"
+
+
+@check("old watchers are cancelled, not left talking over each other")
+def _():
+    """Every watcher can make the agent speak, and they were never stopped
+    - after three lookups in one call, three were running at once."""
+    src = open("agent.py", encoding="utf-8").read()
+    body = src[src.index("def _start_watch("):]
+    body = body[:body.index("\n    def ", 10)]
+    assert "old.cancel()" in body, "watchers still pile up over a long call"
+    assert "self._watchers = [t]" in body, \
+        "the list still grows instead of holding only the current one"
+
+
 @check("required tools exist")
 def _():
     inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},

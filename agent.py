@@ -35,7 +35,9 @@ BACKEND = os.environ["BACKEND_URL"].rstrip("/")
 # How long a call may run, and how long silence is tolerated, in seconds.
 # All three can be changed from Railway without touching the code.
 MAX_CALL_SECONDS = int(os.environ.get("MAX_CALL_SECONDS", "900"))    # 15 min
-SILENCE_WARN = int(os.environ.get("SILENCE_WARN", "20"))
+# Older callers take their time. Twenty seconds was short enough that the
+# "are you still there" prompt kept firing while somebody was thinking.
+SILENCE_WARN = int(os.environ.get("SILENCE_WARN", "35"))
 SILENCE_HANGUP = int(os.environ.get("SILENCE_HANGUP", "45"))
 SERVICE_TOKEN = os.environ.get("SERVICE_TOKEN", "")
 # How long a lookup may hold the tool call open. While the model is inside
@@ -785,9 +787,15 @@ Never pick one for them silently.
 
     def _start_watch(self, kind, fetch, describe):
         try:
+            # Stop whatever was being watched before. Each watcher can make
+            # the agent speak, and they were never cancelled - after three
+            # lookups there were three of them running at once, any of
+            # which could talk over the others.
+            for old in getattr(self, "_watchers", []):
+                if not old.done():
+                    old.cancel()
             t = asyncio.create_task(self._watch(kind, fetch, describe))
-            self._watchers = getattr(self, "_watchers", [])
-            self._watchers.append(t)
+            self._watchers = [t]
         except Exception as e:
             log.warning(f"could not start watcher: {e}")
 
@@ -2407,12 +2415,16 @@ async def entrypoint(ctx: JobContext):
             if quiet > warn_at and warned_at < last_heard["at"]:
                 warned_at = now
                 try:
-                    await session.generate_reply(
-                        instructions=("In English: ask once, gently, if "
-                                      "they're still there. One short "
-                                      "sentence."))
-                except Exception:
-                    pass
+                    # say() speaks these exact words. Asking the model to
+                    # "check if they are still there" made it repeat its
+                    # previous answer in full instead - a caller heard the
+                    # same paragraph about building a sukkah twice.
+                    handle = session.say("Are you still there?",
+                                         allow_interruptions=True)
+                    if inspect.isawaitable(handle):
+                        await handle
+                except Exception as e:
+                    log.warning(f"could not ask if they're there: {e}")
 
     async def hangup_when_asked():
         await hangup.wait()
