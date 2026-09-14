@@ -5977,6 +5977,63 @@ def proxy_status(request: Request):
     return st
 
 
+@app.get("/permissions")
+def token_permissions(request: Request, account_id: int = 0):
+    """Ask Google what each stored token is actually allowed to do.
+
+    Not what we believe, not what we asked for - what Google says the
+    token carries. Scopes are enforced at Google's end, so this is the
+    real answer to "does this give you their whole account"."""
+    require_auth(request)
+    db = Session()
+    q = db.query(Connection).filter_by(provider="google")
+    if account_id:
+        q = q.filter_by(account_id=account_id)
+    rows = [(r.account_id, r.email, r.secret_blob) for r in q.all()]
+    db.close()
+
+    plain = {
+        "https://www.googleapis.com/auth/gmail.modify":
+            "read, send and organise their Gmail",
+        "https://www.googleapis.com/auth/calendar":
+            "read and change their calendar",
+        "https://www.googleapis.com/auth/userinfo.email":
+            "see which email address they are",
+        "openid": "confirm who they are",
+    }
+    out = []
+    for acc, email, blob in rows:
+        row = {"account_id": acc, "email": email}
+        try:
+            tok = vault_get(blob)
+            creds = Credentials(
+                token=tok.get("token"),
+                refresh_token=tok.get("refresh_token"),
+                token_uri="https://oauth2.googleapis.com/token",
+                client_id=GOOGLE_CLIENT_ID,
+                client_secret=GOOGLE_CLIENT_SECRET, scopes=SCOPES)
+            from google.auth.transport.requests import Request as GReq
+            creds.refresh(GReq())
+            req = urllib.request.Request(
+                "https://oauth2.googleapis.com/tokeninfo?access_token="
+                + urllib.parse.quote(creds.token))
+            with urllib.request.urlopen(req, timeout=20) as r:
+                info = json.loads(r.read().decode())
+            got = (info.get("scope") or "").split()
+            row["granted"] = [plain.get(s, s) for s in got]
+            row["raw_scopes"] = got
+            row["can_reach_drive"] = any("drive" in s for s in got)
+            row["can_reach_contacts"] = any("contacts" in s for s in got)
+            row["can_delete_mail_permanently"] = \
+                "https://mail.google.com/" in got
+        except Exception as e:
+            row["error"] = str(e)[:200]
+        out.append(row)
+    return {"mailboxes": out,
+            "note": ("Google enforces these. A token without a scope is "
+                     "refused by that API, not merely unused here.")}
+
+
 @app.get("/vault/status")
 def vault_status(request: Request):
     """Which key protects what."""
