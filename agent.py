@@ -715,6 +715,23 @@ FINDING EMAIL — pick the right tool
   different, broader wording once, and tell the caller what you tried.
 - To get somebody's address, use find_contact with their name.
 
+DOING SOMETHING WITH AN EMAIL
+Once you have read a list out, they can act on any of them by number.
+- "Reply and tell him yes" -> write the reply, read the WHOLE thing back,
+  ask "should I send it?", and only then call reply_to_email.
+- "Send that to my son" -> forward_email. Say who it is going to and get a
+  yes first: forwarding sends the whole original to another person.
+- "Get that out of my inbox" -> tidy_email with archive. "Flag that" ->
+  star. "That's junk" -> spam. "Bin it" -> trash.
+  Nothing there is permanent - trash is recoverable for 30 days and every
+  label can be put back. Still say what you are about to do for trash and
+  spam, and tell them afterwards that it can be undone.
+- "What does the invoice say?" -> read_attachment for a file attached to
+  the message, or read_document if it is a link inside the message.
+- "Write it but don't send it" -> save_draft.
+Always say which message you are acting on - "the one from the pharmacy" -
+so they can stop you if you have the wrong one.
+
 WHAT YOU KNOW ABOUT A MESSAGE
 Every message you are given comes with who it is from, when it arrived,
 which tab it landed in, and whether it is read. Say the date whenever you
@@ -991,6 +1008,196 @@ Never pick one for them silently.
         lines.append("Read them out newest first and say when each arrived. "
                      + ADDRESS_RULE)
         return "\n".join(lines)
+
+    def _pick(self, which: int):
+        """Turn "number three" into a message, or say what went wrong."""
+        if not self.last_list:
+            return None, ("No list loaded. Call recent_email, check_email "
+                          "or search_email first.")
+        if which < 1 or which > len(self.last_list):
+            return None, (f"Pick a number between 1 and "
+                          f"{len(self.last_list)} from the list you read "
+                          f"out.")
+        return self.last_list[which - 1], ""
+
+    @function_tool
+    @auto_report("email")
+    async def reply_to_email(self, context: RunContext, which: int,
+                             body: str, caller_said: str = ""):
+        """Reply to one of the emails in the list you just read out.
+
+        Read the whole reply back to them first and ask "should I send
+        it?". Only call this with caller_said set to what they actually
+        answered, once they have clearly said yes."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        msg, problem = self._pick(which)
+        if problem:
+            return problem
+        said = (caller_said or "").strip().lower()
+        if not any(w in said for w in ("yes", "yeah", "send it", "go ahead",
+                                       "ok", "okay", "correct", "sure")):
+            return (f"Do not send yet. Read this back to them word for "
+                    f"word and ask 'should I send it?': {body}")
+        try:
+            d = await backend_post("/email/reply", {
+                "account_id": self.account_id, "msg_id": msg["id"],
+                "body": body, "which": self.mailbox})
+        except Exception as e:
+            log.error(f"reply failed: {e}")
+            return "The reply didn't go through."
+        await log_turn(self.call_id, "tool",
+                       f"replied to {d.get('to', '')}", "reply_to_email")
+        return f"Sent to {d.get('to')}. Tell them it has gone."
+
+    @function_tool
+    @auto_report("email")
+    async def forward_email(self, context: RunContext, which: int, to: str,
+                            note: str = "", caller_said: str = ""):
+        """Pass one of the emails on to somebody else.
+
+        Forwarding sends the whole original message to another person, so
+        read back WHO it is going to and get a clear yes first."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        msg, problem = self._pick(which)
+        if problem:
+            return problem
+        said = (caller_said or "").strip().lower()
+        if not any(w in said for w in ("yes", "yeah", "send it", "go ahead",
+                                       "ok", "okay", "correct", "sure")):
+            return (f"Do not forward yet. Say back to them that this sends "
+                    f"the whole message from {msg.get('from', '')} to {to}, "
+                    f"ask if that is right, and only call this again once "
+                    f"they say yes.")
+        try:
+            d = await backend_post("/email/forward", {
+                "account_id": self.account_id, "msg_id": msg["id"],
+                "to": to, "note": note, "which": self.mailbox})
+        except Exception as e:
+            log.error(f"forward failed: {e}")
+            return "The forward didn't go through."
+        await log_turn(self.call_id, "tool", f"forwarded to {to}",
+                       "forward_email")
+        return f"Forwarded to {d.get('to')}. Tell them it has gone."
+
+    @function_tool
+    @auto_report("email")
+    async def tidy_email(self, context: RunContext, which_ones: str,
+                         action: str):
+        """Do something with messages from the list you read out.
+
+        which_ones is the numbers, like "1,3". action is one of:
+          archive     take it out of the inbox but keep it
+          star        flag it to come back to
+          important   mark it important
+          spam        move it to spam
+          trash       put it in the bin, recoverable for 30 days
+          unarchive, unstar, not_spam, untrash - undo any of those
+
+        Nothing here deletes anything for good. For trash and spam, say
+        what you are about to do and get a yes first."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        ids = []
+        for part in (which_ones or "").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                msg, problem = self._pick(int(part))
+            except ValueError:
+                continue
+            if problem:
+                return problem
+            ids.append(msg["id"])
+        if not ids:
+            return ("Ask which messages they mean, by number from the list "
+                    "you read out.")
+        try:
+            d = await backend_post("/email/action", {}, params={
+                "account_id": self.account_id, "msg_ids": ",".join(ids),
+                "action": action, "which": self.mailbox})
+        except Exception as e:
+            log.error(f"tidy failed: {e}")
+            return f"That didn't work: {str(e)[:150]}"
+        await log_turn(self.call_id, "tool",
+                       f"{action} on {len(ids)} message(s)", "tidy_email")
+        undo = d.get("undo", "")
+        return (f"Done - {action} on {d.get('changed', 0)} message(s)"
+                + (f" ({undo})" if undo else "")
+                + ". Tell them plainly what happened, and that it can be "
+                  "undone if they change their mind.")
+
+    @function_tool
+    @auto_report("email")
+    async def read_attachment(self, context: RunContext, which: int,
+                              looking_for: str = "what this says"):
+        """Read a document attached to one of the emails - an invoice, a
+        statement, a bill. Works on PDFs and plain text."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        msg, problem = self._pick(which)
+        if problem:
+            return problem
+        try:
+            listing = await backend_get("/email/attachments",
+                                        account_id=self.account_id,
+                                        msg_id=msg["id"],
+                                        which=self.mailbox)
+        except Exception as e:
+            log.error(f"attachments failed: {e}")
+            return "Couldn't check what was attached."
+        atts = listing.get("attachments", [])
+        if not atts:
+            return ("Nothing is attached to that one. If the email has a "
+                    "LINK to a document, read the message and use "
+                    "read_document with that link instead.")
+        best = atts[0]
+        for a in atts:
+            if (a.get("mime") or "").endswith("pdf"):
+                best = a
+                break
+        try:
+            got = await backend_get("/email/attachment",
+                                    account_id=self.account_id,
+                                    msg_id=msg["id"],
+                                    attachment_id=best["id"],
+                                    which=self.mailbox)
+        except Exception as e:
+            log.error(f"attachment read failed: {e}")
+            return "Couldn't open that attachment."
+        text = (got.get("text") or "").strip()
+        if not text:
+            return (f"Couldn't read {best.get('filename', 'that file')}: "
+                    f"{got.get('error', 'unreadable')}. Say so plainly.")
+        await log_turn(self.call_id, "tool",
+                       f"read attachment {best.get('filename', '')}",
+                       "read_attachment")
+        return (f"{best.get('filename', 'document')} says: {text[:3000]}"
+                f" -- Answer their question from THIS text only, in plain "
+                f"spoken words. They asked about: {looking_for}. If it "
+                f"isn't in here, say so.")
+
+    @function_tool
+    @auto_report("email")
+    async def save_draft(self, context: RunContext, to: str, subject: str,
+                         body: str):
+        """Save an email as a draft instead of sending it, so they or the
+        office can finish it later."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            d = await backend_post("/email/draft", {
+                "account_id": self.account_id, "to": to,
+                "subject": subject, "body": body, "which": self.mailbox})
+        except Exception as e:
+            log.error(f"draft failed: {e}")
+            return "That didn't save."
+        await log_turn(self.call_id, "tool", f"drafted to {to}",
+                       "save_draft")
+        return (f"Saved as a draft to {d.get('to')}. Tell them it is "
+                f"waiting in their drafts, not sent.")
 
     @function_tool
     @auto_report("email")

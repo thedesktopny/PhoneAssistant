@@ -1058,6 +1058,171 @@ def tool_send_email(account_id: int, to: str, subject: str,
     return {"sent": True, "id": sent.get("id")}
 
 
+def _headers_of(msg) -> dict:
+    return {x["name"]: x["value"]
+            for x in msg.get("payload", {}).get("headers", [])}
+
+
+def tool_reply_email(account_id: int, msg_id: str, body: str,
+                     which: str = "", all_recipients: bool = False) -> dict:
+    """Reply to a message, in its own thread so it reads as a reply."""
+    svc = gmail_client(account_id, which)
+    orig = svc.users().messages().get(
+        userId="me", id=msg_id, format="metadata",
+        metadataHeaders=["From", "To", "Cc", "Subject", "Message-ID",
+                         "References", "Reply-To"]).execute()
+    h = _headers_of(orig)
+    to = h.get("Reply-To") or h.get("From", "")
+    subject = h.get("Subject", "")
+    if not subject.lower().startswith("re:"):
+        subject = "Re: " + subject
+    msg = MIMEText(body)
+    msg["to"] = to
+    if all_recipients and h.get("Cc"):
+        msg["cc"] = h["Cc"]
+    msg["subject"] = subject
+    mid = h.get("Message-ID", "")
+    if mid:
+        msg["In-Reply-To"] = mid
+        msg["References"] = (h.get("References", "") + " " + mid).strip()
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    sent = svc.users().messages().send(
+        userId="me",
+        body={"raw": raw, "threadId": orig.get("threadId")}).execute()
+    return {"sent": True, "id": sent.get("id"), "to": to,
+            "subject": subject}
+
+
+def tool_forward_email(account_id: int, msg_id: str, to: str,
+                       note: str = "", which: str = "") -> dict:
+    """Pass a message on to somebody else, original text included."""
+    svc = gmail_client(account_id, which)
+    orig = svc.users().messages().get(
+        userId="me", id=msg_id, format="full").execute()
+    h = _headers_of(orig)
+    subject = h.get("Subject", "")
+    if not subject.lower().startswith("fwd:"):
+        subject = "Fwd: " + subject
+    original = _extract_body(orig["payload"]).strip()[:20000]
+    parts = []
+    if note.strip():
+        parts.append(note.strip())
+        parts.append("")
+    parts += ["---------- Forwarded message ----------",
+              f"From: {h.get('From', '')}",
+              f"Date: {h.get('Date', '')}",
+              f"Subject: {h.get('Subject', '')}",
+              "", original]
+    msg = MIMEText("\n".join(parts))
+    msg["to"] = to
+    msg["subject"] = subject
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    sent = svc.users().messages().send(userId="me",
+                                       body={"raw": raw}).execute()
+    return {"sent": True, "id": sent.get("id"), "to": to,
+            "subject": subject}
+
+
+def tool_draft_email(account_id: int, to: str, subject: str, body: str,
+                     which: str = "") -> dict:
+    """Write it now, send it later - or let the office finish it."""
+    svc = gmail_client(account_id, which)
+    msg = MIMEText(body)
+    msg["to"] = to
+    msg["subject"] = subject
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    d = svc.users().drafts().create(
+        userId="me", body={"message": {"raw": raw}}).execute()
+    return {"saved": True, "id": d.get("id"), "to": to, "subject": subject}
+
+
+# What each spoken action does to a message. Trash is its own API call;
+# the rest are label changes.
+MESSAGE_ACTIONS = {
+    "archive": {"removeLabelIds": ["INBOX"]},
+    "unarchive": {"addLabelIds": ["INBOX"]},
+    "star": {"addLabelIds": ["STARRED"]},
+    "unstar": {"removeLabelIds": ["STARRED"]},
+    "important": {"addLabelIds": ["IMPORTANT"]},
+    "spam": {"addLabelIds": ["SPAM"], "removeLabelIds": ["INBOX"]},
+    "not_spam": {"addLabelIds": ["INBOX"], "removeLabelIds": ["SPAM"]},
+}
+
+
+def tool_message_action(account_id: int, msg_ids, action: str,
+                        which: str = "") -> dict:
+    """Archive, star, mark spam or move to the bin.
+
+    Nothing here destroys anything. Trash is recoverable for 30 days and
+    everything else is a label that can be put back - deliberately, because
+    a caller cannot see what just happened."""
+    ids = [msg_ids] if isinstance(msg_ids, str) else list(msg_ids)
+    if not ids:
+        return {"changed": 0}
+    svc = gmail_client(account_id, which)
+    if action == "trash":
+        for i in ids:
+            svc.users().messages().trash(userId="me", id=i).execute()
+        return {"changed": len(ids), "action": "trash",
+                "undo": "in the bin - recoverable for 30 days"}
+    if action == "untrash":
+        for i in ids:
+            svc.users().messages().untrash(userId="me", id=i).execute()
+        return {"changed": len(ids), "action": "untrash"}
+    body = MESSAGE_ACTIONS.get(action)
+    if not body:
+        raise HTTPException(400, f"Don't know how to '{action}'.")
+    svc.users().messages().batchModify(
+        userId="me", body=dict(body, ids=ids)).execute()
+    return {"changed": len(ids), "action": action}
+
+
+def _walk_parts(payload, out):
+    for p in payload.get("parts", []) or []:
+        fn = p.get("filename") or ""
+        bid = (p.get("body") or {}).get("attachmentId")
+        if fn and bid:
+            out.append({"filename": fn,
+                        "mime": p.get("mimeType", ""),
+                        "bytes": (p.get("body") or {}).get("size", 0),
+                        "id": bid})
+        _walk_parts(p, out)
+    return out
+
+
+def tool_attachments(account_id: int, msg_id: str, which: str = "") -> dict:
+    """What is actually attached to a message."""
+    svc = gmail_client(account_id, which)
+    m = svc.users().messages().get(
+        userId="me", id=msg_id, format="full").execute()
+    return {"attachments": _walk_parts(m.get("payload", {}), [])}
+
+
+def tool_attachment_text(account_id: int, msg_id: str, attachment_id: str,
+                         which: str = "", limit: int = 12000) -> dict:
+    """Read an attached document. PDFs and plain text for now."""
+    svc = gmail_client(account_id, which)
+    a = svc.users().messages().attachments().get(
+        userId="me", messageId=msg_id, id=attachment_id).execute()
+    raw = base64.urlsafe_b64decode(a.get("data", ""))
+    head = raw[:5]
+    if head.startswith(b"%PDF"):
+        try:
+            from pypdf import PdfReader
+            import io as _io
+            reader = PdfReader(_io.BytesIO(raw))
+            text = " ".join((p.extract_text() or "") for p in reader.pages)
+            return {"text": " ".join(text.split())[:limit], "kind": "pdf"}
+        except Exception as e:
+            return {"text": "", "error": f"could not read the PDF: "
+                                         f"{str(e)[:120]}"}
+    try:
+        return {"text": " ".join(raw.decode("utf-8", "ignore").split())[:limit],
+                "kind": "text"}
+    except Exception:
+        return {"text": "", "error": "that kind of file can't be read aloud"}
+
+
 def tool_search_email(account_id: int, query: str, limit: int = 5,
                       which: str = "", newest_first: bool = False) -> dict:
     """Search the whole mailbox, not just unread.
@@ -4787,6 +4952,83 @@ def email_mark_read(request: Request, account_id: int, msg_ids: str = "",
     if not ids:
         raise HTTPException(400, "Give msg_ids, or set all_unread=true.")
     return tool_mark_read(account_id, ids, read, which)
+
+
+class ReplyBody(BaseModel):
+    account_id: int
+    msg_id: str
+    body: str
+    which: str = ""
+    all_recipients: bool = False
+
+
+@app.post("/email/reply")
+def email_reply(b: ReplyBody, request: Request):
+    require_auth(request)
+    out = tool_reply_email(b.account_id, b.msg_id, b.body, b.which,
+                           b.all_recipients)
+    emit("email", "reply", f"replied to {out.get('to', '')}", "info",
+         b.account_id)
+    return out
+
+
+class ForwardBody(BaseModel):
+    account_id: int
+    msg_id: str
+    to: str
+    note: str = ""
+    which: str = ""
+
+
+@app.post("/email/forward")
+def email_forward(b: ForwardBody, request: Request):
+    require_auth(request)
+    out = tool_forward_email(b.account_id, b.msg_id, b.to, b.note, b.which)
+    emit("email", "forward", f"forwarded to {b.to}", "info", b.account_id)
+    return out
+
+
+class DraftBody(BaseModel):
+    account_id: int
+    to: str
+    subject: str
+    body: str
+    which: str = ""
+
+
+@app.post("/email/draft")
+def email_draft(b: DraftBody, request: Request):
+    require_auth(request)
+    return tool_draft_email(b.account_id, b.to, b.subject, b.body, b.which)
+
+
+@app.post("/email/action")
+def email_action(request: Request, account_id: int, msg_ids: str,
+                 action: str, which: str = ""):
+    """archive, unarchive, star, unstar, important, spam, not_spam,
+    trash, untrash. Nothing here is permanent."""
+    require_auth(request)
+    ids = [i for i in msg_ids.split(",") if i.strip()]
+    if not ids:
+        raise HTTPException(400, "No messages given.")
+    out = tool_message_action(account_id, ids, action, which)
+    emit("email", action, f"{action} on {len(ids)} message(s)", "info",
+         account_id)
+    return out
+
+
+@app.get("/email/attachments")
+def email_attachments(request: Request, account_id: int, msg_id: str,
+                      which: str = ""):
+    require_auth(request)
+    return tool_attachments(account_id, msg_id, which)
+
+
+@app.get("/email/attachment")
+def email_attachment(request: Request, account_id: int, msg_id: str,
+                     attachment_id: str, which: str = ""):
+    require_auth(request)
+    return tool_attachment_text(account_id, msg_id, attachment_id, which)
 
 
 @app.get("/test/read")

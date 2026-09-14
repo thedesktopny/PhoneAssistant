@@ -1292,6 +1292,52 @@ def _():
         "the list still grows instead of holding only the current one"
 
 
+@check("email can be replied to, tidied and read, not just listened to")
+def _():
+    """A phone-only caller could hear their email but do nothing with it -
+    no reply, no filing, and an attached invoice was unreadable."""
+    inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                           "+1555", 1)
+    names = {getattr(t, "__name__", "") for t in inst.tools}
+    for t in ("reply_to_email", "forward_email", "tidy_email",
+              "read_attachment", "save_draft"):
+        assert t in names, f"missing: {t}"
+    paths = {r.path for r in main.app.routes}
+    for p in ("/email/reply", "/email/forward", "/email/action",
+              "/email/attachments", "/email/attachment", "/email/draft"):
+        assert p in paths, f"route missing: {p}"
+
+
+@check("nothing an email tool does is permanent")
+def _():
+    """A caller cannot see what just happened, so every action has to be
+    reversible - trash is recoverable, labels can be put back, and there
+    is no permanent delete anywhere."""
+    for undoable in ("archive", "star", "important", "spam"):
+        assert undoable in main.MESSAGE_ACTIONS, f"{undoable} is missing"
+    for undo in ("unarchive", "unstar", "not_spam"):
+        assert undo in main.MESSAGE_ACTIONS, f"no way to undo: {undo}"
+    src = open("main.py", encoding="utf-8").read()
+    assert "messages().delete(" not in src, \
+        "a permanent delete has appeared - trash only, it is recoverable"
+    body = src[src.index("def tool_message_action("):]
+    body = body[:body.index("\ndef ", 10)]
+    assert "untrash" in body, "trash can't be undone"
+
+
+@check("sending or forwarding needs a spoken yes first")
+def _():
+    """Forwarding sends the whole original to somebody else. Neither it
+    nor a reply may go without the caller actually agreeing."""
+    src = open("agent.py", encoding="utf-8").read()
+    for fn in ("reply_to_email", "forward_email"):
+        body = src[src.index(f"async def {fn}("):]
+        body = body[:body.index("\n    @function_tool")]
+        assert "caller_said" in body, f"{fn} can send with no confirmation"
+        assert body.index("caller_said") < body.index("backend_post"), \
+            f"{fn} sends before checking they agreed"
+
+
 @check("required tools exist")
 def _():
     inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
