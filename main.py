@@ -4860,9 +4860,66 @@ def text_brain(account_id: int, incoming: str) -> str:
 app = FastAPI(title="Phone Assistant")
 
 
-@app.get("/")
+# NB: this file must NOT be called site.py - Python has a built-in module
+# of that name and shadowing it breaks the interpreter's startup.
+from site_pages import HOME, SIGNUP, PRIVACY, TERMS
+
+
+@app.get("/health")
 def health():
     return {"ok": True, "service": "phone-assistant", "step": "gmail"}
+
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    """The public front page. Google's reviewers land here, and so do the
+    families who set an elderly customer up."""
+    return HTMLResponse(HOME)
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+def privacy():
+    """Required for Google verification, and it has to be on a domain you
+    own - a railway.app address will not pass."""
+    return HTMLResponse(PRIVACY)
+
+
+@app.get("/terms", response_class=HTMLResponse)
+def terms():
+    return HTMLResponse(TERMS)
+
+
+@app.get("/signup", response_class=HTMLResponse)
+def signup_page():
+    return HTMLResponse(SIGNUP)
+
+
+class SignupBody(BaseModel):
+    name: str = ""
+    phone: str = ""
+    helper: str = ""
+    note: str = ""
+
+
+@app.post("/signup")
+def signup_request(b: SignupBody):
+    """Somebody asking to be set up. Deliberately not an account - accounts
+    need a phone number we have confirmed, and most of these will be a
+    daughter arranging it for her father."""
+    who = (b.name or "").strip()[:120]
+    phone = (b.phone or "").strip()[:40]
+    if not who or not phone:
+        raise HTTPException(400, "A name and a telephone number are needed.")
+    note = (f"NEW SIGNUP REQUEST\nFor: {who}\nTheir number: {phone}\n"
+            f"Arranged by: {(b.helper or '(themselves)').strip()[:120]}\n"
+            f"Notes: {(b.note or '').strip()[:600]}")
+    db = Session()
+    db.add(Followup(reason="signup", note=note, channel="web"))
+    db.commit()
+    db.close()
+    emit("signup", "web", f"someone asked to be set up: {who} ({phone})",
+         "warn")
+    return {"ok": True}
 
 
 class NewAccount(BaseModel):

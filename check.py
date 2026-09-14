@@ -886,6 +886,29 @@ def _():
         "something still builds a forgeable link"
 
 
+@check("the public pages Google verification needs are there")
+def _():
+    """Verification wants a privacy policy and terms on a domain you own,
+    a homepage explaining the app, and the Limited Use disclosure for
+    restricted scopes. Without those the submission is refused."""
+    from fastapi.testclient import TestClient
+    c = TestClient(main.app, raise_server_exceptions=False, base_url="https://t")
+    for path in ("/", "/privacy", "/terms", "/signup"):
+        r = c.get(path)
+        assert r.status_code == 200, f"{path} -> {r.status_code}"
+        assert "<html" in r.text.lower(), f"{path} isn't a web page"
+    priv = c.get("/privacy").text
+    assert "Limited Use" in priv, \
+        "the privacy policy is missing Google's Limited Use disclosure"
+    assert "api-services-user-data-policy" in priv, \
+        "it must link Google's User Data Policy"
+    for must in ("not sold", "not used to train"):
+        assert must in priv, f"the policy should say data is {must}"
+    # the machine health check must survive the homepage becoming a page
+    assert c.get("/health").json().get("ok") is True, \
+        "nothing answers a plain health check any more"
+
+
 @check("caller country routing")
 def _():
     assert main._where_for_phone("+13476752334")[0] == "US"
