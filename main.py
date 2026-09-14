@@ -6090,7 +6090,7 @@ week's hours, whether a shop has it in stock - say it needs checking."""
 
 
 @app.get("/ask")
-def ask_ai(request: Request, q: str):
+def ask_ai(request: Request, q: str, model: str = ""):
     """Ask a bigger model a general-knowledge question.
 
     The voice model is tuned for speech, not for knowing things, and it was
@@ -6103,7 +6103,10 @@ def ask_ai(request: Request, q: str):
     if not OPENAI_API_KEY:
         return {"answer": "", "error": "no model configured"}
     try:
-        d = _openai_chat(model=MODEL_BROWSER, cheap=False, messages=[
+        # model= lets you compare what different models actually know
+        # before committing to one in Railway
+        use = model.strip() or MODEL_BROWSER
+        d = _openai_chat(model=use, cheap=False, messages=[
             {"role": "system", "content": ASK_SYSTEM},
             {"role": "user", "content": q[:600]}])
         said = (d["choices"][0]["message"].get("content") or "").strip()
@@ -6111,7 +6114,7 @@ def ask_ai(request: Request, q: str):
         return {"answer": "", "error": str(e)[:200]}
     if is_blocked(said):
         return {"blocked": True, "answer": BLOCKED_REPLY}
-    return {"answer": said[:900], "model": MODEL_BROWSER}
+    return {"answer": said[:900], "model": use}
 
 
 @app.get("/web/search")
