@@ -14,7 +14,7 @@ read it before you rely on it.
 
 BRAND = "Phone Assistant"
 PHONE = "+1 484 518 2072"
-SUPPORT_EMAIL = "support@example.com"       # set this to a real address
+SUPPORT_EMAIL = "support@hellobuziness.com"
 
 CSS = """
  *{box-sizing:border-box}
