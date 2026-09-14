@@ -647,10 +647,16 @@ LOOKING THINGS UP
   page actually came back and said it. Do not give the same question three
   different confident answers - that is how they know you are guessing.
 
-- When they want it checked, or being wrong would matter, use web_search
-  and then read_page. Tell them it will take a minute. Do not ask them to
-  go and look at their own appliance and report back - they rang you to be
-  told.
+- WHEN IT HAS TO BE RIGHT, USE look_it_up - one tool, and it searches and
+  reads the real pages itself. A specific model's steps, today's price,
+  this week's hours: look_it_up, then one short sentence and silence until
+  I give you the answer.
+  Do NOT use web_search for those. A search alone gives you headlines, and
+  three separate callers have been told wrong fridge instructions built
+  out of headlines. web_search is for a phone number, an address, a quick
+  fact - things a headline actually contains.
+- Do not ask them to go and look at their own appliance and report back.
+  They rang you to be told.
 - The caller is in the New York area. For anything local, pass their area in
   the "near" field.
 - Give the answer in one or two spoken sentences. Read a phone number in
@@ -772,6 +778,12 @@ Never pick one for them silently.
                     return ("Say they are signed in now, then start what "
                             "they originally asked for again. Do not ask "
                             "get_site_result about the sign-in itself.")
+                if kind == "browse":
+                    # the message IS the answer - don't make them wait
+                    # through another round trip to hear it
+                    return (f"Tell them this now, in your own words, and "
+                            f"say where it came from if it names a model: "
+                            f"{msg}")
                 return ("Say it's done, then get the details with "
                         "get_site_result.")
             if st == "failed":
@@ -1869,6 +1881,40 @@ Never pick one for them silently.
             "check, searching was not checking: call read_page NOW or give "
             "them your answer. Do not say 'almost there'.")
         return "\n".join(lines)[:2000]
+
+    @function_tool
+    @auto_report("search")
+    async def look_it_up(self, context: RunContext, question: str):
+        """Find something out PROPERLY: this searches and then reads the
+        real pages itself, and tells you the answer when it has one.
+
+        Use this whenever they need exact detail you do not already know -
+        a particular model's steps, today's price, this week's opening
+        hours. It takes about a minute and runs in the background, so say
+        one short sentence and then stay quiet until I tell you the answer.
+
+        Do NOT use web_search for these. A search on its own only gives you
+        headlines, and answering from those is how people get told wrong
+        instructions."""
+        try:
+            async with httpx.AsyncClient(timeout=25) as c:
+                r = await c.post(f"{BACKEND}/jobs/browse", headers=AUTH,
+                                 params={"account_id": self.account_id,
+                                         "goal": question,
+                                         "max_steps": 10,
+                                         "call_id": self.call_id or 0})
+                d = r.json()
+        except Exception as e:
+            log.error(f"look up failed: {e}")
+            return "Couldn't start that."
+        if d.get("blocked"):
+            return d.get("answer") or "BLOCKED."
+        self.job_id = d.get("job_id")
+        self.job_question = question
+        self._watch_job(f"looking up {question}")
+        return ("Looking it up properly now. Say ONE short sentence telling "
+                "them that - about a minute - then stay silent. I will tell "
+                "you the answer.")
 
     @function_tool
     @auto_report("search")

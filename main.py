@@ -3474,8 +3474,25 @@ def _run_browse(jid: int, account_id: int, site: str):
     call_id = row.call_id if row else None
     db.close()
     goal = payload.get("goal", "")
-    start = payload.get("url") or (f"https://www.{site}.com"
-                                   if site else "https://www.google.com")
+    start = payload.get("url") or ""
+    if not start and not site:
+        # "Look this up properly": do the search here and start on the best
+        # result. Asking the model to search and then decide to read a page
+        # never worked - it searched, narrated, and answered from thin air.
+        try:
+            found = tool_web_search(goal)
+            hits = [r.get("url") for r in found.get("results", [])
+                    if r.get("url")]
+            if hits:
+                start = hits[0]
+                payload.setdefault("urls", [])
+                payload["urls"] = hits[1:4] + list(payload["urls"])
+                _job_set(jid, "opening", f"Looking up: {goal[:90]}")
+        except Exception as e:
+            emit("browse", f"job {jid}", f"search first failed: {e}", "warn")
+    if not start:
+        start = (f"https://www.{site}.com" if site
+                 else "https://www.google.com")
     # Other pages to try if this one turns out to refuse robots. A
     # manufacturer's own support page is usually the first search result
     # and usually the one that blocks, so going back to the agent to pick

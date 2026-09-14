@@ -1019,7 +1019,13 @@ def _():
     names = {getattr(t, "__name__", "") for t in inst.tools}
     assert "read_page" in names, \
         "nothing can open a search result and read the actual page"
+    assert "look_it_up" in names, (
+        "there is no single tool that searches AND reads the page. Telling "
+        "the model to do it in two steps failed on three separate calls - "
+        "it searched, narrated progress, and answered from headlines.")
     said = inst.instructions
+    assert "USE look_it_up" in said, \
+        "the instructions still send it to web_search for exact detail"
     # It must be free to answer general knowledge straight away - forbidding
     # that made it browse for a minute and a half over something it knew.
     assert "ANSWER FROM WHAT YOU KNOW FIRST" in said, \
