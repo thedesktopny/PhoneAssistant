@@ -1180,6 +1180,35 @@ def _():
     assert agent.LOOKUP_WAIT <= 180, "that would hold a caller far too long"
 
 
+@check("the same failed lookup isn't run again")
+def _():
+    """Call 52: the ice maker lookup failed, and the assistant ran the
+    identical search twice more while the caller waited four and a half
+    minutes and then hung up."""
+    src = open("agent.py", encoding="utf-8").read()
+    body = src[src.index("async def look_it_up("):]
+    body = body[:body.index("\n    @function_tool")]
+    assert "_lookups" in body, "nothing remembers that a lookup failed"
+    assert body.index("_lookups.get(key)") < body.index("jobs/browse"), \
+        "it starts the job before checking whether this already failed"
+    assert 'self._lookups[key] = "failed"' in body, \
+        "a failure is never recorded, so it can be repeated for ever"
+
+
+@check("a shop listing doesn't outrank the manual")
+def _():
+    """The first result for a model number is the page selling it, which
+    tells an owner nothing. The lookup kept landing there and getting
+    stuck."""
+    src = open("main.py", encoding="utf-8").read()
+    body = src[src.index("def _run_browse("):]
+    body = body[:body.index("\ndef ", 10)]
+    i = body.index("def _rank(")
+    rank = body[i:i + 600]
+    for must in ("looks_like_pdf", "manual", "/p/"):
+        assert must in rank, f"{must} isn't considered when ranking sources"
+
+
 @check("required tools exist")
 def _():
     inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},

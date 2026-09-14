@@ -275,6 +275,7 @@ class Assistant(Agent):
         self.job_username = ""
         self._login_confirmed = {}
         self.last_search = []
+        self._lookups = {}          # question -> how it went, this call
 
         # %-d is Linux-only and raises on Windows, where check.py is run
         _now = datetime.now(ZoneInfo("America/New_York"))
@@ -1960,6 +1961,19 @@ Never pick one for them silently.
         Do NOT use web_search for these. A search on its own only gives you
         headlines, and answering from those is how people get told wrong
         instructions."""
+        key = " ".join(question.lower().split())[:120]
+        if self._lookups.get(key) == "failed":
+            # Running the same failed search again gets the same nothing,
+            # and the caller is listening to it. One call spent four and a
+            # half minutes on three identical lookups.
+            return ("That exact lookup already failed once on this call. Do "
+                    "NOT run it again unchanged - it will fail the same way "
+                    "and they are waiting. Tell them straight that you "
+                    "can't get the manufacturer's own instructions. Then "
+                    "either say what you know with the caveat that it "
+                    "varies by model, or try look_it_up ONCE more with a "
+                    "genuinely different question - a different wording, "
+                    "the manual, a part number - never the same one.")
         try:
             async with httpx.AsyncClient(timeout=25) as c:
                 r = await c.post(f"{BACKEND}/jobs/browse", headers=AUTH,
@@ -2004,14 +2018,17 @@ Never pick one for them silently.
                 continue
             state = st.get("state", "")
             if state == "done":
+                self._lookups[key] = "done"
                 return (f"{st.get('message', '')} -- Tell them that now, in "
                         f"your own words. Do not say you are still looking, "
                         f"you have the answer.")
             if state == "failed":
+                self._lookups[key] = "failed"
                 return (f"It didn't work: {st.get('message', '')}. You have "
                         f"nothing from it - do not describe what it said. "
-                        f"Tell them you couldn't find it and offer another "
-                        f"way.")
+                        f"Tell them plainly you couldn't get it, then say "
+                        f"what you know with the caveat that it varies by "
+                        f"model. Do not run this same lookup again.")
             if state == "needs_input":
                 return (st.get("message", "") + " Ask them, then call "
                         "answer_website_question.")

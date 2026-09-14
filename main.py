@@ -3520,8 +3520,19 @@ def _run_browse(jid: int, account_id: int, site: str):
             found = tool_web_search(goal)
             hits = [r.get("url") for r in found.get("results", [])
                     if r.get("url")]
-            # a manufacturer's manual beats somebody's video
-            hits.sort(key=lambda u: 0 if looks_like_pdf(u) else 1)
+            # the manual beats a video, and both beat a shop listing -
+            # a product page for the thing they already own tells them
+            # nothing and is usually the first result
+            def _rank(u: str) -> int:
+                low = (u or "").lower()
+                if looks_like_pdf(low):
+                    return 0                     # the manual itself
+                if "manual" in low or "use-and-care" in low:
+                    return 1                     # a page hosting one
+                if "/p/" in low or "/shop" in low or "buy" in low:
+                    return 3                     # somewhere to buy it
+                return 2
+            hits.sort(key=_rank)
             if hits:
                 start = hits[0]
                 payload.setdefault("urls", [])
