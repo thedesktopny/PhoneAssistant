@@ -1422,12 +1422,18 @@ BLOCKED_TERMS = {
 }
 
 
-def is_blocked(text: str) -> bool:
+def blocked_terms_in(text: str) -> set:
+    """Which forbidden words actually appear. Counting them matters: one
+    stray word in a web snippet is not the same as a page about it."""
     t = " " + (text or "").lower().replace("-", " ") + " "
-    for term in BLOCKED_TERMS:
-        if f" {term} " in t or t.strip() == term:
-            return True
-    return False
+    return {term for term in BLOCKED_TERMS
+            if f" {term} " in t or t.strip() == term}
+
+
+def is_blocked(text: str) -> bool:
+    """For something the CALLER said, or an answer we are about to read
+    out. One word is enough here - they chose those words."""
+    return bool(blocked_terms_in(text))
 
 
 # What a tool returns when a blocked topic comes up. The browser path has to
@@ -1512,9 +1518,18 @@ def tool_web_search(query: str, near: str = "") -> dict:
     except Exception as e:
         return {"answer": f"Search failed: {e}", "results": []}
 
-    combined = out.get("answer", "") + " " + " ".join(
-        r.get("snippet", "") for r in out.get("results", []))
-    if is_blocked(combined):
+    # The direct answer is read out, so judge it as strictly as speech.
+    if is_blocked(out.get("answer", "")):
+        return {"blocked": True,
+                "answer": "I am not allowed to talk to you about this.",
+                "results": []}
+    # Snippets are scraped web text and full of stray words. Refusing a
+    # whole search because one result said "news" blocked a question about
+    # security assessors. Two different forbidden words means the results
+    # really are about something we don't discuss; one means nothing.
+    snippets = " ".join(r.get("snippet", "") + " " + r.get("title", "")
+                        for r in out.get("results", []))
+    if len(blocked_terms_in(snippets)) >= 2:
         return {"blocked": True,
                 "answer": "I am not allowed to talk to you about this.",
                 "results": []}

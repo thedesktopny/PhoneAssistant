@@ -832,6 +832,29 @@ def _():
     assert hits[0].endswith(".pdf"), hits
 
 
+@check("one stray word in a search result doesn't block the whole search")
+def _():
+    """A question about Google security assessors was refused because one
+    result snippet contained the word "news". Snippets are scraped web
+    text - a single word in one is not what the caller asked about."""
+    stray = ("Security news and updates for assessors. CASA validation "
+             "letters explained.")
+    assert len(main.blocked_terms_in(stray)) == 1, stray
+    assert main.is_blocked(stray), "a caller saying this should still stop"
+    # but as search RESULTS it must get through
+    real = ("Breaking news headlines today. Latest news, sports scores and "
+            "entertainment.")
+    assert len(main.blocked_terms_in(real)) >= 2, \
+        "genuinely-news results must still be caught"
+    src = open("main.py", encoding="utf-8").read()
+    body = src[src.index("def tool_web_search("):]
+    body = body[:body.index("\ndef ", 10)]
+    assert "blocked_terms_in(snippets)) >= 2" in body, \
+        "a single stray word in a snippet can still refuse a whole search"
+    assert "is_blocked(out.get(\"answer\"" in body, \
+        "the spoken answer must still be judged strictly"
+
+
 @check("caller country routing")
 def _():
     assert main._where_for_phone("+13476752334")[0] == "US"
