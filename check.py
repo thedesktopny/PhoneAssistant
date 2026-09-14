@@ -1075,6 +1075,41 @@ def _():
         "nothing stops a misheard turn being read as a language choice"
 
 
+@check("an old answer isn't repeated as established fact")
+def _():
+    """Call 49: the assistant opened with "we were looking into that
+    earlier" and repeated the wrong button combination from call 48 - the
+    one the caller had already rejected. Conversation history was labelled
+    "you already know this", so a hallucination became a remembered fact."""
+    inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                           "+1555", 1, history="- (voice) assistant: it is "
+                                               "the v and + buttons")
+    said = inst.instructions
+    assert "you already know this" not in said, \
+        "history is still presented to the model as known fact"
+    assert "NOT a record of facts" in said, said[:300]
+    assert "assume the last" in said and "get it right this time" in said, \
+        "asking again doesn't prompt it to re-check"
+
+
+@check("it can't claim to be working when nothing is running")
+def _():
+    """Call 49: it searched once, never read a page, then said "almost
+    there" for two and a half minutes with nothing running at all."""
+    inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                           "+1555", 1)
+    said = inst.instructions
+    assert "ONLY SAY YOU ARE WORKING" in said, \
+        "nothing stops it narrating progress on work it never started"
+    assert "web_search is NOT one of" in said, \
+        "a finished search can still be treated as something to wait for"
+    src = open("agent.py", encoding="utf-8").read()
+    body = src[src.index("async def web_search("):]
+    body = body[:body.index("\n    @function_tool")]
+    assert "This search is FINISHED" in body, \
+        "the search result doesn't say it has already returned"
+
+
 @check("required tools exist")
 def _():
     inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
