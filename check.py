@@ -806,6 +806,32 @@ def _():
         "read_page doesn't pass the other results as fallbacks"
 
 
+@check("a PDF is read, not browsed")
+def _():
+    """An appliance manual is a PDF, and a PDF has no text in a browser at
+    all. We were scraping videos for something the manufacturer's own
+    manual states plainly - which is how Claude answered and we couldn't."""
+    assert main.looks_like_pdf("https://x.com/manual/A16366306.pdf")
+    assert main.looks_like_pdf("https://x.com/a.PDF?v=2")
+    assert not main.looks_like_pdf("https://youtube.com/watch?v=abc")
+    assert not main.looks_like_pdf("")
+    src = open("main.py", encoding="utf-8").read()
+    body = src[src.index("def _run_browse("):]
+    body = body[:body.index("\ndef ", 10)]
+    assert "looks_like_pdf(start)" in body, \
+        "a browse job still opens a PDF in a browser, where it reads blank"
+    # (the import at the top doesn't open anything - this is where one does)
+    assert body.index("looks_like_pdf(start)") \
+        < body.index("with sync_playwright()"), \
+        "the PDF check must happen before a browser is started"
+    # and a manual should outrank a video in the results
+    hits = ["https://youtube.com/watch?v=a",
+            "https://frigidaire.com/manual.pdf",
+            "https://reddit.com/r/x"]
+    hits.sort(key=lambda u: 0 if main.looks_like_pdf(u) else 1)
+    assert hits[0].endswith(".pdf"), hits
+
+
 @check("caller country routing")
 def _():
     assert main._where_for_phone("+13476752334")[0] == "US"

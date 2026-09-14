@@ -2759,6 +2759,43 @@ def _new_browserbase_context() -> str:
         return ""
 
 
+def looks_like_pdf(url: str) -> bool:
+    u = (url or "").lower().split("?")[0]
+    return u.endswith(".pdf") or "/pdf/" in u
+
+
+def read_pdf(url: str, limit: int = 12000) -> str:
+    """Pull the text out of a PDF.
+
+    Appliance manuals, statements and bills are all PDFs, and a PDF has no
+    readable text in a browser at all - document.innerText is empty. We
+    were scraping videos for something the manufacturer's own manual says
+    plainly."""
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; PhoneAssistant/1.0)"})
+        with urllib.request.urlopen(req, timeout=40) as r:
+            raw = r.read(8 * 1024 * 1024)
+    except Exception as e:
+        emit("browse", "pdf", f"could not fetch {url[:80]}: {str(e)[:90]}",
+             "warn")
+        return ""
+    try:
+        from pypdf import PdfReader
+        import io as _io
+        reader = PdfReader(_io.BytesIO(raw))
+        out = []
+        for page in reader.pages:
+            out.append(page.extract_text() or "")
+            if sum(len(x) for x in out) > limit:
+                break
+        return " ".join(" ".join(out).split())[:limit]
+    except Exception as e:
+        emit("browse", "pdf", f"could not read {url[:80]}: {str(e)[:90]}",
+             "warn")
+        return ""
+
+
 def _agent_fallback(jid: int, account_id: int, site: str, goal: str,
                     url: str = ""):
     """No hand-written setup for this site - hand it to the general agent
@@ -3483,6 +3520,8 @@ def _run_browse(jid: int, account_id: int, site: str):
             found = tool_web_search(goal)
             hits = [r.get("url") for r in found.get("results", [])
                     if r.get("url")]
+            # a manufacturer's manual beats somebody's video
+            hits.sort(key=lambda u: 0 if looks_like_pdf(u) else 1)
             if hits:
                 start = hits[0]
                 payload.setdefault("urls", [])
@@ -3518,6 +3557,24 @@ def _run_browse(jid: int, account_id: int, site: str):
 
     def log_fn(msg):
         _job_set(jid, "working", msg)
+
+    # A PDF has nothing for a browser to read - fetch and extract it
+    # instead. No browser session, no bot check, and it is the manual.
+    if looks_like_pdf(start):
+        text = read_pdf(start)
+        if text:
+            answer = _summarise_page(text, goal)
+            if answer and "NOTHING_RELEVANT" not in answer:
+                _job_set(jid, "done", answer[:1500])
+                _record_request(site_key, task, goal, "pdf", "ok",
+                                time.time() - t0, jid)
+                return
+        nxt = [u for u in (payload.get("urls") or []) if u]
+        if nxt:
+            start, payload["urls"] = nxt[0], nxt[1:]
+        else:
+            _job_set(jid, "failed", "That document could not be read.")
+            return
 
     browser = page = None
     recorded = []          # steps with element descriptions, for the recipe
