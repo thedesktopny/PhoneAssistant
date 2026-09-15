@@ -189,6 +189,17 @@ def _():
             f"the caller ({now:%I:%M %p}) - that's the UTC bug")
 
 
+@scenario("email: 'minutes ago' also says the clock time",
+          "call 54 - '51 minutes ago' at midnight; it thought it was morning")
+def _():
+    d = call("/test/search", account_id=ACCOUNT, q="in:inbox", limit=10,
+             newest_first=True)
+    for m in d.get("messages", []):
+        w = m.get("when") or ""
+        if "minutes ago" in w:
+            assert " at " in w, f"no clock time in {w!r}"
+
+
 @scenario("email: most recent really is most recent",
           "call 38 - read out a 4:07 PM email before a 7:17 PM one")
 def _():
