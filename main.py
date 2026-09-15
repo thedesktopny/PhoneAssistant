@@ -8,6 +8,7 @@ Endpoints:
   GET  /link/new?account_id=1       -> a signed link for the customer
   GET  /link/start?t=...            -> the page they open to connect Gmail
   GET  /link/callback               (Google redirects here, don't call it yourself)
+  GET  /link/code?account_id=1      -> a six-digit code for the /connect page
   GET  /test/unread?account_id=1    -> what the voice agent will read out
   GET  /test/read?account_id=1&msg_id=...
   POST /test/send             {"account_id":1,"to":"...","subject":"...","body":"..."}
@@ -715,47 +716,47 @@ def _check_link_token(t: str):
         return None
 
 
-LINK_PAGE_CSS = """
- body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#f4f5f7;
-      color:#1c2331;display:flex;align-items:center;justify-content:center;
-      min-height:100vh;margin:0;padding:20px;}
- .box{background:#fff;border-radius:14px;padding:32px;max-width:460px;
-      box-shadow:0 2px 18px rgba(0,0,0,.08);}
- h1{font-size:20px;margin:0 0 14px;}
- p{font-size:16px;line-height:1.6;color:#414a5c;}
- .who{background:#eef3ff;border-radius:8px;padding:12px 14px;margin:18px 0;
-      font-size:17px;}
- a.go{display:inline-block;margin-top:10px;padding:13px 22px;background:#2563eb;
-      color:#fff;text-decoration:none;border-radius:8px;font-size:16px;}
- .small{font-size:13px;color:#6b7482;margin-top:20px;}
-"""
+CONNECT_CODE_HOURS = 1
+CONNECT_MAX_FAILS = 5        # per phone number, per hour
+CONNECT_MAX_FAILS_IP = 20    # per address, per hour
+_CONNECT_FAILS: dict = {}
 
-LINK_CONFIRM_HTML = """<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Connect your email</title><style>""" + LINK_PAGE_CSS + """</style>
-</head><body><div class="box">
-<h1>Connect your email</h1>
-<p>This connects a Gmail account to the phone assistant, so it can read
-your messages to you and send replies when you ask it to.</p>
-<div class="who">You are connecting to the account for <b>{name}</b>.</div>
-<p>If that is not you or the person you are helping, close this page and
-do nothing else.</p>
-<p>Google will ask you to sign in and show you exactly what you are
-allowing. You can undo it at any time from your Google account.</p>
-<a class="go" href="/link/start?t={token}&go=1">Continue to Google</a>
-<div class="small">You will only be asked to do this once.</div>
-</div></body></html>"""
 
-LINK_BAD_HTML = """<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>This link has expired</title><style>""" + LINK_PAGE_CSS + """</style>
-</head><body><div class="box">
-<h1>This link has expired</h1>
-<p>Links to connect an email account are only good for a short time, so
-that nobody else can use one.</p>
-<p>Ring the assistant again and ask for a new link, and it will send you
-a fresh one.</p>
-</div></body></html>"""
+def _connect_code(account_id: int, hour: int | None = None) -> str:
+    """Six digits the assistant reads out, for a helper to type in on the
+    connect page. Nothing is stored: it is worked out from the account and
+    the hour, signed with our key, so it can't be guessed from the account
+    number and it dies on its own."""
+    import hmac
+    import hashlib
+    if hour is None:
+        hour = int(time.time() // (CONNECT_CODE_HOURS * 3600))
+    mac = hmac.new(ENCRYPTION_KEY.encode(),
+                   f"connect.{account_id}.{hour}".encode(),
+                   hashlib.sha256).digest()
+    return f"{int.from_bytes(mac[:8], 'big') % 1000000:06d}"
+
+
+def _connect_code_ok(account_id: int, code: str) -> bool:
+    """This hour's code or last hour's, so one given at 2:59 still works."""
+    import hmac
+    code = "".join(ch for ch in (code or "") if ch.isdigit())
+    if len(code) != 6:
+        return False
+    now = int(time.time() // (CONNECT_CODE_HOURS * 3600))
+    return any(hmac.compare_digest(_connect_code(account_id, h), code)
+               for h in (now, now - 1))
+
+
+def _connect_too_many(key: str, limit: int, add: bool = False) -> bool:
+    """Six digits are only safe if nobody can try them all. Count failures
+    per phone number and per address over the last hour."""
+    cutoff = time.time() - 3600
+    hits = [t for t in _CONNECT_FAILS.get(key, []) if t > cutoff]
+    if add:
+        hits.append(time.time())
+    _CONNECT_FAILS[key] = hits
+    return len(hits) >= limit
 
 
 def _flow(state=None):
@@ -4862,7 +4863,9 @@ app = FastAPI(title="Phone Assistant")
 
 # NB: this file must NOT be called site.py - Python has a built-in module
 # of that name and shadowing it breaks the interpreter's startup.
-from site_pages import HOME, SIGNUP, PRIVACY, TERMS
+from site_pages import (HOME, SIGNUP, PRIVACY, TERMS, CONNECT,
+                        LINK_EXPIRED, NOT_CONNECTED, connect_confirm,
+                        connected)
 
 
 @app.get("/health")
@@ -4887,6 +4890,56 @@ def privacy():
 @app.get("/terms", response_class=HTMLResponse)
 def terms():
     return HTMLResponse(TERMS)
+
+
+@app.get("/connect", response_class=HTMLResponse)
+def connect_page():
+    """Where a son, daughter or neighbour connects a customer's email, with
+    the code the assistant read out on the phone."""
+    return HTMLResponse(CONNECT)
+
+
+class ConnectBody(BaseModel):
+    phone: str = ""
+    code: str = ""
+
+
+@app.post("/connect")
+def connect_with_code(b: ConnectBody, request: Request):
+    """Phone number plus code -> the signed link for that customer. The
+    same answer for a wrong code and an unknown number, so the page can't
+    be used to find out who is a customer."""
+    digits = "".join(ch for ch in (b.phone or "") if ch.isdigit())[-10:]
+    ip = (request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+          or (request.client.host if request.client else "?"))
+    if (_connect_too_many("p" + digits, CONNECT_MAX_FAILS)
+            or _connect_too_many("i" + ip, CONNECT_MAX_FAILS_IP)):
+        raise HTTPException(429, "Too many tries. Please wait an hour, or "
+                                 "ask the assistant for a new code.")
+    acct = account_for_number(digits) if len(digits) == 10 else None
+    if not acct or not _connect_code_ok(acct.id, b.code):
+        _connect_too_many("p" + digits, CONNECT_MAX_FAILS, add=True)
+        _connect_too_many("i" + ip, CONNECT_MAX_FAILS_IP, add=True)
+        emit("signin", "connect page", "a connect code didn't match", "warn")
+        raise HTTPException(400, "That code doesn't match that phone number. "
+                                 "Check both and try again.")
+    emit("signin", "connect page", f"code accepted for {acct.name}", "info",
+         acct.id)
+    t = _make_link_token(acct.id)
+    return {"url": f"/link/start?t={urllib.parse.quote(t)}"}
+
+
+@app.get("/link/code")
+def link_code(request: Request, account_id: int):
+    """A connect code for the assistant to read out. Agent and staff only."""
+    require_auth(request)
+    db = Session()
+    row = db.query(Account).filter_by(id=account_id).first()
+    db.close()
+    if not row:
+        raise HTTPException(404, "No such customer.")
+    return {"code": _connect_code(account_id), "valid_minutes": 60,
+            "page": f"{PUBLIC_URL}/connect", "for": row.name}
 
 
 @app.get("/signup", response_class=HTMLResponse)
@@ -5044,18 +5097,20 @@ def link_start(request: Request, t: str = "", account_id: int = 0):
     account they are about to connect to before anything happens."""
     acc = _check_link_token(t)
     if not acc:
-        return HTMLResponse(LINK_BAD_HTML, status_code=400)
+        return HTMLResponse(LINK_EXPIRED, status_code=400)
     db = Session()
     row = db.query(Account).filter_by(id=acc).first()
     name = row.name if row else ""
     db.close()
     if not name:
-        return HTMLResponse(LINK_BAD_HTML, status_code=400)
+        return HTMLResponse(LINK_EXPIRED, status_code=400)
     if request.query_params.get("go") != "1":
-        return HTMLResponse(LINK_CONFIRM_HTML
-                            .replace("{name}", name)
-                            .replace("{token}", urllib.parse.quote(t)))
-    url, _ = _flow(state=str(acc)).authorization_url(
+        return HTMLResponse(connect_confirm(
+            name, f"/link/start?t={urllib.parse.quote(t)}&go=1"))
+    # The state Google hands back is the signed ticket, not a bare account
+    # number - otherwise anyone could build a Google link carrying THEIR
+    # account number and skip our checks entirely.
+    url, _ = _flow(state=t).authorization_url(
         access_type="offline", prompt="consent", include_granted_scopes="true")
     return RedirectResponse(url)
 
@@ -5076,10 +5131,12 @@ def link_new(request: Request, account_id: int, minutes: int = 30):
 
 @app.get("/link/callback")
 def link_callback(request: Request):
-    state = request.query_params.get("state")
-    if not state:
-        raise HTTPException(400, "missing state")
-    account_id = int(state)
+    state = request.query_params.get("state") or ""
+    if request.query_params.get("error"):
+        return HTMLResponse(NOT_CONNECTED)
+    account_id = _check_link_token(state)
+    if not account_id:
+        return HTMLResponse(LINK_EXPIRED, status_code=400)
 
     flow = _flow(state=state)
     flow.fetch_token(authorization_response=str(request.url).replace(
@@ -5114,9 +5171,9 @@ def link_callback(request: Request):
     db.commit()
     db.close()
 
-    return HTMLResponse(
-        f"<h2>Linked{' — ' + email if email else ''}</h2>"
-        f"<p>Account {account_id} is connected. You can close this window.</p>")
+    emit("signin", "connected", f"mailbox connected: {email}", "info",
+         account_id)
+    return HTMLResponse(connected(email))
 
 
 @app.get("/test/unread")

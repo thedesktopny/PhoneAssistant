@@ -886,6 +886,80 @@ def _():
         "something still builds a forgeable link"
 
 
+@check("Google's answer can't attach a mailbox to someone else's account")
+def _():
+    """The state Google hands back to /link/callback used to be the bare
+    account number. Anyone could build a Google sign-in link carrying THEIR
+    number, skip our signed link entirely, and have a victim's mailbox land
+    on their account."""
+    from fastapi.testclient import TestClient
+    c = TestClient(main.app, raise_server_exceptions=False,
+                   base_url="https://t", follow_redirects=False)
+    r = c.get("/link/callback?state=1&code=x")
+    assert r.status_code == 400 and "expired" in r.text.lower(), \
+        f"a bare account number was accepted as state: {r.status_code}"
+    r = c.get("/link/callback?state=x&error=access_denied")
+    assert r.status_code == 200 and "Nothing was connected" in r.text, \
+        "saying no on Google's screen should get a plain page, not a crash"
+    src = open("main.py", encoding="utf-8").read()
+    body = src[src.index("def link_start("):]
+    body = body[:body.index("\n@app.", 10)]
+    assert "state=str(" not in body and "_flow(state=t)" in body, \
+        "the Google link must carry the signed ticket as its state"
+    body = src[src.index("def link_callback("):]
+    assert "_check_link_token(state)" in body[:600], \
+        "the callback must check the signed state"
+
+
+@check("connect codes work, and can't be guessed or tried forever")
+def _():
+    from fastapi.testclient import TestClient
+    c = TestClient(main.app, raise_server_exceptions=False,
+                   base_url="https://t", follow_redirects=False)
+    db = main.Session()
+    acct = main.Account(name="Code Tester", pin="1234")
+    db.add(acct)
+    db.commit()
+    db.refresh(acct)
+    acct_id = acct.id
+    db.add(main.PhoneNumber(number="+18455550199", account_id=acct_id))
+    db.commit()
+    db.close()
+    main._CONNECT_FAILS.clear()
+    code = main._connect_code(acct_id)
+    assert len(code) == 6 and code.isdigit(), code
+    assert code != main._connect_code(acct_id + 1), "codes must differ"
+    assert c.get("/connect").status_code == 200
+    # right number and code -> a signed link for THAT customer
+    r = c.post("/connect", json={"phone": "(845) 555-0199",
+                                 "code": code[:3] + " " + code[3:]})
+    assert r.status_code == 200, r.text
+    t = r.json()["url"].split("t=", 1)[1]
+    import urllib.parse
+    assert main._check_link_token(urllib.parse.unquote(t)) == acct_id
+    page = c.get(r.json()["url"]).text
+    assert "Code Tester" in page, "the confirm page must say whose account"
+    # an old code is dead
+    old = main._connect_code(acct_id, int(main.time.time() // 3600) - 2)
+    if old != code:
+        r = c.post("/connect", json={"phone": "8455550199", "code": old})
+        assert r.status_code == 400, "a code from hours ago still works"
+    # wrong codes and unknown numbers get the SAME answer
+    wrong = "000000" if code != "000000" else "111111"
+    a = c.post("/connect", json={"phone": "8455550199", "code": wrong})
+    b = c.post("/connect", json={"phone": "2125550000", "code": wrong})
+    assert a.status_code == b.status_code == 400
+    assert a.json() == b.json(), "the page reveals who is a customer"
+    # and it stops after a handful of tries, even with the right code
+    for _ in range(6):
+        c.post("/connect", json={"phone": "8455550199", "code": wrong})
+    r = c.post("/connect", json={"phone": "8455550199", "code": code})
+    assert r.status_code == 429, f"no limit on guessing: {r.status_code}"
+    main._CONNECT_FAILS.clear()
+    # the assistant's code comes from an authorised endpoint only
+    assert c.get(f"/link/code?account_id={acct_id}").status_code in (401, 403)
+
+
 @check("the public pages Google verification needs are there")
 def _():
     """Verification wants a privacy policy and terms on a domain you own,
@@ -893,7 +967,7 @@ def _():
     restricted scopes. Without those the submission is refused."""
     from fastapi.testclient import TestClient
     c = TestClient(main.app, raise_server_exceptions=False, base_url="https://t")
-    for path in ("/", "/privacy", "/terms", "/signup"):
+    for path in ("/", "/privacy", "/terms", "/signup", "/connect"):
         r = c.get(path)
         assert r.status_code == 200, f"{path} -> {r.status_code}"
         assert "<html" in r.text.lower(), f"{path} isn't a web page"

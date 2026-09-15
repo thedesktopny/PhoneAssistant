@@ -573,8 +573,12 @@ they have and which one they use most.
   this my main one", use name_mailbox straight away.
 
 CONNECTING THEIR EMAIL (only if they aren't connected yet)
-If check_email says their account has no email linked, offer to connect it
-on this call. Then:
+If check_email says their account has no email linked, offer to connect it.
+FIRST ask whether someone who uses the internet can help them - a son,
+daughter, neighbour, or anyone with a smartphone or computer. If yes, call
+email_connect_code and read out what it gives you. That is the preferred
+way: they never have to say a password out loud. Only if there is nobody
+who can help, do it on this call:
 1. Ask for their email address. Have them spell the part before the @.
    Read it back and get a yes.
 2. Ask for their password. This is the part that goes wrong most, so be
@@ -1893,6 +1897,39 @@ Never pick one for them silently.
         if self._hangup:
             self._hangup.set()
         return "Say a short goodbye now. Nothing else."
+
+    @function_tool
+    @auto_report("signin")
+    async def email_connect_code(self, context: RunContext):
+        """Get a six-digit code so someone with internet - a relative or
+        neighbour - can connect the caller's Gmail on our website. Use this
+        whenever somebody is able to help them with it."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            d = await backend_get("/link/code", account_id=self.account_id)
+        except Exception as e:
+            log.error(f"connect code failed: {e}")
+            return ("Couldn't make a code just now. Say sorry, and offer to "
+                    "connect it on this call instead.")
+        digits = " ".join(d.get("code", ""))
+        page = d.get("page", "").replace("https://", "")
+        host, _, path = page.partition("/")
+        spoken = " dot ".join(
+            part if part == "com" or len(part) > 3 else " ".join(part)
+            for part in host.split(".")) + (f" slash {path}" if path else "")
+        odd = max(host.split("."), key=len)
+        await log_turn(self.call_id, "tool", "gave a connect code",
+                       "email_connect_code")
+        return (f"Tell them, slowly: whoever is helping goes to {spoken}. "
+                f"Spell '{odd}' letter by letter - {' '.join(odd)} - because "
+                f"it is not spelled the usual way. On that page they type "
+                f"the phone number the caller is ringing from, and this "
+                f"code: {digits}. Say the code twice, then ask them to read "
+                f"it back. The code works for about an hour. The person "
+                f"whose email it is must be there, because Google will ask "
+                f"THEM to agree. Once it's done, next time they call their "
+                f"email will be ready. Do not ask for their password.")
 
     @function_tool
     @auto_report("signin")
