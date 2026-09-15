@@ -144,6 +144,22 @@ def _():
         assert m.get("when"), f"no date on: {m.get('subject')}"
 
 
+@scenario("google: contacts, Drive and to-do list answer, or say why not",
+          "Sep 14 - adding them broke every existing mailbox with a 500")
+def _():
+    for path in ("/contacts/search?name=a", "/drive/search?words=",
+                 "/todo?x=1"):
+        p, _, q = path.partition("?")
+        try:
+            call(p, account_id=ACCOUNT, **dict([q.split("=")]))
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "ignore")
+            assert e.code != 500, f"{p} crashed instead of giving a reason"
+            assert any(r in body for r in ("needs_reconnect",
+                                           "api_not_enabled")), \
+                f"{p} -> {e.code} {body[:150]}"
+
+
 @scenario("email: the sender's real address is included",
           "call 37 - asked to verify a sender, it invented an address")
 def _():
