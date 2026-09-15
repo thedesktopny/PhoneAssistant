@@ -101,7 +101,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/contacts",
-    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/tasks",
     "https://www.googleapis.com/auth/userinfo.email",
     "openid",
@@ -1585,6 +1585,294 @@ def tool_drive_read(account_id: int, file_id: str, which: str = "",
     out = document_text(raw, limit)
     out["name"] = name
     return out
+
+
+# ---- changing Drive files
+# The caller can't see the screen, so: nothing here deletes, nothing here
+# shares, and the assistant reads every change back before calling these.
+# Google Docs and Sheets keep their own version history, so a wrong edit
+# can be put back from the file's history.
+
+DOC = "application/vnd.google-apps.document"
+SHEET = "application/vnd.google-apps.spreadsheet"
+SLIDES = "application/vnd.google-apps.presentation"
+# files Google can turn into its own editable kind when it copies them
+CONVERTIBLE = {
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+        DOC,
+    "application/msword": DOC,
+    "application/rtf": DOC,
+    "text/plain": DOC,
+    "application/pdf": DOC,
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": SHEET,
+    "application/vnd.ms-excel": SHEET,
+    "text/csv": SHEET,
+}
+SEND_MAX_BYTES = 18 * 1024 * 1024
+
+
+def _drive_meta(svc, file_id: str) -> dict:
+    return svc.files().get(fileId=file_id,
+                           fields="id,name,mimeType,size").execute()
+
+
+def _must_be(meta: dict, want: str):
+    """Only Google's own Docs and Sheets can be edited in place. Anything
+    else gets a reason code: not_editable means a copy can be made."""
+    mime = meta.get("mimeType", "")
+    if mime == want:
+        return
+    if CONVERTIBLE.get(mime) == want:
+        raise HTTPException(409, "not_editable")
+    raise HTTPException(409, "wrong_kind")
+
+
+def _made(f: dict) -> dict:
+    mime = f.get("mimeType", "")
+    return {"id": f.get("id"), "name": f.get("name", ""),
+            "kind": _drive_kind(mime), "from": "", "changed": "just now",
+            "readable": mime in DRIVE_KINDS}
+
+
+def _upload(svc, name: str, data: bytes, source_mime: str, as_mime: str):
+    from googleapiclient.http import MediaIoBaseUpload
+    import io as _io
+    media = MediaIoBaseUpload(_io.BytesIO(data), mimetype=source_mime,
+                              resumable=False)
+    return svc.files().create(
+        body={"name": (name or "Untitled").strip()[:200],
+              "mimeType": as_mime},
+        media_body=media, fields="id,name,mimeType").execute()
+
+
+def tool_doc_create(account_id: int, title: str, text: str,
+                    which: str = "") -> dict:
+    svc = google_client(account_id, "drive", "v3", which)
+    f = _upload(svc, title, (text or "").encode("utf-8"), "text/plain", DOC)
+    return {"created": True, "file": _made(f)}
+
+
+def tool_sheet_create(account_id: int, title: str, columns: list,
+                      rows: list, which: str = "") -> dict:
+    import csv
+    import io as _io
+    buf = _io.StringIO()
+    w = csv.writer(buf)
+    if columns:
+        w.writerow(columns)
+    for r in rows or []:
+        w.writerow(r)
+    svc = google_client(account_id, "drive", "v3", which)
+    f = _upload(svc, title, buf.getvalue().encode("utf-8"), "text/csv", SHEET)
+    return {"created": True, "file": _made(f)}
+
+
+def tool_doc_add(account_id: int, file_id: str, text: str,
+                 which: str = "") -> dict:
+    drive = google_client(account_id, "drive", "v3", which)
+    meta = _drive_meta(drive, file_id)
+    _must_be(meta, DOC)
+    docs = google_client(account_id, "docs", "v1", which)
+    docs.documents().batchUpdate(documentId=file_id, body={"requests": [
+        {"insertText": {"endOfSegmentLocation": {},
+                        "text": "\n" + (text or "").strip()}}]}).execute()
+    return {"changed": True, "name": meta.get("name")}
+
+
+def tool_doc_replace(account_id: int, file_id: str, find: str,
+                     replace_with: str, all_of_them: bool = False,
+                     which: str = "") -> dict:
+    """Change some words in a Google Doc. If the words appear more than
+    once, say how many times and change nothing unless all_of_them."""
+    find = (find or "").strip()
+    if not find:
+        raise HTTPException(400, "What words should be changed?")
+    drive = google_client(account_id, "drive", "v3", which)
+    meta = _drive_meta(drive, file_id)
+    _must_be(meta, DOC)
+    raw = drive.files().export(fileId=file_id, mimeType="text/plain").execute()
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "ignore")
+    found = " ".join(raw.split()).lower().count(" ".join(find.split()).lower())
+    if found == 0:
+        return {"changed": False, "found": 0, "name": meta.get("name")}
+    if found > 1 and not all_of_them:
+        return {"changed": False, "found": found, "name": meta.get("name")}
+    docs = google_client(account_id, "docs", "v1", which)
+    res = docs.documents().batchUpdate(documentId=file_id, body={"requests": [
+        {"replaceAllText": {"containsText": {"text": find, "matchCase": False},
+                            "replaceText": replace_with or ""}}]}).execute()
+    n = sum((r.get("replaceAllText") or {}).get("occurrencesChanged", 0)
+            for r in res.get("replies", []))
+    return {"changed": n > 0, "found": found, "times": n,
+            "name": meta.get("name")}
+
+
+def _col_letters(n: int) -> str:
+    """1 -> A, 27 -> AA."""
+    out = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        out = chr(65 + r) + out
+    return out
+
+
+def _tab_range(tab: str) -> str:
+    return "'" + tab.replace("'", "''") + "'"
+
+
+def _sheet_values(account_id: int, file_id: str, which: str = ""):
+    drive = google_client(account_id, "drive", "v3", which)
+    meta = _drive_meta(drive, file_id)
+    _must_be(meta, SHEET)
+    sheets = google_client(account_id, "sheets", "v4", which)
+    info = sheets.spreadsheets().get(
+        spreadsheetId=file_id, fields="sheets.properties.title").execute()
+    tab = info["sheets"][0]["properties"]["title"]
+    vals = (sheets.spreadsheets().values()
+            .get(spreadsheetId=file_id, range=_tab_range(tab)).execute()
+            .get("values", []))
+    return meta, sheets, tab, vals
+
+
+def tool_sheet_read(account_id: int, file_id: str, which: str = "",
+                    limit: int = 60) -> dict:
+    meta, _, tab, vals = _sheet_values(account_id, file_id, which)
+    header = vals[0] if vals else []
+    rows = [{"row": i + 2, "cells": r} for i, r in enumerate(vals[1:])
+            if any(str(c).strip() for c in r)]
+    return {"name": meta.get("name"), "tab": tab, "columns": header,
+            "rows": rows[:limit], "total_rows": len(rows)}
+
+
+def _column_number(header: list, column: str) -> int:
+    """The caller says "phone", not "column C". Match the heading; a bare
+    letter like "C" is accepted too. 0 when nothing matches or it's
+    ambiguous."""
+    said = (column or "").strip()
+    want = said.lower()
+    if not want:
+        return 0
+    names = [str(h).strip().lower() for h in header]
+    if want in names:
+        return names.index(want) + 1
+    if said.isalpha() and said.isupper() and len(said) <= 2:
+        n = 0
+        for ch in said:
+            n = n * 26 + (ord(ch) - 64)
+        return n
+    close = [i for i, h in enumerate(names)
+             if h and (want in h or h in want)]
+    return close[0] + 1 if len(close) == 1 else 0
+
+
+def tool_sheet_add_row(account_id: int, file_id: str, values: list,
+                       which: str = "") -> dict:
+    meta, sheets, tab, _ = _sheet_values(account_id, file_id, which)
+    sheets.spreadsheets().values().append(
+        spreadsheetId=file_id, range=_tab_range(tab) + "!A1",
+        valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS",
+        body={"values": [values]}).execute()
+    return {"changed": True, "name": meta.get("name")}
+
+
+def tool_sheet_update(account_id: int, file_id: str, row: int, column: str,
+                      value: str, which: str = "") -> dict:
+    meta, sheets, tab, vals = _sheet_values(account_id, file_id, which)
+    header = vals[0] if vals else []
+    col = _column_number(header, column)
+    if not col:
+        raise HTTPException(400, f"no_such_column: the columns are "
+                                 f"{', '.join(map(str, header)) or 'unnamed'}")
+    if row < 1:
+        raise HTTPException(400, "no_such_row")
+    old = ""
+    if row - 1 < len(vals) and col - 1 < len(vals[row - 1]):
+        old = vals[row - 1][col - 1]
+    cell = f"{_tab_range(tab)}!{_col_letters(col)}{row}"
+    sheets.spreadsheets().values().update(
+        spreadsheetId=file_id, range=cell, valueInputOption="USER_ENTERED",
+        body={"values": [[value]]}).execute()
+    return {"changed": True, "name": meta.get("name"), "was": old,
+            "column": header[col - 1] if col - 1 < len(header) else "",
+            "row": row}
+
+
+def tool_drive_editable_copy(account_id: int, file_id: str,
+                             which: str = "") -> dict:
+    """A Word, Excel or PDF file can't be edited in place. Google can copy
+    it into its own Doc or Sheet; the original stays exactly as it was."""
+    drive = google_client(account_id, "drive", "v3", which)
+    meta = _drive_meta(drive, file_id)
+    target = CONVERTIBLE.get(meta.get("mimeType", ""))
+    if not target:
+        raise HTTPException(409, "wrong_kind")
+    name = meta.get("name", "Copy")
+    base = name.rsplit(".", 1)[0] if "." in name[-6:] else name
+    f = drive.files().copy(fileId=file_id,
+                           body={"name": base + " (editable)",
+                                 "mimeType": target},
+                           fields="id,name,mimeType").execute()
+    return {"created": True, "file": _made(f), "original": name}
+
+
+def _as_pdf(drive, meta: dict):
+    mime = meta.get("mimeType", "")
+    if mime in (DOC, SHEET, SLIDES):
+        data = drive.files().export(fileId=meta["id"],
+                                    mimeType="application/pdf").execute()
+        return data, meta.get("name", "document") + ".pdf", "application/pdf"
+    if mime.startswith("application/vnd.google-apps."):
+        raise HTTPException(409, "wrong_kind")
+    if int(meta.get("size") or 0) > SEND_MAX_BYTES:
+        raise HTTPException(409, "too_big")
+    return (drive.files().get_media(fileId=meta["id"]).execute(),
+            meta.get("name", "file"), mime or "application/octet-stream")
+
+
+def tool_drive_save_pdf(account_id: int, file_id: str,
+                        which: str = "") -> dict:
+    drive = google_client(account_id, "drive", "v3", which)
+    meta = _drive_meta(drive, file_id)
+    if meta.get("mimeType") not in (DOC, SHEET, SLIDES):
+        raise HTTPException(409, "wrong_kind")
+    data, fname, _ = _as_pdf(drive, meta)
+    from googleapiclient.http import MediaIoBaseUpload
+    import io as _io
+    f = drive.files().create(
+        body={"name": fname},
+        media_body=MediaIoBaseUpload(_io.BytesIO(data),
+                                     mimetype="application/pdf"),
+        fields="id,name,mimeType").execute()
+    return {"created": True, "file": _made(f)}
+
+
+def tool_email_drive_file(account_id: int, file_id: str, to: str,
+                          note: str = "", which: str = "") -> dict:
+    """Send a Drive file as an attachment. Google Docs and Sheets go as a
+    PDF, which anyone can open."""
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.base import MIMEBase
+    from email import encoders
+    drive = google_client(account_id, "drive", "v3", which)
+    meta = _drive_meta(drive, file_id)
+    data, fname, ctype = _as_pdf(drive, meta)
+    if len(data) > SEND_MAX_BYTES:
+        raise HTTPException(409, "too_big")
+    msg = MIMEMultipart()
+    msg["to"] = to
+    msg["subject"] = meta.get("name", fname)
+    msg.attach(MIMEText((note or "").strip() or f"Attached: {fname}"))
+    main_type, _, sub_type = ctype.partition("/")
+    part = MIMEBase(main_type or "application", sub_type or "octet-stream")
+    part.set_payload(data)
+    encoders.encode_base64(part)
+    part.add_header("Content-Disposition", "attachment", filename=fname)
+    msg.attach(part)
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    sent = gmail_client(account_id, which).users().messages().send(
+        userId="me", body={"raw": raw}).execute()
+    return {"sent": True, "id": sent.get("id"), "to": to, "file": fname}
 
 
 def _spoken_date(day: str) -> str:
@@ -5614,6 +5902,130 @@ def drive_read(request: Request, account_id: int, file_id: str,
     return tool_drive_read(account_id, file_id, which)
 
 
+class DocBody(BaseModel):
+    account_id: int
+    title: str = ""
+    text: str = ""
+    file_id: str = ""
+    find: str = ""
+    replace_with: str = ""
+    all_of_them: bool = False
+    which: str = ""
+
+
+class SheetBody(BaseModel):
+    account_id: int
+    title: str = ""
+    columns: list = []
+    rows: list = []
+    file_id: str = ""
+    values: list = []
+    row: int = 0
+    column: str = ""
+    value: str = ""
+    which: str = ""
+
+
+class FileBody(BaseModel):
+    account_id: int
+    file_id: str
+    to: str = ""
+    note: str = ""
+    which: str = ""
+
+
+def _drive_did(account_id: int, what: str):
+    """Every change to a customer's files goes in the live log."""
+    emit("drive", "changed", what[:300], "info", account_id)
+
+
+@app.post("/drive/doc/create")
+def drive_doc_create(b: DocBody, request: Request):
+    require_auth(request)
+    out = tool_doc_create(b.account_id, b.title, b.text, b.which)
+    _drive_did(b.account_id, f"created doc: {out['file']['name']}")
+    return out
+
+
+@app.post("/drive/doc/add")
+def drive_doc_add(b: DocBody, request: Request):
+    require_auth(request)
+    out = tool_doc_add(b.account_id, b.file_id, b.text, b.which)
+    _drive_did(b.account_id, f"added to {out['name']}")
+    return out
+
+
+@app.post("/drive/doc/replace")
+def drive_doc_replace(b: DocBody, request: Request):
+    require_auth(request)
+    out = tool_doc_replace(b.account_id, b.file_id, b.find, b.replace_with,
+                           b.all_of_them, b.which)
+    if out.get("changed"):
+        _drive_did(b.account_id, f"changed words in {out['name']} "
+                                 f"({out['times']}x)")
+    return out
+
+
+@app.post("/drive/sheet/create")
+def drive_sheet_create(b: SheetBody, request: Request):
+    require_auth(request)
+    out = tool_sheet_create(b.account_id, b.title, b.columns, b.rows, b.which)
+    _drive_did(b.account_id, f"created sheet: {out['file']['name']}")
+    return out
+
+
+@app.get("/drive/sheet")
+def drive_sheet_read(request: Request, account_id: int, file_id: str,
+                     which: str = ""):
+    require_auth(request)
+    return tool_sheet_read(account_id, file_id, which)
+
+
+@app.post("/drive/sheet/add_row")
+def drive_sheet_add_row(b: SheetBody, request: Request):
+    require_auth(request)
+    out = tool_sheet_add_row(b.account_id, b.file_id, b.values, b.which)
+    _drive_did(b.account_id, f"added a row to {out['name']}")
+    return out
+
+
+@app.post("/drive/sheet/update")
+def drive_sheet_update(b: SheetBody, request: Request):
+    require_auth(request)
+    out = tool_sheet_update(b.account_id, b.file_id, b.row, b.column,
+                            b.value, b.which)
+    _drive_did(b.account_id, f"changed {out['name']} row {out['row']} "
+                             f"{out['column']}")
+    return out
+
+
+@app.post("/drive/copy_editable")
+def drive_copy_editable(b: FileBody, request: Request):
+    require_auth(request)
+    out = tool_drive_editable_copy(b.account_id, b.file_id, b.which)
+    _drive_did(b.account_id, f"editable copy of {out['original']}")
+    return out
+
+
+@app.post("/drive/save_pdf")
+def drive_save_pdf(b: FileBody, request: Request):
+    require_auth(request)
+    out = tool_drive_save_pdf(b.account_id, b.file_id, b.which)
+    _drive_did(b.account_id, f"saved {out['file']['name']}")
+    return out
+
+
+@app.post("/drive/email")
+def drive_email(b: FileBody, request: Request):
+    require_auth(request)
+    if "@" not in b.to:
+        raise HTTPException(400, "Who should it go to?")
+    out = tool_email_drive_file(b.account_id, b.file_id, b.to, b.note,
+                                b.which)
+    _drive_did(b.account_id, f"emailed {out['file']} to {b.to}")
+    return out
+
+
 @app.get("/todo")
 def todo_list(request: Request, account_id: int, which: str = ""):
     require_auth(request)
@@ -6600,6 +7012,8 @@ def token_permissions(request: Request, account_id: int = 0):
             "look up and add to their contacts",
         "https://www.googleapis.com/auth/drive.readonly":
             "find and read files in their Google Drive (not change them)",
+        "https://www.googleapis.com/auth/drive":
+            "find, read, create and edit files in their Google Drive",
         "https://www.googleapis.com/auth/tasks":
             "read and add to their to-do list",
         "https://www.googleapis.com/auth/userinfo.email":

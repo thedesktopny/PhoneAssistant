@@ -962,13 +962,10 @@ def _():
 
 @check("contacts, Drive and to-do list: asked for, and read only where it should be")
 def _():
-    want = ("contacts", "drive.readonly", "tasks", "gmail.modify", "calendar")
+    want = ("contacts", "drive", "tasks", "gmail.modify", "calendar")
     for w in want:
         assert any(sc.endswith("/" + w) for sc in main.SCOPES), \
             f"not asking Google for {w}"
-    assert not any(sc.endswith("/drive") or sc.endswith("/drive.file")
-                   for sc in main.SCOPES), \
-        "Drive should be read only - the assistant never changes files"
     assert os.environ.get("OAUTHLIB_RELAX_TOKEN_SCOPE"), \
         "unticking one box on Google's screen would crash the connection"
     paths = {r.path for r in main.app.routes}
@@ -976,8 +973,11 @@ def _():
               "/drive/read", "/todo", "/todo/add", "/todo/done"):
         assert p in paths, f"route missing: {p}"
     src = open("main.py", encoding="utf-8").read()
-    for bad in ("files().delete(", "files().update(", "people().deleteContact("):
-        assert bad not in src, f"something can now {bad} - not allowed"
+    for bad in ("files().delete(", "files().update(", "files().emptyTrash(",
+                "permissions().create(", "people().deleteContact(",
+                "deleteContentRange", "deleteDimension", "values().clear("):
+        assert bad not in src, \
+            f"something can now {bad} - the assistant never deletes or shares"
 
 
 @check("adding a permission doesn't break everyone already connected")
@@ -1077,6 +1077,70 @@ def _():
     assert main.document_text(bytes(range(256)) * 10).get("error"), \
         "a binary file must not be read out as gibberish"
     assert main.document_text(b"hello there")["text"] == "hello there"
+
+
+@check("Drive editing: words changed only where meant, columns found by name")
+def _():
+    """A caller says "change the phone number for Moshe" - not "cell C4".
+    And "change Monday to Tuesday" in a letter with three Mondays must ask
+    first, not quietly change all three."""
+    h = ["Name", "Phone number", "Address"]
+    assert main._column_number(h, "phone") == 2
+    assert main._column_number(h, "Address") == 3
+    assert main._column_number(h, "C") == 3
+    assert main._column_number(h, "email") == 0, "guessed a column"
+    assert main._column_number(["Home phone", "Work phone"], "phone") == 0, \
+        "two columns match - it must ask, not pick one"
+    assert (main._col_letters(1), main._col_letters(28)) == ("A", "AB")
+
+    class Call:
+        def __init__(self, out): self.out = out
+        def execute(self): return self.out
+    batches = []
+    state = {"mime": main.DOC}
+
+    class Files:
+        def get(self, **k):
+            return Call({"id": "d", "name": "Letter", "mimeType": state["mime"]})
+        def export(self, **k):
+            return Call(b"See you Monday. Not Monday week, Monday.")
+
+    class Docs:
+        def documents(self): return self
+        def batchUpdate(self, **k):
+            batches.append(k)
+            return Call({"replies": [{"replaceAllText":
+                                      {"occurrencesChanged": 3}}]})
+
+    class Drive:
+        def files(self): return Files()
+    real = main.google_client
+    main.google_client = lambda a, api, *x, **k: Docs() if api == "docs" \
+        else Drive()
+    try:
+        out = main.tool_doc_replace(1, "d", "monday", "Tuesday")
+        assert out["found"] == 3 and not out["changed"] and not batches, \
+            "changed three places without asking"
+        out = main.tool_doc_replace(1, "d", "monday", "Tuesday",
+                                    all_of_them=True)
+        assert out["changed"] and len(batches) == 1
+        assert main.tool_doc_replace(1, "d", "Friday", "x")["found"] == 0
+        # a Word file can't be edited in place: reason code, not a crash
+        state["mime"] = ("application/vnd.openxmlformats-officedocument."
+                         "wordprocessingml.document")
+        try:
+            main.tool_doc_add(1, "d", "hi")
+            raise AssertionError("edited a Word file in place")
+        except main.HTTPException as e:
+            assert e.detail == "not_editable", e.detail
+    finally:
+        main.google_client = real
+    paths = {r.path for r in main.app.routes}
+    for pth in ("/drive/doc/create", "/drive/doc/add", "/drive/doc/replace",
+                "/drive/sheet/create", "/drive/sheet", "/drive/sheet/add_row",
+                "/drive/sheet/update", "/drive/copy_editable",
+                "/drive/save_pdf", "/drive/email"):
+        assert pth in paths, f"route missing: {pth}"
 
 
 @check("to-do list: dated things first, dates said the way people say them")
@@ -1624,6 +1688,37 @@ def _():
     e.response = type("R", (), {"text": '{"detail":"needs_reconnect"}'})()
     assert "connect" in agent.google_refusal(e, "their Drive")
     assert agent.google_refusal(E("500 boom"), "x") == ""
+
+
+@check("no file is created, changed or sent without a spoken yes")
+def _():
+    inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                           "+1555", 1)
+    names = {getattr(t, "__name__", "") for t in inst.tools}
+    for t in ("create_document", "create_spreadsheet", "add_to_document",
+              "change_document_words", "read_spreadsheet",
+              "add_spreadsheet_row", "change_spreadsheet_cell",
+              "make_editable_copy", "save_as_pdf", "send_drive_file"):
+        assert t in names, f"missing: {t}"
+    src = open("agent.py", encoding="utf-8").read()
+    for fn in ("add_to_document", "change_document_words",
+               "add_spreadsheet_row", "change_spreadsheet_cell",
+               "send_drive_file"):
+        body = src[src.index(f"async def {fn}("):]
+        body = body[:body.index("\n    @function_tool")]
+        assert "said_yes(caller_said)" in body, f"{fn} has no yes check"
+        assert body.index("said_yes") < body.index("backend_post"), \
+            f"{fn} acts before they agree"
+    yes = ["yes", "yes please", "sure, go ahead now", "okay do it",
+           "yeah that's right"]
+    no = ["", "no", "no thanks", "wait", "hold on a second", "hmm",
+          "I don't know", "not yet"]
+    for t in yes:
+        assert agent.said_yes(t), f"'{t}' wasn't taken as yes"
+    for t in no:
+        assert not agent.said_yes(t), f"'{t}' was taken as yes"
+    assert agent.cells("Moshe; 845 555 0101 ;Monsey") == \
+        ["Moshe", "845 555 0101", "Monsey"]
 
 
 @check("nothing an email tool does is permanent")

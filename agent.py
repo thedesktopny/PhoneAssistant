@@ -87,6 +87,25 @@ async def backend_post(path: str, payload: dict, params: dict = None):
         return r.json()
 
 
+YES_WORDS = ("yes", "yeah", "yep", "correct", "right", "go ahead", "do it",
+             "ok", "okay", "sure", "please", "save", "send")
+
+
+def said_yes(caller_said: str) -> bool:
+    import re as _re
+    said = (caller_said or "").strip().lower()
+    if _re.search(r"\b(no|nope|don't|do not|wait|stop|hold on)\b", said) \
+            and not said.startswith("yes"):
+        return False
+    return any(_re.search(r"\b" + _re.escape(w) + r"\b", said)
+               for w in YES_WORDS)
+
+
+def cells(text: str) -> list:
+    """ "Moshe; 845 555 0101; Monsey" -> three cells."""
+    return [c.strip() for c in (text or "").split(";")]
+
+
 def google_refusal(e: Exception, what: str) -> str:
     """What to tell the caller when Google turned a request down, decided
     by the reason code the backend sends, not by reading the message."""
@@ -97,6 +116,20 @@ def google_refusal(e: Exception, what: str) -> str:
                 f"plainly. Offer email_connect_code so it can be connected "
                 f"again with the new permission; everything else keeps "
                 f"working meanwhile.")
+    if "not_editable" in text:
+        return ("That file is a Word, Excel or PDF file, which can't be "
+                "changed where it is. Offer to make an editable copy with "
+                "make_editable_copy - the original stays as it was - then "
+                "make the change in the copy.")
+    if "wrong_kind" in text:
+        return (f"That kind of file can't be used for {what}. Say so "
+                f"plainly.")
+    if "too_big" in text:
+        return "That file is too big to send by email. Say so."
+    if "no_such_column" in text:
+        cols = text.split("the columns are", 1)[-1][:200]
+        return (f"There's no column by that name. The columns are{cols}. "
+                f"Ask which one they mean.")
     if "api_not_enabled" in text:
         return (f"{what} isn't switched on at our end yet. Say sorry, that "
                 f"isn't available yet, and call leave_note_for_office.")
@@ -499,7 +532,18 @@ CONTACTS, DOCUMENTS AND THE TO-DO LIST
   might be an email attachment rather than a Drive file, check email too.
 - "What do I need to do?", "remind me to..." -> to_do_list, add_to_do,
   tick_off_to_do. Work out dates like "Friday" yourself.
-- Drive is READ ONLY. You can't change, delete or share a file - say so.
+- Making things: "write me a letter", "make me a list", "set up a sheet
+  with names and numbers" -> create_document or create_spreadsheet. Write
+  it properly, read it back, then make it. Offer to email it as a PDF
+  (send_drive_file) or save a PDF copy (save_as_pdf).
+- Changing things: find the file (find_in_drive), hear it first
+  (read_drive_file, or read_spreadsheet for a sheet), then
+  add_to_document, change_document_words, add_spreadsheet_row or
+  change_spreadsheet_cell. ALWAYS say exactly what will change and get a
+  clear yes before calling - pass what they said as caller_said.
+- Word, Excel and PDF files can't be changed where they are. Offer
+  make_editable_copy; the original stays untouched.
+- You never delete a file and never share one. If asked, say you can't.
 - If a tool says they haven't given permission yet, tell them once, offer
   a connect code to fix it, and carry on with whatever else they wanted.
 
@@ -1363,6 +1407,300 @@ Never pick one for them silently.
                 f"only, in plain spoken words. They asked about: "
                 f"{looking_for}. If it isn't in here, say so. Don't read "
                 f"out long tables; sum them up and offer detail.")
+
+    def _drive_file(self, which: int):
+        if not self.last_files:
+            return None, "Call find_in_drive first, so you know which file."
+        if which < 1 or which > len(self.last_files):
+            return None, f"Pick a number from 1 to {len(self.last_files)}."
+        return self.last_files[which - 1], ""
+
+    def _remember_file(self, f: dict) -> int:
+        """A file just made goes to the top of the list, as number 1."""
+        self.last_files = [f] + [x for x in self.last_files
+                                 if x.get("id") != f.get("id")]
+        return 1
+
+    @function_tool
+    @auto_report("drive")
+    async def create_document(self, context: RunContext, title: str,
+                              text: str):
+        """Make a new Google Doc in the caller's Drive - a letter, a list,
+        notes. Write the text out properly first, read it back, and make
+        it once they're happy."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            d = await backend_post("/drive/doc/create", {
+                "account_id": self.account_id, "title": title, "text": text,
+                "which": self.mailbox})
+        except Exception as e:
+            log.error(f"doc create failed: {e}")
+            return (google_refusal(e, "making documents")
+                    or "The document didn't get made.")
+        n = self._remember_file(d["file"])
+        await log_turn(self.call_id, "tool", f"made doc {title}",
+                       "create_document")
+        return (f"Made '{d['file']['name']}' in their Google Drive (file "
+                f"number {n}). Tell them. Offer to email it as a PDF with "
+                f"send_drive_file if that helps.")
+
+    @function_tool
+    @auto_report("drive")
+    async def create_spreadsheet(self, context: RunContext, title: str,
+                                 columns: str, rows: str = ""):
+        """Make a new Google Sheet. columns: the headings separated by
+        semicolons, like "Name; Phone; Address". rows: one row per line,
+        cells separated by semicolons, in the same order. rows can be empty
+        for a blank sheet with headings."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        grid = [cells(line) for line in (rows or "").splitlines()
+                if line.strip()]
+        try:
+            d = await backend_post("/drive/sheet/create", {
+                "account_id": self.account_id, "title": title,
+                "columns": cells(columns), "rows": grid,
+                "which": self.mailbox})
+        except Exception as e:
+            log.error(f"sheet create failed: {e}")
+            return (google_refusal(e, "making spreadsheets")
+                    or "The spreadsheet didn't get made.")
+        n = self._remember_file(d["file"])
+        await log_turn(self.call_id, "tool", f"made sheet {title}",
+                       "create_spreadsheet")
+        return (f"Made the spreadsheet '{d['file']['name']}' with "
+                f"{len(grid)} rows (file number {n}). Tell them.")
+
+    @function_tool
+    @auto_report("drive")
+    async def add_to_document(self, context: RunContext, which: int,
+                              text: str, caller_said: str = ""):
+        """Add text to the end of a Google Doc from the list. Read back
+        exactly what will be added, and only call with caller_said set to
+        their answer once they clearly say yes."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        f, problem = self._drive_file(which)
+        if problem:
+            return problem
+        if not said_yes(caller_said):
+            return (f"Do not change it yet. Say: 'I'll add this to the end "
+                    f"of {f['name']}: {text}. Shall I?' and wait for yes.")
+        try:
+            await backend_post("/drive/doc/add", {
+                "account_id": self.account_id, "file_id": f["id"],
+                "text": text, "which": self.mailbox})
+        except Exception as e:
+            log.error(f"doc add failed: {e}")
+            return (google_refusal(e, "changing documents")
+                    or "That change didn't go through.")
+        await log_turn(self.call_id, "tool", f"added to {f['name']}",
+                       "add_to_document")
+        return f"Added to {f['name']}. Tell them it's done."
+
+    @function_tool
+    @auto_report("drive")
+    async def change_document_words(self, context: RunContext, which: int,
+                                    find: str, replace_with: str,
+                                    all_of_them: bool = False,
+                                    caller_said: str = ""):
+        """Change words in a Google Doc from the list: find is the exact
+        words there now, replace_with what they should become. Read the
+        change back and get a clear yes first."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        f, problem = self._drive_file(which)
+        if problem:
+            return problem
+        if not said_yes(caller_said):
+            return (f"Do not change it yet. Say: 'In {f['name']} I'll change "
+                    f"\"{find}\" to \"{replace_with}\". Shall I?' and wait "
+                    f"for yes.")
+        try:
+            d = await backend_post("/drive/doc/replace", {
+                "account_id": self.account_id, "file_id": f["id"],
+                "find": find, "replace_with": replace_with,
+                "all_of_them": all_of_them, "which": self.mailbox})
+        except Exception as e:
+            log.error(f"doc replace failed: {e}")
+            return (google_refusal(e, "changing documents")
+                    or "That change didn't go through.")
+        if not d.get("found"):
+            return (f"The words \"{find}\" aren't in {f['name']}. Use "
+                    f"read_drive_file to hear what it actually says, then "
+                    f"try again with the exact words.")
+        if not d.get("changed"):
+            return (f"Those words appear {d['found']} times. Nothing is "
+                    f"changed yet. Ask whether to change every one; if yes, "
+                    f"call again with all_of_them true.")
+        await log_turn(self.call_id, "tool", f"changed words in {f['name']}",
+                       "change_document_words")
+        return (f"Changed it in {f['name']}"
+                + (f" ({d['times']} places)" if d.get("times", 1) > 1 else "")
+                + ". Tell them it's done.")
+
+    @function_tool
+    @auto_report("drive")
+    async def read_spreadsheet(self, context: RunContext, which: int):
+        """Hear a Google Sheet from the list as rows, with its row numbers,
+        before changing anything in it."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        f, problem = self._drive_file(which)
+        if problem:
+            return problem
+        try:
+            d = await backend_get("/drive/sheet", account_id=self.account_id,
+                                  file_id=f["id"], which=self.mailbox)
+        except Exception as e:
+            log.error(f"sheet read failed: {e}")
+            return (google_refusal(e, "reading spreadsheets")
+                    or "Couldn't open that spreadsheet.")
+        cols = d.get("columns", [])
+        lines = [f"Columns: {'; '.join(map(str, cols)) or '(none)'}"]
+        for r in d.get("rows", []):
+            lines.append(f"row {r['row']}: " + "; ".join(map(str, r["cells"])))
+        more = d.get("total_rows", 0) - len(d.get("rows", []))
+        if more > 0:
+            lines.append(f"...and {more} more rows")
+        return ("\n".join(lines) + "\nThe row numbers are for YOU, to "
+                "use with change_spreadsheet_cell - talk to the caller about "
+                "the contents, not row numbers. Summarise; don't read a big "
+                "table out cell by cell.")
+
+    @function_tool
+    @auto_report("drive")
+    async def add_spreadsheet_row(self, context: RunContext, which: int,
+                                  values: str, caller_said: str = ""):
+        """Add a row at the bottom of a Google Sheet. values: the cells in
+        column order, separated by semicolons. Call read_spreadsheet first
+        so you know the columns, read the row back, and get a yes."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        f, problem = self._drive_file(which)
+        if problem:
+            return problem
+        if not said_yes(caller_said):
+            return (f"Do not add it yet. Read back the new row for "
+                    f"{f['name']}: {values}. Ask 'Shall I add that?'")
+        try:
+            await backend_post("/drive/sheet/add_row", {
+                "account_id": self.account_id, "file_id": f["id"],
+                "values": cells(values), "which": self.mailbox})
+        except Exception as e:
+            log.error(f"sheet add failed: {e}")
+            return (google_refusal(e, "changing spreadsheets")
+                    or "That row didn't get added.")
+        await log_turn(self.call_id, "tool", f"row added to {f['name']}",
+                       "add_spreadsheet_row")
+        return f"Added the row to {f['name']}. Tell them."
+
+    @function_tool
+    @auto_report("drive")
+    async def change_spreadsheet_cell(self, context: RunContext, which: int,
+                                      row: int, column: str, value: str,
+                                      caller_said: str = ""):
+        """Change one cell in a Google Sheet. row is the row number from
+        read_spreadsheet; column is the heading, like "Phone". Say back
+        what it is now and what it will become, and get a yes first."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        f, problem = self._drive_file(which)
+        if problem:
+            return problem
+        if not said_yes(caller_said):
+            return (f"Do not change it yet. Say what the {column} is now in "
+                    f"that row and that it will become {value}, and ask "
+                    f"'Shall I change it?'")
+        try:
+            d = await backend_post("/drive/sheet/update", {
+                "account_id": self.account_id, "file_id": f["id"],
+                "row": row, "column": column, "value": value,
+                "which": self.mailbox})
+        except Exception as e:
+            log.error(f"sheet update failed: {e}")
+            return (google_refusal(e, "changing spreadsheets")
+                    or "That change didn't go through.")
+        await log_turn(self.call_id, "tool",
+                       f"changed {f['name']} row {row} {column}",
+                       "change_spreadsheet_cell")
+        was = f" (it was {d['was']})" if d.get("was") else ""
+        return f"Changed {d.get('column') or column} to {value}{was}. Tell them."
+
+    @function_tool
+    @auto_report("drive")
+    async def make_editable_copy(self, context: RunContext, which: int):
+        """Turn a Word, Excel or PDF file from the list into a Google Doc or
+        Sheet that can be changed. The original is left exactly as it was."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        f, problem = self._drive_file(which)
+        if problem:
+            return problem
+        try:
+            d = await backend_post("/drive/copy_editable", {
+                "account_id": self.account_id, "file_id": f["id"],
+                "which": self.mailbox})
+        except Exception as e:
+            log.error(f"copy failed: {e}")
+            return (google_refusal(e, "making a copy")
+                    or "The copy didn't get made.")
+        n = self._remember_file(d["file"])
+        await log_turn(self.call_id, "tool", f"editable copy of {f['name']}",
+                       "make_editable_copy")
+        return (f"Made an editable copy called '{d['file']['name']}' (now "
+                f"file number {n}). The original is untouched. Make the "
+                f"change in number {n}.")
+
+    @function_tool
+    @auto_report("drive")
+    async def save_as_pdf(self, context: RunContext, which: int):
+        """Save a PDF copy of a Google Doc or Sheet into their Drive."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        f, problem = self._drive_file(which)
+        if problem:
+            return problem
+        try:
+            d = await backend_post("/drive/save_pdf", {
+                "account_id": self.account_id, "file_id": f["id"],
+                "which": self.mailbox})
+        except Exception as e:
+            log.error(f"pdf failed: {e}")
+            return (google_refusal(e, "making a PDF")
+                    or "The PDF didn't get made.")
+        self._remember_file(d["file"])
+        await log_turn(self.call_id, "tool", f"pdf of {f['name']}",
+                       "save_as_pdf")
+        return f"Saved '{d['file']['name']}' in their Drive. Tell them."
+
+    @function_tool
+    @auto_report("drive")
+    async def send_drive_file(self, context: RunContext, which: int, to: str,
+                              note: str = "", caller_said: str = ""):
+        """Email a file from the list to someone, as an attachment. Google
+        Docs and Sheets are sent as a PDF. Say back which file and who it
+        goes to, and get a clear yes first."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        f, problem = self._drive_file(which)
+        if problem:
+            return problem
+        if not said_yes(caller_said):
+            return (f"Do not send yet. Say: 'I'll email {f['name']} to {to}. "
+                    f"Shall I send it?' and wait for yes.")
+        try:
+            d = await backend_post("/drive/email", {
+                "account_id": self.account_id, "file_id": f["id"], "to": to,
+                "note": note, "which": self.mailbox})
+        except Exception as e:
+            log.error(f"drive email failed: {e}")
+            return (google_refusal(e, "sending files")
+                    or "The email didn't go through.")
+        await log_turn(self.call_id, "tool", f"emailed {f['name']} to {to}",
+                       "send_drive_file")
+        return f"Sent {d.get('file')} to {to}. Tell them it's gone."
 
     @function_tool
     @auto_report("tasks")

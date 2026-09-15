@@ -206,7 +206,8 @@ HOME = page("A telephone assistant", f"""
     <div class="card"><div class="q">&ldquo;What's my son's number?&rdquo;</div>
       <p>It looks people up in your contacts and adds new ones.</p></div>
     <div class="card"><div class="q">&ldquo;Read me the letter from the school.&rdquo;</div>
-      <p>It finds documents in your Google Drive and reads them to you.</p></div>
+      <p>It finds documents in your Google Drive, reads them to you, and
+      writes letters, lists and spreadsheets for you.</p></div>
     <div class="card"><div class="q">&ldquo;When does the pharmacy close?&rdquo;</div>
       <p>It finds opening hours, phone numbers and how-to instructions, and
       tells you when it isn't sure.</p></div>
@@ -260,9 +261,10 @@ HOME = page("A telephone assistant", f"""
   <div class="eyebrow">Your information</div>
   <h2>What we can and cannot see.</h2>
   <p>With your permission, the assistant can read and send your email,
-  manage your calendar and to-do list, look up and add contacts, and read
-  the files in your Google Drive. It can't change or delete Drive files,
-  and it can't see your photos. Google shows you each of these permissions
+  manage your calendar and to-do list, look up and add contacts, and read,
+  create and edit documents and spreadsheets in your Google Drive. It
+  always reads a change back before making it, it never deletes or shares
+  your files, and it can't see your photos. Google shows you each of these permissions
   before you agree.</p>
   <p>Email and calendar information is used only to do what you asked for
   on the phone. It is never sold, never used for advertising and never used
@@ -433,8 +435,7 @@ themselves.</p>
 <ul>
   <li><b>Your name and telephone number</b>, so we know who is calling.</li>
   <li><b>Permission to reach your Google account</b>, if you granted it:
-      your email, calendar, contacts, to-do list, and read-only access to
-      your Google Drive. This is held as an encrypted token from Google.</li>
+      your email, calendar, contacts, to-do list and Google Drive. This is held as an encrypted token from Google.</li>
   <li><b>A record of your calls</b>: what was asked and what was done.
       We keep it so we can fix problems and improve the service.</li>
   <li><b>Delivery addresses and payment cards</b>, if you asked us to keep
@@ -446,7 +447,9 @@ themselves.</p>
   <li>Passwords, PINs and security codes. These are removed from every
       record before it is stored.</li>
   <li>Copies of your Drive files or contacts. They're read from Google
-      when you ask and aren't stored by us.</li>
+      when you ask and aren't stored by us. Files are only created or
+      changed when you ask, after the change is read back to you, and are
+      never deleted or shared by us.</li>
   <li>Your photos. The permission we are granted doesn't reach them.</li>
 </ul>
 
