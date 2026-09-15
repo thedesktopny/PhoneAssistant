@@ -574,10 +574,13 @@ PLACING AN ORDER — do it exactly like a careful person would
    "ship it there?" If none, take it down — street, city, state, zip —
    read it back, and save_address.
 3. Payment: call list_cards. If they have one, say "the Visa ending 1234?"
-   and get a yes. If none, ask if the site has a card saved already; if not,
-   take the card: number in groups of four, expiry, security code, name.
-   Read back ONLY the last four digits and expiry, never the full number,
-   then save_card. If the number is rejected, ask them to read it again.
+   and get a yes. If none, ask if the site has a card saved already. If
+   not, the best way is card_setup_code: someone with internet adds the
+   card on our secure page, so the number is never said aloud. Only if
+   nobody can help, take the card: number in groups of four, expiry,
+   security code, name. Read back ONLY the last four digits and expiry,
+   never the full number, then save_card. If the number is rejected, ask
+   them to read it again.
 4. Call draft_order with everything. It tells you what it has.
 5. Read the whole thing back in one go: item, quantity, price, address,
    card ending. Then ask exactly: "Should I place this order?" Wait.
@@ -2467,6 +2470,36 @@ Never pick one for them silently.
         if self._hangup:
             self._hangup.set()
         return "Say a short goodbye now. Nothing else."
+
+    @function_tool
+    @auto_report("cards")
+    async def card_setup_code(self, context: RunContext):
+        """Get a six-digit code so a card can be added on our website, on
+        the payment provider's secure page. The PREFERRED way to add a card:
+        the number is never said out loud."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            d = await backend_get("/card/code", account_id=self.account_id)
+        except Exception as e:
+            log.error(f"card code failed: {e}")
+            return "Couldn't make a card code just now. Say sorry."
+        digits = " ".join(d.get("code", ""))
+        page = d.get("page", "").replace("https://", "")
+        host, _, path = page.partition("/")
+        spoken = " dot ".join(
+            part if part == "com" or len(part) > 3 else " ".join(part)
+            for part in host.split(".")) + (f" slash {path}" if path else "")
+        odd = max(host.split("."), key=len)
+        await log_turn(self.call_id, "tool", "gave a card code",
+                       "card_setup_code")
+        return (f"Tell them, slowly: go to {spoken}. Spell '{odd}' letter by "
+                f"letter - {' '.join(odd)}. On that page they type the phone "
+                f"number they're calling from and this code: {digits}. Say "
+                f"the code twice and ask them to read it back. It works for "
+                f"about an hour. They'll type the card on Stripe's secure "
+                f"page, and nothing is charged. Once it's done, list_cards "
+                f"will show it.")
 
     @function_tool
     @auto_report("signin")

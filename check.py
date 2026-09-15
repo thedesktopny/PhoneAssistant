@@ -873,7 +873,8 @@ def _():
     # a tampered or stale ticket is refused
     good = main._make_link_token(1, 30)
     assert main._check_link_token(good) == 1
-    assert main._check_link_token(good[:-1] + "0") is None, \
+    flipped = good[:-1] + ("1" if good[-1] == "0" else "0")
+    assert main._check_link_token(flipped) is None, \
         "a changed signature was accepted"
     assert main._check_link_token("2." + good.split(".", 1)[1]) is None, \
         "the account number could be swapped"
@@ -1169,6 +1170,115 @@ def _():
     assert out["tasks"][0]["due_spoken"] == "Friday, September 18", out
 
 
+@check("cards are added on Stripe's page, and only charged the way we mean")
+def _():
+    """No card number is said aloud or reaches us: the card page hands the
+    customer to Stripe. The finish page asks Stripe what happened rather
+    than trusting the address bar, and a charge can't repeat or run away."""
+    from fastapi.testclient import TestClient
+    c = TestClient(main.app, raise_server_exceptions=False,
+                   base_url="https://t", follow_redirects=False)
+    assert c.get("/card").status_code == 200
+    db = main.Session()
+    acct = main.Account(name="Card Tester", pin="1234")
+    db.add(acct)
+    db.commit()
+    db.refresh(acct)
+    aid = acct.id
+    db.add(main.PhoneNumber(number="+18455550177", account_id=aid))
+    db.commit()
+    db.close()
+    main._CONNECT_FAILS.clear()
+    # an email connect code is not a card code, and the other way round
+    assert main._connect_code(aid, purpose="card") != main._connect_code(aid)
+    r = c.post("/card", json={"phone": "8455550177",
+                              "code": main._connect_code(aid)})
+    assert r.status_code == 400, "an email code opened the card page"
+    assert not main._connect_code_ok(aid, main._connect_code(aid, purpose="card"))
+
+    calls = []
+    real_call, real_key = main._stripe_call, main.STRIPE_SECRET_KEY
+    state = {"session": {}, "charge_error": None}
+
+    def fake(method, path, fields=None, idem=""):
+        calls.append((method, path, dict(fields or {}), idem))
+        if path == "customers":
+            return {"id": "cus_T"}
+        if path == "checkout/sessions":
+            return {"url": "https://checkout.stripe.com/c/pay/cs_T"}
+        if path.startswith("checkout/sessions/"):
+            return state["session"]
+        if path == "payment_intents":
+            if state["charge_error"]:
+                raise state["charge_error"]
+            return {"id": "pi_T", "status": "succeeded"}
+        raise AssertionError(path)
+    main._stripe_call, main.STRIPE_SECRET_KEY = fake, "sk_test_x"
+    try:
+        r = c.post("/card", json={"phone": "(845) 555-0177",
+                                  "code": main._connect_code(aid, purpose="card")})
+        assert r.status_code == 200, r.text
+        assert r.json()["url"].startswith("https://checkout.stripe.com/")
+        made = [x for x in calls if x[1] == "checkout/sessions"][0][2]
+        assert made["mode"] == "setup", "the card page must SAVE, not charge"
+        assert made["client_reference_id"] == str(aid)
+        # an unfinished session, or one for another customer, saves nothing
+        state["session"] = {"status": "open", "mode": "setup"}
+        assert c.get("/card/done?session_id=cs_T").status_code == 400
+        state["session"] = {"status": "complete", "mode": "setup",
+                            "client_reference_id": str(aid),
+                            "customer": "cus_SOMEONE_ELSE"}
+        assert c.get("/card/done?session_id=cs_T").status_code == 400
+        done = {"status": "complete", "mode": "setup",
+                "client_reference_id": str(aid), "customer": "cus_T",
+                "setup_intent": {"payment_method": {
+                    "id": "pm_T", "card": {"brand": "visa", "last4": "4242",
+                                           "exp_month": 12, "exp_year": 2030}}}}
+        state["session"] = done
+        r = c.get("/card/done?session_id=cs_T")
+        assert r.status_code == 200 and "4242" in r.text, r.text[:200]
+        c.get("/card/done?session_id=cs_T")        # reloading the page
+        db = main.Session()
+        cards = db.query(main.PaymentCard).filter_by(account_id=aid).all()
+        card_id = cards[0].id
+        db.close()
+        assert len(cards) == 1, "reloading the finish page saved it twice"
+        assert "4242424242424242" not in str(main.vault_get(cards[0].secret_blob))
+        # charging
+        out = main.stripe_charge(aid, card_id, 1250, "gas bill", "order-1")
+        assert out["charged"] and out["amount"] == "$12.50", out
+        pi = [x for x in calls if x[1] == "payment_intents"][-1]
+        assert pi[3] == "order-1", "no idempotency key - a retry could charge twice"
+        assert pi[2]["off_session"] == "true" and pi[2]["amount"] == "1250"
+        for bad, why in ((10, "too_small"),
+                         (main.CHARGE_LIMIT_CENTS + 1, "over_limit")):
+            try:
+                main.stripe_charge(aid, card_id, bad, "x", "k")
+                raise AssertionError(f"charged {bad} cents")
+            except main.HTTPException as e:
+                assert e.detail == why, e.detail
+        try:
+            main.stripe_charge(aid + 999, card_id, 1000, "x", "k2")
+            raise AssertionError("charged a card that isn't theirs")
+        except main.HTTPException as e:
+            assert e.detail == "no_card"
+        state["charge_error"] = main.StripeError("card_declined", "Declined",
+                                                 "insufficient_funds")
+        out = main.stripe_charge(aid, card_id, 1000, "x", "k3")
+        assert out == {**out, "charged": False, "reason": "declined"}, out
+        state["charge_error"] = main.StripeError(
+            "authentication_required", "Needs auth")
+        assert main.stripe_charge(aid, card_id, 1000, "x", "k4")["reason"] \
+            == "needs_authentication"
+    finally:
+        main._stripe_call, main.STRIPE_SECRET_KEY = real_call, real_key
+        main._CONNECT_FAILS.clear()
+    # charging is never open to the public
+    r = c.post("/charges", json={"account_id": aid, "card_id": card_id,
+                                 "amount": "5", "what_for": "x", "key": "k"})
+    assert r.status_code in (401, 403), f"/charges without auth: {r.status_code}"
+
+
 @check("the public pages Google verification needs are there")
 def _():
     """Verification wants a privacy policy and terms on a domain you own,
@@ -1176,7 +1286,7 @@ def _():
     restricted scopes. Without those the submission is refused."""
     from fastapi.testclient import TestClient
     c = TestClient(main.app, raise_server_exceptions=False, base_url="https://t")
-    for path in ("/", "/privacy", "/terms", "/signup", "/connect"):
+    for path in ("/", "/privacy", "/terms", "/signup", "/connect", "/card"):
         r = c.get(path)
         assert r.status_code == 200, f"{path} -> {r.status_code}"
         assert "<html" in r.text.lower(), f"{path} isn't a web page"
@@ -1719,6 +1829,17 @@ def _():
         assert not agent.said_yes(t), f"'{t}' was taken as yes"
     assert agent.cells("Moshe; 845 555 0101 ;Monsey") == \
         ["Moshe", "845 555 0101", "Monsey"]
+
+
+@check("the assistant can hand out a card code")
+def _():
+    inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                           "+1555", 1)
+    names = {getattr(t, "__name__", "") for t in inst.tools}
+    assert "card_setup_code" in names
+    src = open("agent.py", encoding="utf-8").read()
+    assert "the best way is card_setup_code" in src, \
+        "the order instructions should offer the card page first"
 
 
 @check("nothing an email tool does is permanent")

@@ -377,6 +377,72 @@ document.getElementById('f').addEventListener('submit', async function(e){
 """, "/connect")
 
 
+CARD = page("Add a payment card", f"""
+<div class="wrap narrow"><section>
+<div class="eyebrow">Payment card</div>
+<h1>Add a payment card</h1>
+<p class="lead">Call the assistant and ask for a <b>card code</b>, then
+enter it below with the phone number you call from. You'll type your card
+on our payment provider's secure page.</p>
+
+<form class="box" id="f">
+  <div class="msg err" id="cancel" hidden>No card was saved. You can try
+  again whenever you're ready.</div>
+  <label for="p">The phone number you call the assistant from</label>
+  <input id="p" required inputmode="tel" autocomplete="tel"
+         placeholder="(845) 555 0123">
+  <label for="c">Your six-digit card code</label>
+  <input id="c" class="code" required inputmode="numeric" maxlength="7"
+         autocomplete="one-time-code" placeholder="&bull;&bull;&bull;&bull;&bull;&bull;">
+  <button class="btn main" type="submit">Continue to secure page</button>
+  <div class="msg" id="msg" role="status"></div>
+</form>
+
+<div class="note">Your card number goes straight to Stripe, our payment
+provider. We never see or store it. We keep only the card type and last
+four digits, so the assistant can say "your Visa ending 4242". You won't
+be charged anything now. Later, the assistant only charges your card after
+reading you the amount and hearing you agree.</div>
+
+<p class="updated" style="margin-top:20px">Codes last about an hour. If
+yours has stopped working, call {PHONE} and ask for a new one.</p>
+</section></div>
+""" + """<script>
+if (location.search.indexOf('cancelled=1') > -1)
+  document.getElementById('cancel').hidden = false;
+document.getElementById('f').addEventListener('submit', async function(e){
+  e.preventDefault();
+  var msg = document.getElementById('msg');
+  msg.className = 'msg'; msg.textContent = 'Checking...';
+  try {
+    var r = await fetch('/card', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({phone: document.getElementById('p').value,
+                            code: document.getElementById('c').value})});
+    var d = await r.json().catch(function(){ return {}; });
+    if (r.ok && d.url && d.url.indexOf('https://checkout.stripe.com/') === 0) {
+      msg.textContent = 'Opening the secure page...';
+      location.href = d.url; return;
+    }
+    msg.className = 'msg err';
+    msg.textContent = d.detail || 'That did not work. Please try again.';
+  } catch (err) {
+    msg.className = 'msg err';
+    msg.textContent = 'Something went wrong. Please try again.';
+  }
+});
+</script>
+""")
+
+
+def card_saved(brand: str, last4: str) -> str:
+    return _centre("Card saved", "&#10003;", "Your card is saved", f"""
+<p class="lead">Your {html.escape(brand)} ending {html.escape(last4)} is
+saved securely with our payment provider.</p>
+<p>You can close this page. Nothing has been charged. The assistant will
+always read you the amount and ask before it charges anything.</p>""")
+
+
 def _centre(title: str, icon: str, heading: str, body: str) -> str:
     return page(title, f"""<div class="wrap"><div class="centre">
 <div class="big">{icon}</div><h1>{heading}</h1>{body}</div></div>""")
@@ -419,6 +485,12 @@ NOT_CONNECTED = _centre("Not connected", "&#10005;", "Nothing was connected",
 changed.</p>
 <p>If that was a mistake, <a href="/connect">start again</a>. Codes last
 about an hour.</p>""")
+
+
+CARD_NOT_SAVED = _centre("Card not saved", "&#10005;", "No card was saved",
+                         f"""
+<p class="lead">That didn't finish, so nothing has been saved or charged.</p>
+<p><a href="/card">Try again</a>, or call {PHONE}.</p>""")
 
 
 PRIVACY = page("Privacy", f"""
@@ -465,9 +537,10 @@ artificial intelligence models. Only the people needed to run and support
 the service can reach it, and only when there is a reason to.</p>
 
 <h2>Where it is kept</h2>
-<p>On servers operated by Railway in the United States. Tokens, addresses
-and card details are encrypted. Wherever possible, cards are held by our
-payment provider rather than by us.</p>
+<p>On servers operated by Railway in the United States. Tokens and
+addresses are encrypted. Payment cards added on our card page are held by
+our payment provider, Stripe. We keep only the card type, the last four
+digits and Stripe's reference to the card.</p>
 
 <h2>How long we keep it</h2>
 <p>Call records are kept while you are a customer, so we can answer

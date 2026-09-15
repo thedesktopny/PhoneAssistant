@@ -134,6 +134,7 @@ class Account(Base):
     name = Column(String(120))
     pin = Column(String(10), default="1234")
     created_at = Column(DateTime, default=datetime.utcnow)
+    stripe_customer = Column(String(40), default="")
 
 
 class PhoneNumber(Base):
@@ -421,6 +422,9 @@ def _ensure_columns():
         ],
         "jobs": [
             ("reason", "VARCHAR(40) DEFAULT ''"),
+        ],
+        "accounts": [
+            ("stripe_customer", "VARCHAR(40) DEFAULT ''"),
         ],
     }
     # Each ALTER gets its own transaction: in Postgres one failure aborts
@@ -737,7 +741,8 @@ CONNECT_MAX_FAILS_IP = 20    # per address, per hour
 _CONNECT_FAILS: dict = {}
 
 
-def _connect_code(account_id: int, hour: int | None = None) -> str:
+def _connect_code(account_id: int, hour: int | None = None,
+                  purpose: str = "connect") -> str:
     """Six digits the assistant reads out, for a helper to type in on the
     connect page. Nothing is stored: it is worked out from the account and
     the hour, signed with our key, so it can't be guessed from the account
@@ -747,19 +752,21 @@ def _connect_code(account_id: int, hour: int | None = None) -> str:
     if hour is None:
         hour = int(time.time() // (CONNECT_CODE_HOURS * 3600))
     mac = hmac.new(ENCRYPTION_KEY.encode(),
-                   f"connect.{account_id}.{hour}".encode(),
+                   f"{purpose}.{account_id}.{hour}".encode(),
                    hashlib.sha256).digest()
     return f"{int.from_bytes(mac[:8], 'big') % 1000000:06d}"
 
 
-def _connect_code_ok(account_id: int, code: str) -> bool:
+def _connect_code_ok(account_id: int, code: str,
+                     purpose: str = "connect") -> bool:
     """This hour's code or last hour's, so one given at 2:59 still works."""
     import hmac
     code = "".join(ch for ch in (code or "") if ch.isdigit())
     if len(code) != 6:
         return False
     now = int(time.time() // (CONNECT_CODE_HOURS * 3600))
-    return any(hmac.compare_digest(_connect_code(account_id, h), code)
+    return any(hmac.compare_digest(_connect_code(account_id, h, purpose),
+                                   code)
                for h in (now, now - 1))
 
 
@@ -4982,25 +4989,186 @@ def _fmt_address(a) -> str:
     return ", ".join(p for p in parts if p)
 
 
-def _stripe(path: str, fields: dict) -> dict:
-    """One form-encoded call to Stripe. Same plain-urllib style as every
-    other service here - no extra dependency to install or keep current."""
-    body = urllib.parse.urlencode(fields).encode()
-    req = urllib.request.Request(
-        f"https://api.stripe.com/v1/{path}", data=body,
-        headers={"Authorization": f"Bearer {STRIPE_SECRET_KEY}",
-                 "Content-Type": "application/x-www-form-urlencoded"})
+class StripeError(Exception):
+    def __init__(self, code: str, message: str, decline: str = ""):
+        super().__init__(message)
+        self.code, self.message, self.decline = code, message, decline
+
+
+def _stripe_call(method: str, path: str, fields: dict | None = None,
+                 idem: str = "") -> dict:
+    """One call to Stripe, plain urllib like every other service here.
+    Failures keep Stripe's own error code, so nothing reads the message."""
+    data = urllib.parse.urlencode(fields or {}, doseq=True)
+    url = f"https://api.stripe.com/v1/{path}"
+    headers = {"Authorization": f"Bearer {STRIPE_SECRET_KEY}"}
+    body = None
+    if method == "GET":
+        url += ("?" + data) if data else ""
+    else:
+        body = data.encode()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    if idem:
+        headers["Idempotency-Key"] = idem[:255]
+    req = urllib.request.Request(url, data=body, headers=headers,
+                                 method=method)
     try:
         with urllib.request.urlopen(req, timeout=25) as r:
             return json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
-        said = ""
+        err = {}
         try:
-            said = (json.loads(e.read().decode()).get("error", {})
-                    .get("message", ""))
+            err = json.loads(e.read().decode()).get("error", {}) or {}
         except Exception:
             pass
-        raise HTTPException(400, said or f"Stripe said {e.code}.")
+        raise StripeError(err.get("code") or err.get("type") or str(e.code),
+                          err.get("message") or f"Stripe said {e.code}.",
+                          err.get("decline_code", "")) from None
+
+
+def _stripe(path: str, fields: dict) -> dict:
+    try:
+        return _stripe_call("POST", path, fields)
+    except StripeError as e:
+        raise HTTPException(400, e.message)
+
+
+def stripe_customer_for(account_id: int) -> str:
+    """Each customer gets one Stripe customer, made the first time."""
+    db = Session()
+    acct = db.query(Account).filter_by(id=account_id).first()
+    if not acct:
+        db.close()
+        raise HTTPException(404, "No such customer.")
+    if acct.stripe_customer:
+        cus = acct.stripe_customer
+        db.close()
+        return cus
+    name = acct.name or ""
+    db.close()
+    made = _stripe_call("POST", "customers", {
+        "name": name, "metadata[account_id]": str(account_id)},
+        idem=f"customer-{account_id}")
+    db = Session()
+    acct = db.query(Account).filter_by(id=account_id).first()
+    acct.stripe_customer = made["id"]
+    db.commit()
+    db.close()
+    return made["id"]
+
+
+def stripe_card_page_url(account_id: int) -> str:
+    """Stripe's own hosted page, set up to SAVE a card, not charge it. The
+    card is typed into Stripe, never into us."""
+    cus = stripe_customer_for(account_id)
+    session = _stripe_call("POST", "checkout/sessions", {
+        "mode": "setup",
+        "customer": cus,
+        "payment_method_types[0]": "card",
+        "client_reference_id": str(account_id),
+        "metadata[account_id]": str(account_id),
+        "setup_intent_data[metadata][account_id]": str(account_id),
+        "success_url": f"{PUBLIC_URL}/card/done?session_id="
+                       "{CHECKOUT_SESSION_ID}",
+        "cancel_url": f"{PUBLIC_URL}/card?cancelled=1",
+    })
+    return session["url"]
+
+
+def stripe_save_finished(session_id: str) -> dict:
+    """Stripe says the card page was completed: record the card. Asks
+    Stripe, never trusts the address bar, and is safe to run twice."""
+    sess = _stripe_call("GET", f"checkout/sessions/{session_id}",
+                        {"expand[]": "setup_intent.payment_method"})
+    if sess.get("status") != "complete" or sess.get("mode") != "setup":
+        raise HTTPException(400, "not_finished")
+    try:
+        account_id = int(sess.get("client_reference_id") or 0)
+    except ValueError:
+        account_id = 0
+    db = Session()
+    acct = db.query(Account).filter_by(id=account_id).first()
+    if not acct or not acct.stripe_customer \
+            or acct.stripe_customer != sess.get("customer"):
+        db.close()
+        raise HTTPException(400, "not_finished")
+    pm = ((sess.get("setup_intent") or {}).get("payment_method") or {})
+    card = pm.get("card") or {}
+    pm_id = pm.get("id", "")
+    for c in db.query(PaymentCard).filter_by(account_id=account_id).all():
+        try:
+            if vault_get(c.secret_blob).get("stripe_pm") == pm_id:
+                out = {"brand": c.brand, "last4": c.last4, "new": False}
+                db.close()
+                return out
+        except Exception:
+            continue
+    for c in db.query(PaymentCard).filter_by(account_id=account_id).all():
+        c.is_default = 0
+    brand = (card.get("brand") or "card").title()
+    row = PaymentCard(
+        account_id=account_id, brand=brand, last4=card.get("last4", ""),
+        exp=f"{card.get('exp_month', '')}/{str(card.get('exp_year', ''))[-2:]}",
+        name_on_card=((pm.get("billing_details") or {}).get("name") or "")[:120],
+        secret_blob=vault_put({"stripe_pm": pm_id,
+                               "stripe_customer": acct.stripe_customer}),
+        is_default=1)
+    db.add(row)
+    db.commit()
+    out = {"brand": brand, "last4": row.last4, "new": True,
+           "account_id": account_id}
+    db.close()
+    emit("cards", "saved", f"card saved at Stripe ({brand} {out['last4']})",
+         "info", account_id)
+    return out
+
+
+CHARGE_LIMIT_CENTS = int(os.environ.get("CHARGE_LIMIT_CENTS", "50000"))
+
+
+def stripe_charge(account_id: int, card_id: int, cents: int,
+                  what_for: str, key: str) -> dict:
+    """Charge a card saved at Stripe. key makes it safe to retry: the same
+    key never charges twice. Outcomes are reason codes, not sentences."""
+    if cents < 50:
+        raise HTTPException(400, "too_small")
+    if cents > CHARGE_LIMIT_CENTS:
+        raise HTTPException(400, "over_limit")
+    db = Session()
+    card = db.query(PaymentCard).filter_by(id=card_id,
+                                           account_id=account_id).first()
+    db.close()
+    if not card:
+        raise HTTPException(404, "no_card")
+    secret = vault_get(card.secret_blob)
+    pm, cus = secret.get("stripe_pm"), secret.get("stripe_customer")
+    if not pm or not cus:
+        raise HTTPException(400, "card_not_at_stripe")
+    try:
+        pi = _stripe_call("POST", "payment_intents", {
+            "amount": str(int(cents)), "currency": "usd",
+            "customer": cus, "payment_method": pm,
+            "off_session": "true", "confirm": "true",
+            "description": (what_for or "")[:300],
+            "metadata[account_id]": str(account_id)}, idem=key)
+    except StripeError as e:
+        reason = {"authentication_required": "needs_authentication",
+                  "card_declined": "declined",
+                  "expired_card": "card_expired",
+                  "insufficient_funds": "declined"}.get(e.code, "stripe_error")
+        if e.decline == "authentication_required":
+            reason = "needs_authentication"
+        emit("cards", "charge", f"charge of ${cents / 100:.2f} failed: "
+                                f"{reason}", "warn", account_id)
+        return {"charged": False, "reason": reason, "message": e.message}
+    ok = pi.get("status") == "succeeded"
+    emit("cards", "charge",
+         f"{'charged' if ok else 'charge ' + pi.get('status', '')} "
+         f"${cents / 100:.2f} on {card.brand} {card.last4}: {what_for[:80]}",
+         "info" if ok else "warn", account_id)
+    return {"charged": ok, "reason": "" if ok else pi.get("status", ""),
+            "id": pi.get("id"), "amount": f"${cents / 100:.2f}",
+            "card": f"{card.brand} ending {card.last4}"}
 
 
 class StripeNeedsRawCardAccess(Exception):
@@ -5406,7 +5574,7 @@ app = FastAPI(title="Phone Assistant")
 # of that name and shadowing it breaks the interpreter's startup.
 from site_pages import (HOME, SIGNUP, PRIVACY, TERMS, CONNECT,
                         LINK_EXPIRED, NOT_CONNECTED, connect_confirm,
-                        connected)
+                        connected, CARD, CARD_NOT_SAVED, card_saved)
 
 
 @app.get("/health")
@@ -5481,6 +5649,86 @@ def link_code(request: Request, account_id: int):
         raise HTTPException(404, "No such customer.")
     return {"code": _connect_code(account_id), "valid_minutes": 60,
             "page": f"{PUBLIC_URL}/connect", "for": row.name}
+
+
+@app.get("/card", response_class=HTMLResponse)
+def card_page():
+    """Where a card is added, on Stripe's own page, with a code the
+    assistant read out."""
+    return HTMLResponse(CARD)
+
+
+@app.post("/card")
+def card_with_code(b: ConnectBody, request: Request):
+    digits = "".join(ch for ch in (b.phone or "") if ch.isdigit())[-10:]
+    ip = (request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+          or (request.client.host if request.client else "?"))
+    if (_connect_too_many("cp" + digits, CONNECT_MAX_FAILS)
+            or _connect_too_many("ci" + ip, CONNECT_MAX_FAILS_IP)):
+        raise HTTPException(429, "Too many tries. Please wait an hour, or "
+                                 "ask the assistant for a new code.")
+    acct = account_for_number(digits) if len(digits) == 10 else None
+    if not acct or not _connect_code_ok(acct.id, b.code, "card"):
+        _connect_too_many("cp" + digits, CONNECT_MAX_FAILS, add=True)
+        _connect_too_many("ci" + ip, CONNECT_MAX_FAILS_IP, add=True)
+        emit("cards", "card page", "a card code didn't match", "warn")
+        raise HTTPException(400, "That code doesn't match that phone number. "
+                                 "Check both and try again.")
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(503, "Cards can't be added just yet. Please call "
+                                 "us.")
+    try:
+        url = stripe_card_page_url(acct.id)
+    except StripeError as e:
+        emit("cards", "card page", f"Stripe refused: {e.message[:150]}",
+             "error", acct.id)
+        raise HTTPException(502, "Something went wrong. Please try again "
+                                 "shortly.")
+    emit("cards", "card page", f"card page opened for {acct.name}", "info",
+         acct.id)
+    return {"url": url}
+
+
+@app.get("/card/done", response_class=HTMLResponse)
+def card_done(session_id: str = ""):
+    try:
+        got = stripe_save_finished(session_id)
+    except (HTTPException, StripeError):
+        return HTMLResponse(CARD_NOT_SAVED, status_code=400)
+    return HTMLResponse(card_saved(got["brand"], got["last4"]))
+
+
+@app.get("/card/code")
+def card_code(request: Request, account_id: int):
+    """A card code for the assistant to read out. Agent and staff only."""
+    require_auth(request)
+    db = Session()
+    row = db.query(Account).filter_by(id=account_id).first()
+    db.close()
+    if not row:
+        raise HTTPException(404, "No such customer.")
+    return {"code": _connect_code(account_id, purpose="card"),
+            "valid_minutes": 60, "page": f"{PUBLIC_URL}/card"}
+
+
+class ChargeBody(BaseModel):
+    account_id: int
+    card_id: int
+    amount: str                 # "12.50"
+    what_for: str
+    key: str                    # the same key never charges twice
+
+
+@app.post("/charges")
+def charge(b: ChargeBody, request: Request):
+    require_auth(request)
+    try:
+        cents = int(round(float(b.amount.replace("$", "").strip()) * 100))
+    except ValueError:
+        raise HTTPException(400, "bad_amount")
+    if not b.key.strip() or not b.what_for.strip():
+        raise HTTPException(400, "A reason and a key are needed.")
+    return stripe_charge(b.account_id, b.card_id, cents, b.what_for, b.key)
 
 
 @app.get("/signup", response_class=HTMLResponse)
@@ -6962,7 +7210,9 @@ def stripe_status(request: Request):
         out["verdict"] = ("Stripe is holding cards. The digits no longer "
                           "reach this database.")
     except StripeNeedsRawCardAccess:
-        out["needs"] = "raw card data API access"
+        out["card_page"] = ("works - cards added on /card go through "
+                            "Stripe's own page and need no approval")
+        out["needs"] = "raw card data API access (only for cards read out)"
         out["verdict"] = (
             "The key works, but Stripe has not approved this account to "
             "accept card numbers from a server. That is the normal state - "
