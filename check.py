@@ -262,8 +262,11 @@ def _():
     assert hour in said, \
         f"said {said!r}, but the caller's clock says {hour}"
     # and the relative wording still works
-    assert "minutes ago" in main._when(
-        int((now - timedelta(minutes=5)).timestamp() * 1000))
+    five = now - timedelta(minutes=5)
+    said = main._when(int(five.timestamp() * 1000))
+    assert "minutes ago" in said, said
+    assert five.astimezone(main._tz()).strftime("%I:%M %p").lstrip("0") \
+        in said, f"'{said}' gives no clock time - the model can't place it"
     assert main._when(int(now.timestamp() * 1000)) == "just now"
     assert main._when("nonsense") == ""
 
@@ -1840,6 +1843,26 @@ def _():
     src = open("agent.py", encoding="utf-8").read()
     assert "the best way is card_setup_code" in src, \
         "the order instructions should offer the card page first"
+
+
+@check("the assistant knows what time it is instead of guessing")
+def _():
+    """Call 54: asked the time at 12:01 AM, it said "about 10:15 in the
+    morning". It had the date and no clock, so it made one up."""
+    import asyncio
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                           "+1555", 1)
+    tool = next(t for t in inst.tools
+                if getattr(t, "__name__", "") == "what_time_is_it")
+    said = asyncio.run(tool(None))
+    now = datetime.now(ZoneInfo("America/New_York"))
+    assert now.strftime("%I:%M %p").lstrip("0") in said or \
+        now.strftime("%p") in said, said
+    assert "call started at" in inst.instructions, \
+        "the instructions don't say when the call started"
+    assert "Never guess a time" in inst.instructions
 
 
 @check("nothing an email tool does is permanent")

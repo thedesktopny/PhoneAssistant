@@ -882,7 +882,11 @@ def _when(internal_ms) -> str:
     if mins < 1:
         return "just now"
     if mins < 60:
-        return f"{mins} minutes ago"
+        # the clock time too: "51 minutes ago" said just after midnight
+        # left the model believing it was still the same day
+        if t.date() != now.date():
+            return f"{mins} minutes ago, at {_clock(t)} last night"
+        return f"{mins} minutes ago, at {_clock(t)}"
     if t.date() == now.date():
         return f"today at {_clock(t)}"
     if (now.date() - t.date()).days == 1:

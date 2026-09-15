@@ -334,6 +334,7 @@ class Assistant(Agent):
         # %-d is Linux-only and raises on Windows, where check.py is run
         _now = datetime.now(ZoneInfo("America/New_York"))
         today = f"{_now:%A, %B} {_now.day}, {_now.year}"
+        started = _now.strftime("%I:%M %p").lstrip("0")
         super().__init__(instructions=f"""
 You are a personal assistant for {account.get('name', 'the caller')},
 reachable by phone and by text. This is a phone call.
@@ -520,8 +521,12 @@ CALENDAR
   loud. Read the whole thing back and ask "Should I put that in?" before
   calling create_event.
 - Speak times naturally: "Tuesday at two thirty", never ISO timestamps.
-- Today is {today}. Work out relative dates like "tomorrow" or "next Tuesday"
-  yourself before calling a tool.
+- Today is {today}. This call started at {started}, Eastern time. Work out
+  relative dates like "tomorrow" or "next Tuesday" yourself before calling
+  a tool.
+- You have no clock of your own. If they ask the time, or anything depends
+  on what time it is now ("is the pharmacy still open?", "did that come
+  today?"), call what_time_is_it. Never guess a time.
 
 CONTACTS, DOCUMENTS AND THE TO-DO LIST
 - "What's my daughter's number?", "where does he live?", "when is her
@@ -2459,6 +2464,14 @@ Never pick one for them silently.
             return f"Couldn't do that: {str(e)[:200]}"
         return (f"Marked {d.get('marked_read', 0)} messages as read in the "
                 f"{d.get('scope', 'inbox')}. Tell them the number.")
+
+    @function_tool
+    async def what_time_is_it(self, context: RunContext):
+        """The real time and date right now, in the caller's time zone."""
+        now = datetime.now(ZoneInfo("America/New_York"))
+        return (f"It is {now.strftime('%I:%M %p').lstrip('0')} on "
+                f"{now:%A, %B} {now.day}, Eastern time. Say it naturally, "
+                f"like 'just after midnight' or 'ten past three'.")
 
     @function_tool
     async def end_call(self, context: RunContext, reason: str = "finished"):
