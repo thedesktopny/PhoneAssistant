@@ -100,9 +100,19 @@ def _tz():
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/contacts",
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/tasks",
     "https://www.googleapis.com/auth/userinfo.email",
     "openid",
 ]
+
+# Google lets people untick individual boxes on the consent screen. When
+# they do, the token comes back with fewer scopes than we asked for, and
+# oauthlib treats that as an error and throws - the customer would get a
+# crash page instead of a connection. Accept what was granted; the tools
+# report a missing permission on their own.
+os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 
 fernet = Fernet(ENCRYPTION_KEY.encode())
 
@@ -1275,29 +1285,48 @@ def tool_attachments(account_id: int, msg_id: str, which: str = "") -> dict:
     return {"attachments": _walk_parts(m.get("payload", {}), [])}
 
 
-def tool_attachment_text(account_id: int, msg_id: str, attachment_id: str,
-                         which: str = "", limit: int = 12000) -> dict:
-    """Read an attached document. PDFs and plain text for now."""
-    svc = gmail_client(account_id, which)
-    a = svc.users().messages().attachments().get(
-        userId="me", messageId=msg_id, id=attachment_id).execute()
-    raw = base64.urlsafe_b64decode(a.get("data", ""))
-    head = raw[:5]
-    if head.startswith(b"%PDF"):
+def document_text(raw: bytes, limit: int = 12000) -> dict:
+    """Words out of a file, whatever it came from: a PDF, a Word document
+    or plain text. Anything else is said to be unreadable rather than read
+    out as gibberish."""
+    import io as _io
+    import re
+    import html
+    if raw[:5].startswith(b"%PDF"):
         try:
             from pypdf import PdfReader
-            import io as _io
             reader = PdfReader(_io.BytesIO(raw))
             text = " ".join((p.extract_text() or "") for p in reader.pages)
             return {"text": " ".join(text.split())[:limit], "kind": "pdf"}
         except Exception as e:
             return {"text": "", "error": f"could not read the PDF: "
                                          f"{str(e)[:120]}"}
-    try:
-        return {"text": " ".join(raw.decode("utf-8", "ignore").split())[:limit],
-                "kind": "text"}
-    except Exception:
+    if raw[:2] == b"PK":
+        # .docx is a zip with the words in word/document.xml
+        try:
+            import zipfile
+            with zipfile.ZipFile(_io.BytesIO(raw)) as z:
+                xml = z.read("word/document.xml").decode("utf-8", "ignore")
+            xml = re.sub(r"</w:p>", "\n", xml)
+            text = html.unescape(re.sub(r"<[^>]+>", "", xml))
+            return {"text": " ".join(text.split())[:limit], "kind": "word"}
+        except Exception:
+            return {"text": "", "error": "that kind of file can't be read "
+                                         "aloud"}
+    sample = raw[:2000]
+    if sample and sum(b < 9 or 13 < b < 32 for b in sample) > len(sample) // 20:
         return {"text": "", "error": "that kind of file can't be read aloud"}
+    return {"text": " ".join(raw.decode("utf-8", "ignore").split())[:limit],
+            "kind": "text"}
+
+
+def tool_attachment_text(account_id: int, msg_id: str, attachment_id: str,
+                         which: str = "", limit: int = 12000) -> dict:
+    """Read an attached document."""
+    svc = gmail_client(account_id, which)
+    a = svc.users().messages().attachments().get(
+        userId="me", messageId=msg_id, id=attachment_id).execute()
+    return document_text(base64.urlsafe_b64decode(a.get("data", "")), limit)
 
 
 def tool_search_email(account_id: int, query: str, limit: int = 5,
@@ -1333,9 +1362,20 @@ def tool_search_email(account_id: int, query: str, limit: int = 5,
 
 
 def tool_find_contact(account_id: int, name: str, which: str = "") -> dict:
-    """Find someone's email address from past messages, by name or partial."""
-    svc = gmail_client(account_id, which)
+    """Find someone's email address: their Google Contacts first, then
+    anyone they've emailed with."""
     seen = {}
+    try:
+        for c in tool_contacts_search(account_id, name, which)["contacts"]:
+            for e in c["emails"]:
+                seen[e.lower()] = c["name"] or e
+    except Exception:
+        pass    # no Contacts permission yet - past emails still work
+    if seen:
+        return {"matches": [{"name": v, "email": k}
+                            for k, v in seen.items()][:5],
+                "source": "contacts"}
+    svc = gmail_client(account_id, which)
     for q in (f"from:{name}", f"to:{name}", name):
         try:
             res = svc.users().messages().list(
@@ -1380,6 +1420,214 @@ def google_client(account_id: int, api: str, version: str, which: str = ""):
         scopes=SCOPES,
     )
     return build(api, version, credentials=creds, cache_discovery=False)
+
+
+# ---------------------------------------------- contacts, drive and tasks
+# Each of these needs its own permission. Anyone connected before they
+# were added hasn't granted it, and Google refuses the call. That comes
+# back to the assistant as reason "needs_reconnect" (see google_refused),
+# never as a crash.
+
+PERSON_FIELDS = "names,emailAddresses,phoneNumbers,addresses,birthdays"
+
+
+def _person(p: dict) -> dict:
+    names = p.get("names") or [{}]
+    bday = ((p.get("birthdays") or [{}])[0].get("date") or {})
+    out = {
+        "id": p.get("resourceName", ""),
+        "name": names[0].get("displayName", ""),
+        "emails": [e.get("value") for e in p.get("emailAddresses") or []
+                   if e.get("value")],
+        "phones": [{"number": n.get("value"), "type": n.get("type", "")}
+                   for n in p.get("phoneNumbers") or [] if n.get("value")],
+        "address": ((p.get("addresses") or [{}])[0]
+                    .get("formattedValue", "")).replace("\n", ", "),
+    }
+    if bday.get("month") and bday.get("day"):
+        import calendar as _calendar
+        out["birthday"] = f"{_calendar.month_name[bday['month']]} {bday['day']}"
+    return out
+
+
+def tool_contacts_search(account_id: int, name: str, which: str = "") -> dict:
+    """Someone in their Google Contacts: numbers, email, address, birthday."""
+    svc = google_client(account_id, "people", "v1", which)
+    # Google's documented quirk: the search index is only brought up to
+    # date by a request with an empty query, so send one first.
+    svc.people().searchContacts(query="", readMask="names").execute()
+    res = svc.people().searchContacts(query=name, readMask=PERSON_FIELDS,
+                                      pageSize=10).execute()
+    found = [_person(r.get("person", {})) for r in res.get("results", [])]
+    if not found:
+        # the index can lag behind a contact added minutes ago
+        want = name.lower().split()
+        page_token = None
+        for _ in range(5):
+            res = svc.people().connections().list(
+                resourceName="people/me", personFields=PERSON_FIELDS,
+                pageSize=1000, pageToken=page_token).execute()
+            for p in res.get("connections", []):
+                person = _person(p)
+                if want and all(w in person["name"].lower() for w in want):
+                    found.append(person)
+            page_token = res.get("nextPageToken")
+            if not page_token:
+                break
+    return {"found": len(found), "contacts": found[:5]}
+
+
+def tool_contact_add(account_id: int, name: str, phone: str = "",
+                     email: str = "", which: str = "") -> dict:
+    svc = google_client(account_id, "people", "v1", which)
+    body = {"names": [{"unstructuredName": name.strip()}]}
+    if phone.strip():
+        body["phoneNumbers"] = [{"value": phone.strip()}]
+    if email.strip():
+        body["emailAddresses"] = [{"value": email.strip()}]
+    p = svc.people().createContact(
+        body=body, personFields="names,emailAddresses,phoneNumbers").execute()
+    return {"saved": True, "contact": _person(p)}
+
+
+# what each kind of Drive file is called out loud, and how to get words out
+DRIVE_KINDS = {
+    "application/vnd.google-apps.document": ("Google Doc", "text/plain"),
+    "application/vnd.google-apps.spreadsheet": ("spreadsheet", "text/csv"),
+    "application/vnd.google-apps.presentation": ("slide show", "text/plain"),
+    "application/pdf": ("PDF", ""),
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+        ("Word document", ""),
+    "text/plain": ("text file", ""),
+    "text/csv": ("spreadsheet", ""),
+}
+DRIVE_MAX_BYTES = 15 * 1024 * 1024
+
+
+def _drive_kind(mime: str) -> str:
+    if mime in DRIVE_KINDS:
+        return DRIVE_KINDS[mime][0]
+    for start, word in (("image/", "picture"), ("video/", "video"),
+                        ("audio/", "recording")):
+        if mime.startswith(start):
+            return word
+    return "file"
+
+
+def _google_time(stamp: str):
+    try:
+        return datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def tool_drive_search(account_id: int, words: str = "", limit: int = 5,
+                      which: str = "") -> dict:
+    """Files in their Google Drive, including ones shared with them. By
+    name first, newest first; if nothing is called that, by what's inside."""
+    svc = google_client(account_id, "drive", "v3", which)
+    fields = ("files(id,name,mimeType,modifiedTime,size,"
+              "owners(displayName),sharingUser(displayName))")
+    base = ("trashed = false and "
+            "mimeType != 'application/vnd.google-apps.folder'")
+    w = (words or "").replace("\\", " ").replace("'", "\\'").strip()
+    limit = max(1, min(int(limit or 5), 10))
+    if w:
+        files = svc.files().list(
+            q=f"{base} and name contains '{w}'", orderBy="modifiedTime desc",
+            pageSize=limit, fields=fields).execute().get("files", [])
+        if not files:
+            # Drive can't sort a search of the contents
+            files = svc.files().list(
+                q=f"{base} and fullText contains '{w}'", pageSize=limit,
+                fields=fields).execute().get("files", [])
+    else:
+        files = svc.files().list(q=base, orderBy="modifiedTime desc",
+                                 pageSize=limit,
+                                 fields=fields).execute().get("files", [])
+    out = []
+    for f in files:
+        mime = f.get("mimeType", "")
+        who = ((f.get("sharingUser") or {}).get("displayName")
+               or ((f.get("owners") or [{}])[0].get("displayName", "")))
+        out.append({"id": f.get("id"), "name": f.get("name", ""),
+                    "kind": _drive_kind(mime),
+                    "changed": local_str(_google_time(
+                        f.get("modifiedTime", "")), "day"),
+                    "from": who, "readable": mime in DRIVE_KINDS})
+    return {"found": len(out), "files": out}
+
+
+def tool_drive_read(account_id: int, file_id: str, which: str = "",
+                    limit: int = 12000) -> dict:
+    svc = google_client(account_id, "drive", "v3", which)
+    meta = svc.files().get(fileId=file_id,
+                           fields="id,name,mimeType,size").execute()
+    mime, name = meta.get("mimeType", ""), meta.get("name", "")
+    if mime not in DRIVE_KINDS:
+        return {"name": name, "text": "",
+                "error": f"a {_drive_kind(mime)} can't be read aloud"}
+    if int(meta.get("size") or 0) > DRIVE_MAX_BYTES:
+        return {"name": name, "text": "", "error": "that file is too big to "
+                                                   "read aloud"}
+    export = DRIVE_KINDS[mime][1]
+    if mime.startswith("application/vnd.google-apps."):
+        raw = svc.files().export(fileId=file_id, mimeType=export).execute()
+    else:
+        raw = svc.files().get_media(fileId=file_id).execute()
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8")
+    out = document_text(raw, limit)
+    out["name"] = name
+    return out
+
+
+def _spoken_date(day: str) -> str:
+    try:
+        d = datetime.fromisoformat(day[:10])
+        return f"{d:%A}, {d:%B} {d.day}"
+    except Exception:
+        return ""
+
+
+def tool_tasks_list(account_id: int, which: str = "") -> dict:
+    """Their to-do list: what's not done yet, the ones with a date first."""
+    svc = google_client(account_id, "tasks", "v1", which)
+    res = svc.tasks().list(tasklist="@default", showCompleted=False,
+                           showHidden=False, maxResults=50).execute()
+    items = []
+    for t in res.get("items", []):
+        if not (t.get("title") or "").strip():
+            continue
+        due = (t.get("due") or "")[:10]
+        items.append({"id": t.get("id"), "title": t.get("title", ""),
+                      "notes": (t.get("notes") or "")[:300],
+                      "due": due, "due_spoken": _spoken_date(due)})
+    items.sort(key=lambda t: (not t["due"], t["due"]))
+    return {"count": len(items), "tasks": items}
+
+
+def tool_task_add(account_id: int, title: str, due_date: str = "",
+                  notes: str = "", which: str = "") -> dict:
+    svc = google_client(account_id, "tasks", "v1", which)
+    body = {"title": title.strip()[:500]}
+    if notes.strip():
+        body["notes"] = notes.strip()[:2000]
+    if due_date.strip():
+        # Google Tasks keeps only the date; the time part is ignored
+        body["due"] = f"{due_date.strip()[:10]}T00:00:00.000Z"
+    t = svc.tasks().insert(tasklist="@default", body=body).execute()
+    return {"added": True, "id": t.get("id"), "title": t.get("title"),
+            "due_spoken": _spoken_date(due_date)}
+
+
+def tool_task_done(account_id: int, task_id: str, done: bool = True,
+                   which: str = "") -> dict:
+    svc = google_client(account_id, "tasks", "v1", which)
+    t = svc.tasks().patch(
+        tasklist="@default", task=task_id,
+        body={"status": "completed" if done else "needsAction"}).execute()
+    return {"done": t.get("status") == "completed", "title": t.get("title")}
 
 
 def _cal(account_id: int, which: str = ""):
@@ -5291,6 +5539,105 @@ def test_search(request: Request, account_id: int, q: str, limit: int = 5,
     return tool_search_email(account_id, q, limit, which, newest_first)
 
 
+from googleapiclient.errors import HttpError
+
+
+@app.exception_handler(HttpError)
+async def google_refused(request: Request, exc: HttpError):
+    """Google said no. Say WHY in a word the assistant can act on, instead
+    of a 500 that reads as "something broke"."""
+    status = getattr(getattr(exc, "resp", None), "status", 500) or 500
+    try:
+        body = (exc.content or b"").decode("utf-8", "ignore")
+    except Exception:
+        body = ""
+    if ("ACCESS_TOKEN_SCOPE_INSUFFICIENT" in body
+            or "insufficient authentication scopes" in body.lower()):
+        reason, level = "needs_reconnect", "warn"
+    elif ("SERVICE_DISABLED" in body or "accessNotConfigured" in body
+          or "has not been used in project" in body):
+        reason, level = "api_not_enabled", "error"
+    elif status == 404:
+        reason, level = "not_found", "warn"
+    else:
+        reason, level = "google_error", "error"
+    emit("google", request.url.path,
+         f"Google refused ({status}): {reason}", level)
+    code = 403 if reason in ("needs_reconnect", "api_not_enabled") else int(
+        status)
+    return JSONResponse({"detail": reason, "status": int(status)},
+                        status_code=code)
+
+
+@app.get("/contacts/search")
+def contacts_search(request: Request, account_id: int, name: str,
+                    which: str = ""):
+    require_auth(request)
+    return tool_contacts_search(account_id, name, which)
+
+
+class NewContact(BaseModel):
+    account_id: int
+    name: str
+    phone: str = ""
+    email: str = ""
+    which: str = ""
+
+
+@app.post("/contacts/add")
+def contacts_add(b: NewContact, request: Request):
+    require_auth(request)
+    if not b.name.strip() or not (b.phone.strip() or b.email.strip()):
+        raise HTTPException(400, "A name and a phone number or email needed.")
+    out = tool_contact_add(b.account_id, b.name, b.phone, b.email, b.which)
+    emit("contacts", "saved", f"contact saved: {b.name}", "info",
+         b.account_id)
+    return out
+
+
+@app.get("/drive/search")
+def drive_search(request: Request, account_id: int, words: str = "",
+                 limit: int = 5, which: str = ""):
+    require_auth(request)
+    return tool_drive_search(account_id, words, limit, which)
+
+
+@app.get("/drive/read")
+def drive_read(request: Request, account_id: int, file_id: str,
+               which: str = ""):
+    require_auth(request)
+    return tool_drive_read(account_id, file_id, which)
+
+
+@app.get("/todo")
+def todo_list(request: Request, account_id: int, which: str = ""):
+    require_auth(request)
+    return tool_tasks_list(account_id, which)
+
+
+class NewTask(BaseModel):
+    account_id: int
+    title: str
+    due_date: str = ""
+    notes: str = ""
+    which: str = ""
+
+
+@app.post("/todo/add")
+def todo_add(b: NewTask, request: Request):
+    require_auth(request)
+    if not b.title.strip():
+        raise HTTPException(400, "What is the task?")
+    return tool_task_add(b.account_id, b.title, b.due_date, b.notes, b.which)
+
+
+@app.post("/todo/done")
+def todo_done(request: Request, account_id: int, task_id: str,
+              done: bool = True, which: str = ""):
+    require_auth(request)
+    return tool_task_done(account_id, task_id, done, which)
+
+
 @app.get("/test/contact")
 def test_contact(request: Request, account_id: int, name: str,
                  which: str = ""):
@@ -6244,6 +6591,12 @@ def token_permissions(request: Request, account_id: int = 0):
             "read, send and organise their Gmail",
         "https://www.googleapis.com/auth/calendar":
             "read and change their calendar",
+        "https://www.googleapis.com/auth/contacts":
+            "look up and add to their contacts",
+        "https://www.googleapis.com/auth/drive.readonly":
+            "find and read files in their Google Drive (not change them)",
+        "https://www.googleapis.com/auth/tasks":
+            "read and add to their to-do list",
         "https://www.googleapis.com/auth/userinfo.email":
             "see which email address they are",
         "openid": "confirm who they are",

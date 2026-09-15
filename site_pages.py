@@ -77,7 +77,7 @@ CSS = """
  .btn.alt{background:transparent;color:var(--ink);
    box-shadow:inset 0 0 0 2px var(--line)}
  .btn.alt:hover{box-shadow:inset 0 0 0 2px var(--warm)}
- .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
+ .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));
    gap:16px;margin-top:26px}
  .card{background:var(--card);border:1px solid var(--line);border-radius:18px;
    padding:22px}
@@ -140,7 +140,7 @@ CSS = """
 """
 
 NAV = [("/", "Home"), ("/#how", "How it works"), ("/signup", "Sign up"),
-       ("/connect", "Connect email"), ("/privacy", "Privacy")]
+       ("/connect", "Connect account"), ("/privacy", "Privacy")]
 
 
 def page(title: str, body: str, here: str = "") -> str:
@@ -162,7 +162,7 @@ by voice.">
 <footer><div class="wrap">
   <span>&copy; {BRAND}</span>
   <a href="/privacy">Privacy</a><a href="/terms">Terms</a>
-  <a href="/signup">Sign up</a><a href="/connect">Connect email</a>
+  <a href="/signup">Sign up</a><a href="/connect">Connect account</a>
   <span class="r"><a href="tel:{PHONE_TEL}">{PHONE}</a> &middot;
   <a href="mailto:{SUPPORT_EMAIL}">{SUPPORT_EMAIL}</a></span>
 </div></footer>
@@ -175,11 +175,11 @@ HOME = page("A telephone assistant", f"""
   <div>
     <div class="eyebrow">No internet needed</div>
     <h1>Your email, your diary and your errands, by telephone.</h1>
-    <p class="lead">For people who don't use the internet and don't want to.
+    <p class="lead">For people who don't use the internet, or would rather not.
     There's no app, no website to learn and no screen. You ring one number
     and ask for what you need.</p>
     <div class="btns">
-      <a class="btn main" href="/signup">Register someone</a>
+      <a class="btn main" href="/signup">Get started</a>
       <a class="btn alt" href="#how">How it works</a>
     </div>
   </div>
@@ -201,7 +201,12 @@ HOME = page("A telephone assistant", f"""
       <p>It reads your messages out, replies with the words you give it, and
       reads a reply back to you before it sends anything.</p></div>
     <div class="card"><div class="q">&ldquo;What do I have on Thursday?&rdquo;</div>
-      <p>It tells you what's in your calendar and adds appointments.</p></div>
+      <p>It tells you what's in your calendar, adds appointments and keeps
+      your to-do list.</p></div>
+    <div class="card"><div class="q">&ldquo;What's my son's number?&rdquo;</div>
+      <p>It looks people up in your contacts and adds new ones.</p></div>
+    <div class="card"><div class="q">&ldquo;Read me the letter from the school.&rdquo;</div>
+      <p>It finds documents in your Google Drive and reads them to you.</p></div>
     <div class="card"><div class="q">&ldquo;When does the pharmacy close?&rdquo;</div>
       <p>It finds opening hours, phone numbers and how-to instructions, and
       tells you when it isn't sure.</p></div>
@@ -215,20 +220,19 @@ HOME = page("A telephone assistant", f"""
   <div class="eyebrow">How it works</div>
   <h2>Set it up once. After that, just call.</h2>
   <div class="steps">
-    <div class="step"><div><h3>Register</h3>
-      <p>Fill in <a href="/signup">the sign-up form</a> for yourself or for a
-      parent or relative. You can also ring and ask.</p></div></div>
-    <div class="step"><div><h3>We call to set it up</h3>
-      <p>We register the telephone number they call from and they choose a
-      PIN, so only they can reach their account.</p></div></div>
-    <div class="step"><div><h3>Connect their email</h3>
-      <p>This happens once. The assistant reads out a short code. Someone
-      with a phone or computer enters it on <a href="/connect">our connect
-      page</a>, and the person whose email it is agrees on Google's own
-      screen. If nobody is available to help, call us and we'll work out
-      another way.</p></div></div>
-    <div class="step"><div><h3>Pick up the phone</h3>
-      <p>From then on, everything happens by voice.</p></div></div>
+    <div class="step"><div><h3>Sign up</h3>
+      <p>Fill in <a href="/signup">the short form</a> or call us, and we'll
+      call you back.</p></div></div>
+    <div class="step"><div><h3>We set up your account</h3>
+      <p>We register the phone number you'll call from, and you choose a PIN
+      so that only you can reach your account.</p></div></div>
+    <div class="step"><div><h3>Connect your Google account</h3>
+      <p>You only do this once. The assistant gives you a short code. Enter
+      it on <a href="/connect">our connect page</a> and approve access on
+      Google's own screen. If you don't have a computer or smartphone, call
+      us and we'll help.</p></div></div>
+    <div class="step"><div><h3>Just call</h3>
+      <p>From then on, everything is done by voice.</p></div></div>
   </div>
 </div></section>
 
@@ -255,9 +259,11 @@ HOME = page("A telephone assistant", f"""
 <section><div class="wrap"><div style="max-width:720px">
   <div class="eyebrow">Your information</div>
   <h2>What we can and cannot see.</h2>
-  <p>With permission, the assistant can read and send email, and read and
-  change the calendar, for the account that was connected. It cannot see
-  Google Drive, photos or contacts.</p>
+  <p>With your permission, the assistant can read and send your email,
+  manage your calendar and to-do list, look up and add contacts, and read
+  the files in your Google Drive. It can't change or delete Drive files,
+  and it can't see your photos. Google shows you each of these permissions
+  before you agree.</p>
   <p>Email and calendar information is used only to do what you asked for
   on the phone. It is never sold, never used for advertising and never used
   to train AI. Permission can be withdrawn at any time, either by asking us
@@ -267,34 +273,33 @@ HOME = page("A telephone assistant", f"""
 """, "/")
 
 
-SIGNUP = page("Register someone", f"""
+SIGNUP = page("Get started", f"""
 <div class="wrap narrow"><section>
-<div class="eyebrow">Sign up</div>
-<h1>Register someone for the service</h1>
-<p class="lead">Fill this in and we'll call to finish setting it up. If
-you're arranging this for a parent or relative, put their details first and
-yours underneath.</p>
+<div class="eyebrow">Get started</div>
+<h1>Sign up for {BRAND}</h1>
+<p class="lead">Leave your details and we'll call you to set up your
+account. It takes a few minutes, all by phone.</p>
 
 <form class="box" id="f">
-  <label for="n">Name of the person who will use the assistant</label>
+  <label for="n">Your name</label>
   <input id="n" required autocomplete="name">
-  <label for="p">The telephone number they will call from</label>
+  <label for="p">The phone number you'll call from</label>
   <input id="p" required inputmode="tel" placeholder="(845) 555 0123">
-  <label for="h">Your name and number <span>if you're arranging this for
-  them</span></label>
-  <input id="h" placeholder="optional">
+  <label for="h">Another contact <span>optional, if someone else should
+  hear from us about setup</span></label>
+  <input id="h" placeholder="Name and phone number">
   <label for="m">Anything we should know <span>optional</span></label>
   <textarea id="m" rows="3"></textarea>
   <p class="agree">By sending this you agree to our <a href="/terms">Terms</a>
   and <a href="/privacy">Privacy Policy</a>. We'll only use these details to
-  contact you about setting up the service.</p>
+  set up your service.</p>
   <button class="btn main" type="submit">Send</button>
   <div class="msg" id="msg" role="status"></div>
 </form>
 
-<div class="note">If the service will read someone's email, the person
-whose email it is gives that permission themselves, on Google's own screen,
-when it is connected.</div>
+<div class="note">Your Google account is connected separately, by you, on
+Google's own screen. You'll see exactly what you're allowing before you
+agree.</div>
 </section></div>
 """ + """<script>
 document.getElementById('f').addEventListener('submit', async function(e){
@@ -309,7 +314,7 @@ document.getElementById('f').addEventListener('submit', async function(e){
                             note:v('m')})});
     if (!r.ok) throw 0;
     msg.className = 'msg ok';
-    msg.textContent = "Thank you. We'll call to finish setting it up.";
+    msg.textContent = "Thank you. We'll call you shortly to set up your account.";
     this.reset();
   } catch (err) {
     msg.className = 'msg err';
@@ -324,24 +329,24 @@ CONNECT = page("Connect an email account", f"""
 <div class="wrap narrow"><section>
 <div class="eyebrow">Connect email</div>
 <h1>Connect an email account</h1>
-<p class="lead">You only do this once. Ask the assistant for a
-<b>connect code</b> on a call, then enter it here with the telephone number
-they call from.</p>
+<p class="lead">You only need to do this once. Call the assistant, ask for a
+<b>connect code</b>, and enter it below with the phone number you call
+from.</p>
 
 <form class="box" id="f">
-  <label for="p">The telephone number they call the assistant from</label>
+  <label for="p">The phone number you call the assistant from</label>
   <input id="p" required inputmode="tel" autocomplete="tel"
          placeholder="(845) 555 0123">
-  <label for="c">The six-digit code the assistant gave</label>
+  <label for="c">Your six-digit code</label>
   <input id="c" class="code" required inputmode="numeric" maxlength="7"
          autocomplete="one-time-code" placeholder="&bull;&bull;&bull;&bull;&bull;&bull;">
   <button class="btn main" type="submit">Continue</button>
   <div class="msg" id="msg" role="status"></div>
 </form>
 
-<div class="note"><b>The person whose email it is needs to be there.</b>
-Next, Google shows exactly what the assistant will be allowed to do, and
-they decide whether to agree. It can be undone at any time.</div>
+<div class="note">Next, Google shows you exactly what the assistant will be
+allowed to do, and you decide whether to agree. Only the owner of the
+Google account should approve. You can remove access at any time.</div>
 
 <p class="updated" style="margin-top:20px">Codes last about an hour. If
 yours has stopped working, ring {PHONE} and ask for a new one.</p>
@@ -377,15 +382,15 @@ def _centre(title: str, icon: str, heading: str, body: str) -> str:
 
 def connect_confirm(name: str, go_url: str) -> str:
     """Shown before Google, so they can see whose account they're joining."""
-    return _centre("Connect your email", "&#9993;", "Connect your email", f"""
-<p class="lead">This connects a Gmail account to the telephone assistant,
-so it can read messages aloud and send replies when asked.</p>
-<div class="said" style="text-align:left;margin:22px 0"><b>Connecting to the
-account for</b>{html.escape(name)}</div>
-<p>If that isn't you or the person you're helping, close this page and do
-nothing else.</p>
+    return _centre("Connect your account", "&#9993;",
+                   "Connect your Google account", f"""
+<p class="lead">This connects your Google account to your phone
+assistant.</p>
+<div class="said" style="text-align:left;margin:22px 0"><b>Account
+holder</b>{html.escape(name)}</div>
+<p>If that isn't you, close this page.</p>
 <p>Google will ask you to sign in and show you exactly what you're
-allowing. The person whose email it is should be the one to agree.</p>
+allowing.</p>
 <div class="btns" style="justify-content:center">
   <a class="btn main" href="{html.escape(go_url)}">Continue to Google</a></div>
 """)
@@ -393,24 +398,23 @@ allowing. The person whose email it is should be the one to agree.</p>
 
 LINK_EXPIRED = _centre("This link has expired", "&#8987;",
                        "This link has expired", f"""
-<p class="lead">Links for connecting an email account only work for a short
-time, so nobody else can use one.</p>
-<p>Ring {PHONE}, ask the assistant for a new connect code, and enter it on
+<p class="lead">For your security, connect links only work for a short
+time.</p>
+<p>Call {PHONE}, ask the assistant for a new connect code, and enter it on
 <a href="/connect">the connect page</a>.</p>""")
 
 
 def connected(email: str) -> str:
     who = f" <b>{html.escape(email)}</b>" if email else ""
-    return _centre("Connected", "&#10003;", "Email connected", f"""
-<p class="lead">The assistant can now reach{who or " this account"}.</p>
-<p>You can close this page. Next time they call, they can ask it to read
-their email.</p>""")
+    return _centre("Connected", "&#10003;", "You're connected", f"""
+<p class="lead">Your assistant can now reach{who or " your account"}.</p>
+<p>You can close this page. Next time you call, just ask.</p>""")
 
 
 NOT_CONNECTED = _centre("Not connected", "&#10005;", "Nothing was connected",
                         f"""
-<p class="lead">Permission wasn't given, so the assistant can't reach this
-email account. Nothing has been changed.</p>
+<p class="lead">Access wasn't approved, so nothing has been connected or
+changed.</p>
 <p>If that was a mistake, <a href="/connect">start again</a>. Codes last
 about an hour.</p>""")
 
@@ -428,8 +432,9 @@ themselves.</p>
 <h2>What we hold</h2>
 <ul>
   <li><b>Your name and telephone number</b>, so we know who is calling.</li>
-  <li><b>Permission to reach your email and calendar</b>, if you granted
-      it. This is held as an encrypted token from Google.</li>
+  <li><b>Permission to reach your Google account</b>, if you granted it:
+      your email, calendar, contacts, to-do list, and read-only access to
+      your Google Drive. This is held as an encrypted token from Google.</li>
   <li><b>A record of your calls</b>: what was asked and what was done.
       We keep it so we can fix problems and improve the service.</li>
   <li><b>Delivery addresses and payment cards</b>, if you asked us to keep
@@ -440,8 +445,9 @@ themselves.</p>
 <ul>
   <li>Passwords, PINs and security codes. These are removed from every
       record before it is stored.</li>
-  <li>Anything in Google Drive, your photos or your contacts. The
-      permission we are granted does not reach them.</li>
+  <li>Copies of your Drive files or contacts. They're read from Google
+      when you ask and aren't stored by us.</li>
+  <li>Your photos. The permission we are granted doesn't reach them.</li>
 </ul>
 
 <h2>How Google data is used</h2>
@@ -449,7 +455,7 @@ themselves.</p>
 <a href="https://developers.google.com/terms/api-services-user-data-policy">
 Google API Services User Data Policy</a>, including the Limited Use
 requirements.</p>
-<p>In plain words, your email and calendar information is used only to
+<p>In plain words, information from your Google account is used only to
 provide the features you asked for on the telephone. It is not sold, not
 shared with anyone else, not used for advertising, and not used to train
 artificial intelligence models. Only the people needed to run and support

@@ -960,6 +960,133 @@ def _():
     assert c.get(f"/link/code?account_id={acct_id}").status_code in (401, 403)
 
 
+@check("contacts, Drive and to-do list: asked for, and read only where it should be")
+def _():
+    want = ("contacts", "drive.readonly", "tasks", "gmail.modify", "calendar")
+    for w in want:
+        assert any(sc.endswith("/" + w) for sc in main.SCOPES), \
+            f"not asking Google for {w}"
+    assert not any(sc.endswith("/drive") or sc.endswith("/drive.file")
+                   for sc in main.SCOPES), \
+        "Drive should be read only - the assistant never changes files"
+    assert os.environ.get("OAUTHLIB_RELAX_TOKEN_SCOPE"), \
+        "unticking one box on Google's screen would crash the connection"
+    paths = {r.path for r in main.app.routes}
+    for p in ("/contacts/search", "/contacts/add", "/drive/search",
+              "/drive/read", "/todo", "/todo/add", "/todo/done"):
+        assert p in paths, f"route missing: {p}"
+    src = open("main.py", encoding="utf-8").read()
+    for bad in ("files().delete(", "files().update(", "people().deleteContact("):
+        assert bad not in src, f"something can now {bad} - not allowed"
+
+
+@check("a permission they haven't given comes back as a reason, not a crash")
+def _():
+    """Everyone connected before Contacts/Drive/Tasks were added lacks those
+    permissions. Google refuses; the caller must hear "reconnect to allow
+    that", not "something went wrong"."""
+    import httplib2
+    from fastapi.testclient import TestClient
+    from googleapiclient.errors import HttpError
+    real = main.google_client
+
+    def refusing(body, status=403):
+        def fake(*a, **k):
+            raise HttpError(httplib2.Response({"status": status}), body)
+        return fake
+    c = TestClient(main.app, raise_server_exceptions=False, base_url="https://t")
+    c.headers["Authorization"] = f"Bearer {main.SERVICE_TOKEN}" \
+        if getattr(main, "SERVICE_TOKEN", "") else ""
+    try:
+        main.google_client = refusing(
+            b'{"error":{"details":[{"reason":"ACCESS_TOKEN_SCOPE_INSUFFICIENT"}]}}')
+        r = c.get("/drive/search?account_id=1&words=x")
+        if r.status_code in (401, 403) and r.json().get("detail") not in (
+                "needs_reconnect",):
+            # auth refused before we got there - call the handler directly
+            import asyncio
+            from starlette.requests import Request as SReq
+            req = SReq({"type": "http", "method": "GET", "path": "/drive/search",
+                        "headers": [], "query_string": b""})
+            exc = HttpError(httplib2.Response({"status": 403}),
+                            b"ACCESS_TOKEN_SCOPE_INSUFFICIENT")
+            resp = asyncio.run(main.google_refused(req, exc))
+            assert resp.status_code == 403 and b"needs_reconnect" in resp.body
+            exc = HttpError(httplib2.Response({"status": 403}),
+                            b"People API has not been used in project 1")
+            resp = asyncio.run(main.google_refused(req, exc))
+            assert b"api_not_enabled" in resp.body, resp.body
+        else:
+            assert r.status_code == 403, r.status_code
+            assert r.json()["detail"] == "needs_reconnect", r.text
+    finally:
+        main.google_client = real
+
+
+@check("Drive search can't be broken by a quote, and files read as words")
+def _():
+    seen = {}
+
+    class Call:
+        def __init__(self, out): self.out = out
+        def execute(self): return self.out
+
+    class Files:
+        def list(self, **k):
+            seen.setdefault("q", []).append(k["q"])
+            return Call({"files": []})
+
+    class Svc:
+        def files(self): return Files()
+    real = main.google_client
+    main.google_client = lambda *a, **k: Svc()
+    try:
+        main.tool_drive_search(1, "Moshe's lease")
+    finally:
+        main.google_client = real
+    assert all("Moshe\\'s lease" in q for q in seen["q"]), seen
+    assert any("fullText" in q for q in seen["q"]), \
+        "nothing named that should fall back to searching the contents"
+    # a Word document comes out as words
+    import io as _io, zipfile
+    buf = _io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("word/document.xml", "<w:document><w:p><w:r><w:t>Rent is "
+                   "due on the first &amp; late after the fifth</w:t></w:r>"
+                   "</w:p></w:document>")
+    out = main.document_text(buf.getvalue())
+    assert "Rent is due on the first & late" in out["text"], out
+    assert main.document_text(bytes(range(256)) * 10).get("error"), \
+        "a binary file must not be read out as gibberish"
+    assert main.document_text(b"hello there")["text"] == "hello there"
+
+
+@check("to-do list: dated things first, dates said the way people say them")
+def _():
+    class Call:
+        def __init__(self, out): self.out = out
+        def execute(self): return self.out
+
+    class Tasks:
+        def list(self, **k):
+            return Call({"items": [
+                {"id": "a", "title": "call the plumber"},
+                {"id": "b", "title": "pay gas bill", "due": "2026-09-18T00:00:00.000Z"},
+                {"id": "c", "title": ""}]})
+
+    class Svc:
+        def tasks(self): return Tasks()
+    real = main.google_client
+    main.google_client = lambda *a, **k: Svc()
+    try:
+        out = main.tool_tasks_list(1)
+    finally:
+        main.google_client = real
+    assert [t["title"] for t in out["tasks"]] == ["pay gas bill",
+                                                  "call the plumber"], out
+    assert out["tasks"][0]["due_spoken"] == "Friday, September 18", out
+
+
 @check("the public pages Google verification needs are there")
 def _():
     """Verification wants a privacy policy and terms on a domain you own,
@@ -1457,6 +1584,28 @@ def _():
     for p in ("/email/reply", "/email/forward", "/email/action",
               "/email/attachments", "/email/attachment", "/email/draft"):
         assert p in paths, f"route missing: {p}"
+
+
+@check("the assistant can use contacts, Drive and the to-do list")
+def _():
+    inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                           "+1555", 1)
+    names = {getattr(t, "__name__", "") for t in inst.tools}
+    for t in ("contact_details", "save_contact", "find_in_drive",
+              "read_drive_file", "to_do_list", "add_to_do", "tick_off_to_do"):
+        assert t in names, f"missing: {t}"
+    src = open("agent.py", encoding="utf-8").read()
+    body = src[src.index("async def save_contact("):]
+    body = body[:body.index("\n    @function_tool")]
+    assert body.index("caller_said") < body.index("backend_post"), \
+        "a contact can be saved before they agree"
+    # a missing permission is decided by the reason code
+    class E(Exception):
+        pass
+    e = E("403")
+    e.response = type("R", (), {"text": '{"detail":"needs_reconnect"}'})()
+    assert "connect" in agent.google_refusal(e, "their Drive")
+    assert agent.google_refusal(E("500 boom"), "x") == ""
 
 
 @check("nothing an email tool does is permanent")

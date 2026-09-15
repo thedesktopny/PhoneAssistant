@@ -87,6 +87,22 @@ async def backend_post(path: str, payload: dict, params: dict = None):
         return r.json()
 
 
+def google_refusal(e: Exception, what: str) -> str:
+    """What to tell the caller when Google turned a request down, decided
+    by the reason code the backend sends, not by reading the message."""
+    text = str(e) + (getattr(getattr(e, "response", None), "text", "") or "")
+    if "needs_reconnect" in text:
+        return (f"They haven't given permission for {what} yet - their Google "
+                f"account was connected before that was added. Say so "
+                f"plainly. Offer email_connect_code so it can be connected "
+                f"again with the new permission; everything else keeps "
+                f"working meanwhile.")
+    if "api_not_enabled" in text:
+        return (f"{what} isn't switched on at our end yet. Say sorry, that "
+                f"isn't available yet, and call leave_note_for_office.")
+    return ""
+
+
 async def log_turn(call_id, who, text="", tool="", latency_ms=0):
     if not call_id:
         return
@@ -279,6 +295,8 @@ class Assistant(Agent):
         self.last_search = []
         self._lookups = {}          # question -> how it went, this call
         self.last_email_body = ""
+        self.last_files = []
+        self.last_tasks = []
 
         # %-d is Linux-only and raises on Windows, where check.py is run
         _now = datetime.now(ZoneInfo("America/New_York"))
@@ -471,6 +489,19 @@ CALENDAR
 - Speak times naturally: "Tuesday at two thirty", never ISO timestamps.
 - Today is {today}. Work out relative dates like "tomorrow" or "next Tuesday"
   yourself before calling a tool.
+
+CONTACTS, DOCUMENTS AND THE TO-DO LIST
+- "What's my daughter's number?", "where does he live?", "when is her
+  birthday?" -> contact_details. To add someone new -> save_contact, after
+  reading the name and number back.
+- "Read me the letter from the school", "what does my lease say about..."
+  -> find_in_drive, then read_drive_file with the number they pick. If it
+  might be an email attachment rather than a Drive file, check email too.
+- "What do I need to do?", "remind me to..." -> to_do_list, add_to_do,
+  tick_off_to_do. Work out dates like "Friday" yourself.
+- Drive is READ ONLY. You can't change, delete or share a file - say so.
+- If a tool says they haven't given permission yet, tell them once, offer
+  a connect code to fix it, and carry on with whatever else they wanted.
 
 SAVED LOGINS FOR OTHER SITES
 If they want you to order from a site that needs their account, you can save
@@ -1204,9 +1235,210 @@ Never pick one for them silently.
                 f"waiting in their drafts, not sent.")
 
     @function_tool
+    @auto_report("contacts")
+    async def contact_details(self, context: RunContext, name: str):
+        """Look someone up in the caller's Google Contacts: phone numbers,
+        email, address and birthday. Use for "what's my son's number",
+        "where does Mrs Klein live", "when is Moshe's birthday"."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            d = await backend_get("/contacts/search",
+                                  account_id=self.account_id, name=name,
+                                  which=self.mailbox)
+        except Exception as e:
+            log.error(f"contacts failed: {e}")
+            return (google_refusal(e, "their contacts")
+                    or "The contacts lookup didn't go through.")
+        people = d.get("contacts", [])
+        if not people:
+            return (f"Nobody called {name} in their contacts. Ask them to "
+                    f"say the name another way, or spell it.")
+        lines = []
+        for i, c in enumerate(people, 1):
+            bits = [c.get("name") or "(no name)"]
+            for ph in c.get("phones", []):
+                kind = f" ({ph['type']})" if ph.get("type") else ""
+                bits.append(f"phone {ph['number']}{kind}")
+            if c.get("emails"):
+                bits.append("email " + ", ".join(c["emails"]))
+            if c.get("address"):
+                bits.append("address " + c["address"])
+            if c.get("birthday"):
+                bits.append("birthday " + c["birthday"])
+            lines.append(f"{i}. " + "; ".join(bits))
+        return ("\n".join(lines) + "\nIf more than one could be who they "
+                "mean, ask which. Say phone numbers in groups of digits, "
+                "slowly.")
+
+    @function_tool
+    @auto_report("contacts")
+    async def save_contact(self, context: RunContext, name: str,
+                           phone: str = "", email: str = "",
+                           caller_said: str = ""):
+        """Add a new person to the caller's Google Contacts. Read the name
+        and number back first, and only call with caller_said set to what
+        they answered once they clearly say yes."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        if not (phone.strip() or email.strip()):
+            return "Ask for a phone number or an email address to save."
+        said = (caller_said or "").strip().lower()
+        if not any(w in said for w in ("yes", "yeah", "correct", "right",
+                                       "go ahead", "save", "ok", "sure")):
+            digits = " ".join(ch for ch in phone if ch.isdigit())
+            return (f"Do not save yet. Read back: {name}"
+                    + (f", phone {digits}" if digits else "")
+                    + (f", email {email}" if email else "")
+                    + ". Ask if that's right.")
+        try:
+            await backend_post("/contacts/add", {
+                "account_id": self.account_id, "name": name, "phone": phone,
+                "email": email, "which": self.mailbox})
+        except Exception as e:
+            log.error(f"save contact failed: {e}")
+            return (google_refusal(e, "their contacts")
+                    or "That didn't save.")
+        await log_turn(self.call_id, "tool", f"saved contact {name}",
+                       "save_contact")
+        return f"Saved {name} to their contacts. Tell them."
+
+    @function_tool
+    @auto_report("drive")
+    async def find_in_drive(self, context: RunContext, words: str = ""):
+        """Find a document in the caller's Google Drive, including ones
+        other people shared with them. words is what it's called or what
+        it's about, like "lease" or "school letter". Leave words empty for
+        the most recent files."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            d = await backend_get("/drive/search",
+                                  account_id=self.account_id, words=words,
+                                  which=self.mailbox)
+        except Exception as e:
+            log.error(f"drive search failed: {e}")
+            return (google_refusal(e, "their Google Drive")
+                    or "The Drive search didn't go through.")
+        self.last_files = d.get("files", [])
+        if not self.last_files:
+            return (f"Nothing in their Drive matches '{words}'. Ask what else "
+                    f"it might be called.")
+        lines = []
+        for i, f in enumerate(self.last_files, 1):
+            src = f" from {f['from']}" if f.get("from") else ""
+            lines.append(f"{i}. {f['name']} - a {f['kind']}{src}, changed "
+                         f"{f.get('changed', '')}"
+                         + ("" if f.get("readable") else
+                            " (can't be read aloud)"))
+        return ("\n".join(lines) + "\nTell them what you found by name and "
+                "ask which one to read. Use read_drive_file with its number.")
+
+    @function_tool
+    @auto_report("drive")
+    async def read_drive_file(self, context: RunContext, which: int,
+                              looking_for: str = "what it says"):
+        """Read one of the files find_in_drive just listed, by its number."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        if not self.last_files:
+            return "Call find_in_drive first."
+        if which < 1 or which > len(self.last_files):
+            return f"Pick a number from 1 to {len(self.last_files)}."
+        f = self.last_files[which - 1]
+        try:
+            d = await backend_get("/drive/read", account_id=self.account_id,
+                                  file_id=f["id"], which=self.mailbox)
+        except Exception as e:
+            log.error(f"drive read failed: {e}")
+            return (google_refusal(e, "their Google Drive")
+                    or "Couldn't open that file.")
+        text = (d.get("text") or "").strip()
+        if not text:
+            return (f"Couldn't read {f['name']}: "
+                    f"{d.get('error', 'no words in it')}. Say so plainly.")
+        await log_turn(self.call_id, "tool", f"read drive file {f['name']}",
+                       "read_drive_file")
+        return (f"{f['name']} says: {text[:3000]} -- Answer from THIS text "
+                f"only, in plain spoken words. They asked about: "
+                f"{looking_for}. If it isn't in here, say so. Don't read "
+                f"out long tables; sum them up and offer detail.")
+
+    @function_tool
+    @auto_report("tasks")
+    async def to_do_list(self, context: RunContext):
+        """What's on the caller's to-do list (Google Tasks) that isn't done."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            d = await backend_get("/todo", account_id=self.account_id,
+                                  which=self.mailbox)
+        except Exception as e:
+            log.error(f"tasks failed: {e}")
+            return (google_refusal(e, "their to-do list")
+                    or "Couldn't get the to-do list.")
+        self.last_tasks = d.get("tasks", [])
+        if not self.last_tasks:
+            return "Their to-do list is empty. Tell them."
+        lines = []
+        for i, t in enumerate(self.last_tasks, 1):
+            due = f" - by {t['due_spoken']}" if t.get("due_spoken") else ""
+            lines.append(f"{i}. {t['title']}{due}")
+        return ("\n".join(lines) + "\nRead these out plainly. Today is "
+                + datetime.now(ZoneInfo("America/New_York")).strftime("%A")
+                + ". Mention anything overdue first.")
+
+    @function_tool
+    @auto_report("tasks")
+    async def add_to_do(self, context: RunContext, title: str,
+                        due_date: str = "", notes: str = ""):
+        """Put something on the caller's to-do list. due_date is YYYY-MM-DD
+        if they gave a day - work out "Friday" yourself. Say back what you
+        added."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            d = await backend_post("/todo/add", {
+                "account_id": self.account_id, "title": title,
+                "due_date": due_date, "notes": notes, "which": self.mailbox})
+        except Exception as e:
+            log.error(f"add task failed: {e}")
+            return (google_refusal(e, "their to-do list")
+                    or "That didn't get added.")
+        await log_turn(self.call_id, "tool", f"to-do added: {title}",
+                       "add_to_do")
+        due = f" for {d['due_spoken']}" if d.get("due_spoken") else ""
+        return f"Added '{title}'{due}. Tell them it's on the list."
+
+    @function_tool
+    @auto_report("tasks")
+    async def tick_off_to_do(self, context: RunContext, which: int):
+        """Mark one item from the to-do list you just read out as done."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        if not self.last_tasks:
+            return "Call to_do_list first."
+        if which < 1 or which > len(self.last_tasks):
+            return f"Pick a number from 1 to {len(self.last_tasks)}."
+        t = self.last_tasks[which - 1]
+        try:
+            await backend_post("/todo/done", {}, params={
+                "account_id": self.account_id, "task_id": t["id"],
+                "which": self.mailbox})
+        except Exception as e:
+            log.error(f"task done failed: {e}")
+            return (google_refusal(e, "their to-do list")
+                    or "That didn't get ticked off.")
+        await log_turn(self.call_id, "tool", f"to-do done: {t['title']}",
+                       "tick_off_to_do")
+        return f"Ticked off '{t['title']}'. Tell them."
+
+    @function_tool
     @auto_report("email")
     async def find_contact(self, context: RunContext, name: str):
-        """Look up someone's email address from past correspondence."""
+        """Find someone's EMAIL ADDRESS to write to: their contacts first,
+        then people they've emailed. For phone numbers, addresses or
+        birthdays use contact_details instead."""
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
         try:
