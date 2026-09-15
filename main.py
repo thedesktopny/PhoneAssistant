@@ -107,6 +107,11 @@ SCOPES = [
     "openid",
 ]
 
+# STORED_TOKEN_SCOPES: a saved token is never refreshed with SCOPES
+# attached. A refresh that names scopes asks Google for all of them, and
+# Google refuses outright if the customer never granted one - adding
+# Contacts, Drive and Tasks to SCOPES broke every existing mailbox, email
+# included. Refreshing without scopes returns whatever they did grant.
 # Google lets people untick individual boxes on the consent screen. When
 # they do, the token comes back with fewer scopes than we asked for, and
 # oauthlib treats that as an error and throws - the customer would get a
@@ -842,7 +847,7 @@ def gmail_client(account_id: int, which: str = ""):
         token_uri="https://oauth2.googleapis.com/token",
         client_id=GOOGLE_CLIENT_ID,
         client_secret=GOOGLE_CLIENT_SECRET,
-        scopes=SCOPES,
+        scopes=None,    # see STORED_TOKEN_SCOPES
     )
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
@@ -1417,7 +1422,7 @@ def google_client(account_id: int, api: str, version: str, which: str = ""):
         token_uri="https://oauth2.googleapis.com/token",
         client_id=GOOGLE_CLIENT_ID,
         client_secret=GOOGLE_CLIENT_SECRET,
-        scopes=SCOPES,
+        scopes=None,    # see STORED_TOKEN_SCOPES
     )
     return build(api, version, credentials=creds, cache_discovery=False)
 
@@ -6625,7 +6630,7 @@ def token_permissions(request: Request, account_id: int = 0):
                 refresh_token=tok.get("refresh_token"),
                 token_uri="https://oauth2.googleapis.com/token",
                 client_id=GOOGLE_CLIENT_ID,
-                client_secret=GOOGLE_CLIENT_SECRET, scopes=SCOPES)
+                client_secret=GOOGLE_CLIENT_SECRET, scopes=None)
             from google.auth.transport.requests import Request as GReq
             creds.refresh(GReq())
             req = urllib.request.Request(

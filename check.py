@@ -980,6 +980,24 @@ def _():
         assert bad not in src, f"something can now {bad} - not allowed"
 
 
+@check("adding a permission doesn't break everyone already connected")
+def _():
+    """Credentials were built with scopes=SCOPES. A refresh then asks Google
+    for every scope on the list, and Google refuses the whole refresh if
+    the customer never granted one. Adding Contacts, Drive and Tasks made
+    every existing connection fail - reading email included."""
+    src = open("main.py", encoding="utf-8").read()
+    body = src[src.index("def token_permissions("):]
+    for chunk in (src[src.index("def gmail_client("):
+                      src.index("def gmail_client(") + 900],
+                  src[src.index("def google_client("):
+                      src.index("def google_client(") + 900],
+                  body[:3000]):
+        assert "scopes=SCOPES" not in chunk,             "a stored token is refreshed while demanding every scope"
+    # Flow is the one place SCOPES belongs: that's the consent request
+    assert "Flow.from_client_config(cfg, scopes=SCOPES" in src
+
+
 @check("a permission they haven't given comes back as a reason, not a crash")
 def _():
     """Everyone connected before Contacts/Drive/Tasks were added lacks those
