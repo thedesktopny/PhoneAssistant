@@ -310,6 +310,11 @@ def login_failure_line(site: str, reason: str, msg: str, fails: int,
     if reason == "no_code":
         return (f"Nobody read a code out, so {site} timed us out. Offer to "
                 f"start again when they have the code in front of them.")
+    if reason == "no_results":
+        return (f"The {site} page opened but nothing readable came back. Say "
+                f"exactly that - do NOT say they have no orders, and do NOT "
+                f"say the item doesn't exist. Offer to try again or to look "
+                f"somewhere else.")
     if reason == "cancelled":
         return "That was stopped because the call ended."
     if reason == "stuck":

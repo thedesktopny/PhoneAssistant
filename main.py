@@ -3919,6 +3919,9 @@ def _do_site_login(jid: int, account_id: int, site: str):
                     _save_context(account_id, site.lower(), ctx_id)
                 _job_set(jid, "done",
                          f"Signed in to {site} and saved the session.")
+                record_change(account_id, "login", "signed in",
+                              f"signed in to {site} and saved the session "
+                              f"so it isn't needed again")
             else:
                 seen = page_text(page, 1500) or ""
                 if q(page, cfg["otp_sel"]) or CODE_BAD.search(seen):
@@ -3969,6 +3972,33 @@ SEARCH_PAGES = {
 }
 
 
+# A shop page starts with a hundred menu items. Handing the first 1800
+# characters to the model means handing it "Alexa Skills, Amazon Autos,
+# Amazon Devices..." - so it reported, honestly enough, that it could not
+# find anything. Read more of the page and let the summariser find the
+# part that answers the question.
+NAV_NOISE = _re_scrub.compile(
+    r"(?i)(skip to main content|all departments|alexa skills|"
+    r"customer service|registry|gift cards|sell on |your account|"
+    r"hello, sign in|deliver to|shop by category)")
+
+
+def page_answer(page, question: str, limit: int = 9000) -> tuple:
+    """(answer, raw) for one loaded page. The answer is empty when the page
+    genuinely doesn't say - never menu text dressed up as a result."""
+    raw = page_text(page, limit)
+    if not (raw or "").strip():
+        return "", ""
+    answer = _summarise_page(raw, question)
+    if not answer or "NOTHING_RELEVANT" in answer:
+        return "", raw
+    # a "summary" that is only chrome is not an answer
+    words = [w for w in answer.split() if len(w) > 2]
+    if len(words) < 6 or len(NAV_NOISE.findall(answer)) >= 2:
+        return "", raw
+    return answer, raw
+
+
 def _run_site_orders(jid: int, account_id: int, site: str):
     """Read the customer's recent orders from a site they're signed into."""
     from playwright.sync_api import sync_playwright
@@ -3998,7 +4028,17 @@ def _run_site_orders(jid: int, account_id: int, site: str):
                          reason="signed_out")
                 browser.close()
                 return
-            _job_set(jid, "done", page_text(page, 1800))
+            settle(page, 2500)          # let the list actually render
+            answer, raw = page_answer(page, "their recent orders: what was "
+                                            "ordered, when, and the status")
+            if answer:
+                _job_set(jid, "done", answer)
+            else:
+                _job_set(jid, "failed",
+                         f"The {site} orders page opened but didn't show any "
+                         f"orders we could read. Say that, rather than that "
+                         f"they have no orders.",
+                         reason="no_results")
             if ctx_id:
                 _save_context(account_id, site, ctx_id)
             browser.close()
@@ -4039,14 +4079,31 @@ def _run_site_search(jid: int, account_id: int, site: str):
             browser, page, ctx_id = _open_with_session(p, account_id, site)
             _job_set(jid, "opening", f"Searching {site} for {query}.")
             do_goto(page, base + urllib.parse.quote_plus(query), 5000)
-            result = page_text(page, 1800)
-            if looks_signed_out(result):
+            settle(page, 2500)          # results load after the shell
+            answer, raw = page_answer(
+                page, f"the best few matches for '{query}', with prices")
+            if looks_signed_out(raw or ""):
                 _job_set(jid, "failed",
                          f"{site} wants them signed in before it will "
-                         f"search. Sign in to {site} first.")
+                         f"search. Sign in to {site} first.",
+                         reason="signed_out")
                 browser.close()
                 return
-            _job_set(jid, "done", result)
+            if looks_like_bot_check(raw or ""):
+                _job_set(jid, "failed",
+                         f"{site} is asking for a human check.",
+                         reason="bot_check")
+                browser.close()
+                return
+            if not answer:
+                _job_set(jid, "failed",
+                         f"The {site} search page opened but no results came "
+                         f"back that we could read. Say that, rather than "
+                         f"that the item doesn't exist.",
+                         reason="no_results")
+                browser.close()
+                return
+            _job_set(jid, "done", answer)
             if ctx_id:
                 _save_context(account_id, site, ctx_id)
             browser.close()
@@ -5717,7 +5774,9 @@ def call_state(account_id: int, call_id: int = 0) -> dict:
     for j in q.order_by(Job.id.desc()).limit(6).all():
         row = {"job_id": j.id, "what": j.kind, "site": j.site,
                "state": j.state, "reason": j.reason or "",
-               "message": (j.message or "")[:300]}
+               # what the page actually said, so "what does it say?" has an
+               # answer instead of "the page content isn't known"
+               "message": (j.message or "")[:900]}
         if j.state in ("done", "failed"):
             out["finished"].append(row)
         else:

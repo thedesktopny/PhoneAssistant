@@ -1514,6 +1514,47 @@ def _():
         assert "record_change(" in body, f"{fn} leaves no record"
 
 
+@check("menu text is never reported to a caller as 'nothing found'")
+def _():
+    """Call 59: the Amazon orders page and a product search both handed
+    back the first 1800 characters of the page - the menus - so the caller
+    was told he had no orders and that the paper didn't exist. He had
+    both, and he knew it."""
+    real = main._summarise_page
+    nav = ("Skip to main content Deliver to Spring Valley All Departments "
+           "Alexa Skills Amazon Autos Amazon Devices Amazon Fresh Customer "
+           "Service Registry Gift Cards Sell on Amazon Your Account")
+
+    class FakePage:
+        def __init__(self, text): self.text = text
+    real_text = main.page_text
+    try:
+        main.page_text = lambda page, limit=0: page.text
+        # the summariser honestly finds nothing in a page of menus
+        main._summarise_page = lambda text, q: "NOTHING_RELEVANT"
+        answer, raw = main.page_answer(FakePage(nav), "their recent orders")
+        assert answer == "", f"menu text came back as an answer: {answer!r}"
+        assert raw, "the raw page should still be available"
+        # a summariser that parrots the menus is caught too
+        main._summarise_page = lambda text, q: nav[:120]
+        assert main.page_answer(FakePage(nav), "orders")[0] == "",             "a summary made of menu items was accepted"
+        # a real answer gets through
+        main._summarise_page = lambda text, q: (
+            "Two orders: a printer cable delivered Tuesday, and copy paper "
+            "arriving Friday for $41.99.")
+        got, _ = main.page_answer(FakePage("...orders..."), "orders")
+        assert "copy paper" in got, got
+    finally:
+        main._summarise_page = real
+        main.page_text = real_text
+    src = open("main.py", encoding="utf-8").read()
+    for fn in ("def _run_site_orders(", "def _run_site_search("):
+        body = src[src.index(fn):]
+        body = body[:body.index(chr(10) + "def ", 10)]
+        assert "page_answer(" in body, f"{fn} still reports raw page text"
+        assert 'reason="no_results"' in body,             f"{fn} can't tell 'nothing readable' from 'nothing there'"
+
+
 @check("the public pages Google verification needs are there")
 def _():
     """Verification wants a privacy policy and terms on a domain you own,
@@ -2271,6 +2312,13 @@ def _():
         b = src[i:j if j > 0 else len(src)]
         assert "ask_advisor" not in b, \
             f"{fn} must not take its go-ahead from the advisor"
+
+
+@check("'nothing readable' is never told to a caller as 'you have none'")
+def _():
+    line = agent.login_failure_line("amazon", "no_results", "m", 0, "u@x.com")
+    assert "do NOT say they have no orders" in line, line
+    assert "doesn't exist" in line, line
 
 
 @check("nothing an email tool does is permanent")
