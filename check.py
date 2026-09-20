@@ -1634,6 +1634,10 @@ def _():
     # the scan budget must be spent on controls we can use, not on the
     # thousands of hidden menu links a shop keeps at the top of its page
     assert "cand.length >= 600" in js,         "a page of hidden menus can exhaust the budget before the products"
+    # sixty identical "Add to cart" buttons must not crowd out sixty
+    # different product names
+    assert "dupes.has(key)" in js and "dupes.add(key)" in js,         "duplicates are still removed after ranking, not before"
+    assert js.index("dupes.has(key)") < js.index("cand.sort"),         "duplicates must go before the ranking, or they fill every slot"
     assert "seen > 1500" not in js, "the old budget is still there"
     src = open("main.py", encoding="utf-8").read()
     assert "_page_snapshot(page, want=goal)" in src, \

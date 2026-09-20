@@ -4185,6 +4185,7 @@ _SNAPSHOT_JS = r"""
               '[role=link], [role=combobox], [contenteditable="true"]';
   const typed = ['input', 'textarea', 'select'];
   const cand = [];
+  const dupes = new Set();
   let seen = 0;
   for (const el of document.querySelectorAll(sel)) {
     // Amazon keeps thousands of hidden menu links at the TOP of the page.
@@ -4219,6 +4220,12 @@ _SNAPSHOT_JS = r"""
     if (el.closest('main, [role=main], form, [id*=cart], [id*=checkout]'))
       score += 2;
     if (r.top >= 0 && r.top < 1400) score += 1;
+    // One "Add to cart" button per product means sixty identical entries.
+    // They outranked the product names, filled every slot, and were then
+    // collapsed into one - leaving ten things on a page of hundreds.
+    const key = tag + '|' + type + '|' + label.toLowerCase();
+    if (dupes.has(key)) continue;
+    dupes.add(key);
     cand.push({el: el, order: cand.length, score: score,
                tag: tag, type: type, label: label});
   }
