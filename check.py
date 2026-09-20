@@ -1346,6 +1346,75 @@ def _():
     assert n >= 40, f"only {n} tools"
 
 
+@check("the PIN is checked against the database, not a default")
+def _():
+    """/accounts has never returned a "pin" key, but verify_pin compared
+    against self.account.get("pin", "1234") - so the fallback ran on every
+    call and anyone who said 1234 was let into somebody else's mailbox.
+    Every other fixture here hands the Assistant a pin, which is exactly
+    why nothing caught it: the tests had a key production never receives.
+    This one builds the account dict the way find_account() really does."""
+    import asyncio
+    from fastapi.testclient import TestClient
+    src = open("agent.py", encoding="utf-8").read()
+    assert 'self.account.get("pin"' not in src, \
+        ("verify_pin is reading a PIN off the account dict again - "
+         "/accounts never sends one, so the fallback becomes the real PIN")
+    assert '"/accounts/verify_pin"' in src, \
+        "verify_pin is not asking the backend to compare the PIN"
+    c = TestClient(main.app, raise_server_exceptions=False,
+                   base_url="https://t")
+    c.post("/admin/login", json={"password": os.environ.get(
+        "ADMIN_PASSWORD", "changeme")})
+    db = main.Session()
+    acct = main.Account(name="Pin Tester", pin="8675")
+    db.add(acct)
+    db.commit()
+    db.refresh(acct)
+    acct_id = acct.id
+    db.add(main.PhoneNumber(number="+18455550188", account_id=acct_id))
+    db.commit()
+    db.close()
+
+    real = next(r for r in c.get("/accounts").json()
+                if r["account_id"] == acct_id)
+    assert "pin" not in real, "/accounts must never hand a PIN to the agent"
+
+    saved = agent.backend_post
+
+    async def fake_post(path, payload, params=None):
+        r = c.post(path, json=payload, params=params)
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    def pin_tool(inst):
+        return next(t for t in inst.tools
+                    if getattr(t, "__name__", "") == "verify_pin")
+
+    agent.backend_post = fake_post
+    try:
+        inst = agent.Assistant(real, "+18455550188", 1)
+        said = asyncio.run(pin_tool(inst)(None, "1234"))
+        assert said.startswith("PIN incorrect"), \
+            f"the old default still opens the gate: {said}"
+        assert not inst.verified, "a wrong PIN set verified"
+
+        said = asyncio.run(pin_tool(inst)(None, "8675"))
+        assert said.startswith("PIN correct"), \
+            f"the PIN in the database was refused: {said}"
+        assert inst.verified, "the right PIN did not verify the caller"
+
+        other = agent.Assistant(real, "+18455550188", 2)
+        asyncio.run(pin_tool(other)(None, "1111"))
+        assert not other.verified, "any four digits got through"
+
+        blank = agent.Assistant(real, "+18455550188", 3)
+        asyncio.run(pin_tool(blank)(None, ""))
+        assert not blank.verified, "an empty PIN got through"
+    finally:
+        agent.backend_post = saved
+
+
 @check("no assignment to a read-only LiveKit property (the ring-out bug)")
 def _():
     from livekit.agents import Agent

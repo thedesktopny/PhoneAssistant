@@ -5821,6 +5821,37 @@ def list_accounts(request: Request, q: str = ""):
     return rows
 
 
+class PinCheck(BaseModel):
+    account_id: int
+    pin: str
+
+
+@app.post("/accounts/verify_pin")
+def verify_account_pin(b: PinCheck, request: Request):
+    """Say whether a spoken PIN matches, without ever sending it out.
+
+    The agent gets a yes or a no and nothing else. Doing the comparison
+    here keeps the PIN out of the voice process, and out of /accounts -
+    which has never returned one, so the agent's own fallback of "1234"
+    was the value every caller was checked against.
+    """
+    require_auth(request)
+    db = Session()
+    acct = db.query(Account).filter_by(id=b.account_id).first()
+    stored = (acct.pin or "") if acct else ""
+    db.close()
+    if not stored:
+        return {"ok": False}
+    import hmac
+    said = "".join(ch for ch in (b.pin or "") if ch.isdigit())
+    ok = bool(said) and hmac.compare_digest(said, stored)
+    if not ok:
+        # What was said stays out of the log; that it was refused doesn't.
+        emit("call", f"account {b.account_id}", "PIN refused", "warn",
+             account_id=b.account_id)
+    return {"ok": ok}
+
+
 @app.get("/mailboxes")
 def mailboxes(request: Request, account_id: int):
     require_auth(request)

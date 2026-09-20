@@ -959,14 +959,15 @@ Never pick one for them silently.
     @function_tool
     async def verify_pin(self, context: RunContext, pin: str):
         """Check the caller's PIN. Must be called before any email action."""
+        # Compared on the backend, never here. /accounts does not carry a
+        # "pin" key, so this used to fall back to "1234" for every caller.
         try:
-            data = await backend_get("/accounts")
+            r = await backend_post("/accounts/verify_pin", {
+                "account_id": self.account_id, "pin": pin})
         except Exception as e:
-            log.error(f"pin lookup failed: {e}")
+            log.error(f"pin check failed: {e}")
             return "Could not verify right now."
-        digits = "".join(ch for ch in pin if ch.isdigit())
-        expected = str(self.account.get("pin", "1234"))
-        if digits == expected:
+        if r.get("ok"):
             self.verified = True
             return "PIN correct. The caller is verified."
         return "PIN incorrect."
