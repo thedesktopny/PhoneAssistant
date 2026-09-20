@@ -1477,6 +1477,43 @@ def _():
         "calls are only reviewed when someone asks by hand"
 
 
+@check("the office can see everything done on a customer's behalf")
+def _():
+    """The live log carries every step of every job and scrolls away. A
+    person asking "what did it do for my mother today?" needs a short list
+    in plain words, with no password or card number in it."""
+    from fastapi.testclient import TestClient
+    c = TestClient(main.app, raise_server_exceptions=False, base_url="https://t")
+    c.post("/admin/login", json={"password": os.environ.get(
+        "ADMIN_PASSWORD", "changeme")})
+    main.record_change(1, "email", "sent", "sent to a@b.com: \"the rent\"",
+                       call_id=4242)
+    main.record_change(1, "payment", "charged", "charged $12.50 to Visa "
+                       "ending 4242", undo="refundable from Stripe")
+    rows = c.get("/changes?limit=10").json()
+    assert rows and rows[0]["detail"].startswith("charged"), rows[:1]
+    assert rows[0]["undo"], "no note about whether it can be undone"
+    assert any(r["call_id"] == 4242 for r in rows), "not tied to the call"
+    assert c.get("/changes?area=email").json()[0]["area"] == "email"
+    # it goes through the scrubber like everything else
+    main.record_change(1, "login", "saved", "the password is Hunter22")
+    assert "Hunter22" not in c.get("/changes?limit=3").text
+    # and the office has somewhere to look
+    html = c.get("/admin").text
+    for bit in ("p-changes", "p-reviews", "loadChanges", "loadReviews",
+                "What it did", "Call checks"):
+        assert bit in html, f"admin panel is missing {bit}"
+    # the money and email paths actually record something
+    src = open("main.py", encoding="utf-8").read()
+    for fn in ("def test_send(", "def email_reply(", "def email_action(",
+               "def cal_create(", "def contacts_add(", "def todo_add(",
+               "def logins_save(", "def _drive_did(", "def stripe_charge("):
+        body = src[src.index(fn):]
+        body = body[:body.index(chr(10) + "def ", 10) if chr(10) + "def "
+                    in body[10:] else len(body)][:2500]
+        assert "record_change(" in body, f"{fn} leaves no record"
+
+
 @check("the public pages Google verification needs are there")
 def _():
     """Verification wants a privacy policy and terms on a domain you own,

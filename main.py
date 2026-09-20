@@ -378,6 +378,22 @@ class Usage(Base):
     breakdown = Column(Text, default="")
 
 
+class Change(Base):
+    """Everything done on a customer's behalf: an email sent, a file
+    changed, a card charged. The live log carries every step of every job
+    and scrolls away in minutes; this is the short list a person can read,
+    kept so the office can answer "what did it do for my mother today?"."""
+    __tablename__ = "changes"
+    id = Column(Integer, primary_key=True)
+    at = Column(DateTime, default=datetime.utcnow)
+    account_id = Column(Integer, ForeignKey("accounts.id"), nullable=True)
+    call_id = Column(Integer, nullable=True)
+    area = Column(String(20), default="")     # email/drive/contacts/...
+    what = Column(String(40), default="")     # sent/replied/created/charged
+    detail = Column(Text, default="")         # in plain words
+    undo = Column(String(200), default="")    # how to put it back, if it can
+
+
 class Event(Base):
     """Live log: every step of every job, sign-in, order and failure."""
     __tablename__ = "events"
@@ -600,6 +616,21 @@ def scrub(text: str) -> str:
         else:
             out = pat.sub("[number removed]", out)
     return out
+
+
+def record_change(account_id, area: str, what: str, detail: str,
+                  call_id=None, undo: str = ""):
+    """One line the office can read later. Never raises, never holds a
+    password or card number - scrub() runs over it like everything else."""
+    try:
+        db = Session()
+        db.add(Change(account_id=account_id, call_id=call_id,
+                      area=area[:20], what=what[:40],
+                      detail=scrub(detail or "")[:1000], undo=undo[:200]))
+        db.commit()
+        db.close()
+    except Exception:
+        pass
 
 
 def emit(kind: str, ref: str, text: str, level: str = "info",
@@ -5244,6 +5275,8 @@ def stripe_save_finished(session_id: str) -> dict:
     out = {"brand": brand, "last4": row.last4, "new": True,
            "account_id": account_id}
     db.close()
+    record_change(account_id, "card", "saved",
+                  f"added a {brand} ending {out['last4']} on the card page")
     emit("cards", "saved", f"card saved at Stripe ({brand} {out['last4']})",
          "info", account_id)
     return out
@@ -5288,6 +5321,11 @@ def stripe_charge(account_id: int, card_id: int, cents: int,
                                 f"{reason}", "warn", account_id)
         return {"charged": False, "reason": reason, "message": e.message}
     ok = pi.get("status") == "succeeded"
+    if ok:
+        record_change(account_id, "payment", "charged",
+                      f"charged ${cents / 100:.2f} to {card.brand} ending "
+                      f"{card.last4} for {what_for[:120]}",
+                      undo="refundable from the Stripe dashboard")
     emit("cards", "charge",
          f"{'charged' if ok else 'charge ' + pi.get('status', '')} "
          f"${cents / 100:.2f} on {card.brand} {card.last4}: {what_for[:80]}",
@@ -6357,6 +6395,8 @@ def link_callback(request: Request):
     db.commit()
     db.close()
 
+    record_change(account_id, "mailbox", "connected",
+                  f"connected {email or 'a Google account'}")
     emit("signin", "connected", f"mailbox connected: {email}", "info",
          account_id)
     return HTMLResponse(connected(email))
@@ -6399,6 +6439,9 @@ def email_reply(b: ReplyBody, request: Request):
     require_auth(request)
     out = tool_reply_email(b.account_id, b.msg_id, b.body, b.which,
                            b.all_recipients)
+    record_change(b.account_id, "email", "replied",
+                  f"replied to {out.get('to', '')} about "
+                  f"\"{out.get('subject', '')}\"")
     emit("email", "reply", f"replied to {out.get('to', '')}", "info",
          b.account_id)
     return out
@@ -6416,6 +6459,8 @@ class ForwardBody(BaseModel):
 def email_forward(b: ForwardBody, request: Request):
     require_auth(request)
     out = tool_forward_email(b.account_id, b.msg_id, b.to, b.note, b.which)
+    record_change(b.account_id, "email", "forwarded",
+                  f"forwarded \"{out.get('subject', '')}\" to {b.to}")
     emit("email", "forward", f"forwarded to {b.to}", "info", b.account_id)
     return out
 
@@ -6431,7 +6476,10 @@ class DraftBody(BaseModel):
 @app.post("/email/draft")
 def email_draft(b: DraftBody, request: Request):
     require_auth(request)
-    return tool_draft_email(b.account_id, b.to, b.subject, b.body, b.which)
+    out = tool_draft_email(b.account_id, b.to, b.subject, b.body, b.which)
+    record_change(b.account_id, "email", "drafted",
+                  f"saved a draft to {b.to}: \"{b.subject}\" (not sent)")
+    return out
 
 
 @app.post("/email/action")
@@ -6444,6 +6492,9 @@ def email_action(request: Request, account_id: int, msg_ids: str,
     if not ids:
         raise HTTPException(400, "No messages given.")
     out = tool_message_action(account_id, ids, action, which)
+    record_change(account_id, "email", action,
+                  f"{action} on {out.get('changed', len(ids))} message(s)",
+                  undo=out.get("undo", ""))
     emit("email", action, f"{action} on {len(ids)} message(s)", "info",
          account_id)
     return out
@@ -6542,6 +6593,10 @@ def contacts_add(b: NewContact, request: Request):
     if not b.name.strip() or not (b.phone.strip() or b.email.strip()):
         raise HTTPException(400, "A name and a phone number or email needed.")
     out = tool_contact_add(b.account_id, b.name, b.phone, b.email, b.which)
+    record_change(b.account_id, "contacts", "saved",
+                  f"saved {b.name}"
+                  + (f", {b.phone}" if b.phone else "")
+                  + (f", {b.email}" if b.email else ""))
     emit("contacts", "saved", f"contact saved: {b.name}", "info",
          b.account_id)
     return out
@@ -6594,8 +6649,11 @@ class FileBody(BaseModel):
 
 
 def _drive_did(account_id: int, what: str):
-    """Every change to a customer's files goes in the live log."""
+    """Every change to a customer's files is recorded, in the live log for
+    debugging and in the change list for a person to read."""
     emit("drive", "changed", what[:300], "info", account_id)
+    record_change(account_id, "drive", what.split(":")[0][:40], what,
+                  undo="Google keeps the file's own version history")
 
 
 @app.post("/drive/doc/create")
@@ -6704,14 +6762,23 @@ def todo_add(b: NewTask, request: Request):
     require_auth(request)
     if not b.title.strip():
         raise HTTPException(400, "What is the task?")
-    return tool_task_add(b.account_id, b.title, b.due_date, b.notes, b.which)
+    out = tool_task_add(b.account_id, b.title, b.due_date, b.notes, b.which)
+    record_change(b.account_id, "to-do", "added",
+                  f"added \"{b.title}\""
+                  + (f" for {out.get('due_spoken')}"
+                     if out.get("due_spoken") else ""))
+    return out
 
 
 @app.post("/todo/done")
 def todo_done(request: Request, account_id: int, task_id: str,
               done: bool = True, which: str = ""):
     require_auth(request)
-    return tool_task_done(account_id, task_id, done, which)
+    out = tool_task_done(account_id, task_id, done, which)
+    record_change(account_id, "to-do", "ticked off" if done else "reopened",
+                  f"{out.get('title', 'a task')}",
+                  undo="can be reopened")
+    return out
 
 
 @app.get("/test/contact")
@@ -6997,6 +7064,27 @@ def calls_review(request: Request, call_id: int):
     return review_call(call_id)
 
 
+@app.get("/changes")
+def changes_list(request: Request, account_id: int = 0, limit: int = 100,
+                 area: str = ""):
+    """Everything done on customers' behalf, newest first."""
+    require_auth(request)
+    db = Session()
+    q = db.query(Change)
+    if account_id:
+        q = q.filter_by(account_id=account_id)
+    if area:
+        q = q.filter_by(area=area)
+    rows = q.order_by(Change.id.desc()).limit(min(limit, 500)).all()
+    names = {a.id: a.name for a in db.query(Account).all()}
+    out = [{"id": r.id, "at": local_str(r.at), "account_id": r.account_id,
+            "who": names.get(r.account_id, ""), "call_id": r.call_id,
+            "area": r.area, "what": r.what, "detail": r.detail,
+            "undo": r.undo} for r in rows]
+    db.close()
+    return out
+
+
 @app.get("/reviews")
 def reviews_list(request: Request, limit: int = 20):
     """What the reviewer found, newest first."""
@@ -7121,7 +7209,11 @@ class LoginBody2(BaseModel):
 @app.post("/logins")
 def logins_save(b: LoginBody2, request: Request):
     require_auth(request)
-    return save_site_login(b.account_id, b.site, b.username, b.password)
+    out = save_site_login(b.account_id, b.site, b.username, b.password)
+    record_change(b.account_id, "login", "saved",
+                  f"saved the {b.site} login for {b.username} "
+                  f"(password encrypted, never shown)")
+    return out
 
 
 @app.get("/logins")
@@ -7965,6 +8057,8 @@ def card_add(b: CardBody, request: Request):
         blob = vault_put({"stripe_pm": held["id"]})
         brand, last4 = held["brand"], held["last4"]
         exp = held["exp"] or b.exp[:7]
+        record_change(b.account_id, "card", "saved",
+                      f"saved a {brand} ending {last4}")
         emit("cards", "saved", f"card held by Stripe ({brand} {last4})",
              "info", b.account_id)
     else:
@@ -8286,6 +8380,8 @@ class NewEvent(BaseModel):
 @app.post("/cal/create")
 def cal_create(e: NewEvent, request: Request):
     require_auth(request)
+    record_change(e.account_id, "calendar", "booked",
+                  f"{e.title} on {e.start_iso[:16].replace('T', ' at ')}")
     return tool_create_event(e.account_id, e.title, e.start_iso,
                              e.minutes, e.location, e.notes)
 
@@ -8293,7 +8389,10 @@ def cal_create(e: NewEvent, request: Request):
 @app.post("/cal/cancel")
 def cal_cancel(request: Request, account_id: int, event_id: str):
     require_auth(request)
-    return tool_cancel_event(account_id, event_id)
+    out = tool_cancel_event(account_id, event_id)
+    record_change(account_id, "calendar", "cancelled",
+                  "cancelled a calendar entry")
+    return out
 
 
 class SendBody(BaseModel):
@@ -8307,7 +8406,10 @@ class SendBody(BaseModel):
 @app.post("/test/send")
 def test_send(s: SendBody, request: Request):
     require_auth(request)
-    return tool_send_email(s.account_id, s.to, s.subject, s.body, s.which)
+    out = tool_send_email(s.account_id, s.to, s.subject, s.body, s.which)
+    record_change(s.account_id, "email", "sent",
+                  f"sent to {s.to}: \"{s.subject}\"")
+    return out
 
 
 # ----------------------------------------------------------------- admin
@@ -8385,6 +8487,8 @@ ADMIN_HTML = """<!doctype html>
   <h1>Phone Assistant</h1>
   <nav>
     <a data-p="live">Live</a>
+    <a data-p="changes">What it did</a>
+    <a data-p="reviews">Call checks</a>
     <a data-p="costs">Costs</a>
     <a data-p="overview" class="on">Overview</a>
     <a data-p="calls">Calls</a>
@@ -8400,6 +8504,47 @@ ADMIN_HTML = """<!doctype html>
     .then(()=>location.reload())">Sign out</button>
 </header>
 <main>
+
+<section class="page" id="p-changes">
+  <div class="card"><h2>What the assistant did for customers</h2>
+    <div class="hint">Every email sent, file changed, card charged, contact
+      saved. In plain words, newest first. Passwords and card numbers never
+      appear here.</div>
+    <label style="display:inline-block;margin:8px 14px 8px 0">Show
+      <select id="charea" style="width:auto;margin-left:6px"
+              onchange="loadChanges()">
+        <option value="">everything</option>
+        <option value="email">email</option>
+        <option value="drive">documents</option>
+        <option value="calendar">calendar</option>
+        <option value="contacts">contacts</option>
+        <option value="to-do">to-do list</option>
+        <option value="payment">payments</option>
+        <option value="card">cards</option>
+        <option value="login">logins</option>
+        <option value="mailbox">mailboxes</option>
+      </select></label>
+    <button class="sec" onclick="loadChanges()">Refresh</button>
+    <table><thead><tr><th>When</th><th>Who</th><th>What</th>
+    <th>Details</th><th>Call</th><th>Can it be undone?</th></tr></thead>
+    <tbody id="chrows"><tr><td colspan="6" class="hint">Loading&hellip;</td></tr>
+    </tbody></table>
+  </div>
+</section>
+
+<section class="page" id="p-reviews">
+  <div class="card"><h2>Calls the system checked itself</h2>
+    <div class="hint">After every call, the assistant's own words are read
+      back against what actually happened. Anything it said that the record
+      doesn't support is listed here, so nobody has to ring in to report
+      it.</div>
+    <button class="sec" onclick="loadReviews()">Refresh</button>
+    <table><thead><tr><th>When</th><th>Call</th><th>Who</th>
+    <th>What it found</th></tr></thead>
+    <tbody id="rvrows"><tr><td colspan="4" class="hint">Loading&hellip;</td></tr>
+    </tbody></table>
+  </div>
+</section>
 
 <section class="page" id="p-costs">
   <div class="card"><h2>What calls cost</h2>
@@ -8598,6 +8743,8 @@ document.querySelectorAll('nav a').forEach(function(a){
     document.querySelectorAll('.page').forEach(function(s){
       s.classList.remove('on'); });
     document.getElementById('p-'+a.dataset.p).classList.add('on');
+    if(a.dataset.p === 'changes') loadChanges();
+    if(a.dataset.p === 'reviews') loadReviews();
   };
 });
 
@@ -8760,7 +8907,44 @@ async function loadAlerts(){
         '</div>'; }).join('');
   }catch(e){}
 }
-async function loadFu(){
+async var chArea = "";
+function loadChanges(){
+  var sel = document.getElementById('charea');
+  chArea = sel ? sel.value : "";
+  fetch('/changes?limit=200' + (chArea ? '&area=' + chArea : ''))
+    .then(function(r){ return r.json(); })
+    .then(function(rows){
+      var b = document.getElementById('chrows');
+      if(!rows.length){ b.innerHTML =
+        '<tr><td colspan="6" class="hint">Nothing yet.</td></tr>'; return; }
+      b.innerHTML = rows.map(function(c){
+        return '<tr><td>' + esc(c.at) + '</td>' +
+          '<td>' + esc(c.who || ('#' + (c.account_id||''))) + '</td>' +
+          '<td><span class="tag">' + esc(c.area) + '</span> ' +
+            esc(c.what) + '</td>' +
+          '<td>' + esc(c.detail) + '</td>' +
+          '<td>' + (c.call_id ? esc(c.call_id) : '') + '</td>' +
+          '<td class="hint">' + esc(c.undo || '') + '</td></tr>';
+      }).join('');
+    });
+}
+function loadReviews(){
+  fetch('/reviews?limit=50').then(function(r){ return r.json(); })
+    .then(function(rows){
+      var b = document.getElementById('rvrows');
+      if(!rows.length){ b.innerHTML =
+        '<tr><td colspan="4" class="hint">No calls flagged.</td></tr>';
+        return; }
+      b.innerHTML = rows.map(function(r){
+        return '<tr><td>' + esc(r.at) + '</td>' +
+          '<td>' + esc(r.call_id || '') + '</td>' +
+          '<td>' + esc(r.account_id || '') + '</td>' +
+          '<td><pre style="margin:0;max-height:200px">' +
+            esc(r.note) + '</pre></td></tr>';
+      }).join('');
+    });
+}
+function loadFu(){
   const tb = document.getElementById('furows');
   try{
     const d = await (await fetch('/followups?include_done='+
