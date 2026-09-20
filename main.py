@@ -7783,9 +7783,21 @@ def job_answer(request: Request, job_id: int, question: str = ""):
         return {"state": "done",
                 "answer": ("They are signed in now. Say so, then start what "
                            "they originally asked for again.")}
-    asked = question or ("their recent orders" if row.kind == "site_orders"
-                         else "the search results")
-    answer = _summarise_page(row.message or "", asked)
+    # These runners already store a spoken-length answer. Summarising a
+    # summary is how a search that really did find three house numbers was
+    # read back to the caller as "I couldn't get any results" - the second
+    # pass had nothing left to work with and said so.
+    answer = (row.message or "").strip()
+    if len(answer) > 1200 or answer.count(" ") > 220:
+        asked = question or ("their recent orders"
+                             if row.kind == "site_orders"
+                             else "the search results")
+        answer = _summarise_page(answer, asked)
+    if "NOTHING_RELEVANT" in answer:
+        return {"state": "done",
+                "answer": ("The page opened but nothing readable came back. "
+                           "Say that - do not say they have none and do not "
+                           "say it doesn't exist.")}
     if is_blocked(answer):
         return {"state": "done", "answer": BLOCKED_REPLY}
     return {"state": "done", "answer": answer}

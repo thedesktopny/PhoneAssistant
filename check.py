@@ -1744,6 +1744,55 @@ def _():
     assert back.endswith("expired. "), back[-40:]
 
 
+@check("a search that worked is not read back as a failure")
+def _():
+    """Call 60: a second search really did find three solar house numbers,
+    and the caller was told "I couldn't get more results". The runner now
+    stores a spoken answer, and /jobs/answer was summarising that summary
+    again - the second pass had nothing left and said so."""
+    from fastapi.testclient import TestClient
+    c = TestClient(main.app, raise_server_exceptions=False, base_url="https://t")
+    c.post("/admin/login", json={"password": os.environ.get(
+        "ADMIN_PASSWORD", "changeme")})
+    found = ("Here are a few options: ISUNMEA 9 Inch Solar Lighted House "
+             "Number for $22.99, DIBMS 9 inch for $22.99, and CARPESUN for "
+             "$22.99, all delivered tomorrow.")
+    db = main.Session()
+    job = main.Job(account_id=1, kind="site_search", site="amazon",
+                   state="done", message=found)
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    jid = job.id
+    db.close()
+    hit = {"n": 0}
+    real = main._summarise_page
+
+    def counted(text, q):
+        hit["n"] += 1
+        return "NOTHING_RELEVANT"
+    try:
+        main._summarise_page = counted
+        got = c.get("/jobs/answer?job_id=%d&question=the search" % jid).json()
+        assert got["answer"] == found, got
+        assert hit["n"] == 0, "it summarised an answer that was already one"
+        # a genuinely raw page still gets summarised
+        db = main.Session()
+        raw = main.Job(account_id=1, kind="site_orders", site="amazon",
+                       state="done", message="word " * 400)
+        db.add(raw)
+        db.commit()
+        db.refresh(raw)
+        rid = raw.id
+        db.close()
+        got = c.get("/jobs/answer?job_id=%d" % rid).json()
+        assert hit["n"] == 1, "raw page text was passed on unsummarised"
+        assert "nothing readable" in got["answer"], got
+        assert "doesn't exist" in got["answer"], got
+    finally:
+        main._summarise_page = real
+
+
 @check("the public pages Google verification needs are there")
 def _():
     """Verification wants a privacy policy and terms on a domain you own,
