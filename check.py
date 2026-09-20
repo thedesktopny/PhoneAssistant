@@ -1500,8 +1500,9 @@ def _():
     assert "Hunter22" not in c.get("/changes?limit=3").text
     # and the office has somewhere to look
     html = c.get("/admin").text
-    for bit in ("p-changes", "p-reviews", "loadChanges", "loadReviews",
-                "What it did", "Call checks"):
+    for bit in ("p-changes", "p-reviews", "p-know", "loadChanges",
+                "loadReviews", "loadKnow", "saveKnow",
+                "What it did", "Call checks", "Who they are"):
         assert bit in html, f"admin panel is missing {bit}"
     # the money and email paths actually record something
     src = open("main.py", encoding="utf-8").read()

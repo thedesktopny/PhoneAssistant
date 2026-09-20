@@ -7260,6 +7260,22 @@ def calls_review(request: Request, call_id: int):
     return review_call(call_id)
 
 
+@app.get("/profiles")
+def profiles_list(request: Request, limit: int = 100):
+    """What we know about every customer, for the office to read."""
+    require_auth(request)
+    db = Session()
+    names = {a.id: a.name for a in db.query(Account).all()}
+    rows = (db.query(Profile).order_by(Profile.updated.desc())
+              .limit(min(limit, 300)).all())
+    out = [{"account_id": r.account_id, "who": names.get(r.account_id, ""),
+            "notes": r.notes or "", "by_hand": r.by_hand or "",
+            "updated": local_str(r.updated) if r.updated else ""}
+           for r in rows]
+    db.close()
+    return out
+
+
 @app.get("/profile")
 def profile_get(request: Request, account_id: int):
     """What we know about one customer."""
@@ -8732,6 +8748,7 @@ ADMIN_HTML = """<!doctype html>
     <a data-p="live">Live</a>
     <a data-p="changes">What it did</a>
     <a data-p="reviews">Call checks</a>
+    <a data-p="know">Who they are</a>
     <a data-p="costs">Costs</a>
     <a data-p="overview" class="on">Overview</a>
     <a data-p="calls">Calls</a>
@@ -8772,6 +8789,18 @@ ADMIN_HTML = """<!doctype html>
     <th>Details</th><th>Call</th><th>Can it be undone?</th></tr></thead>
     <tbody id="chrows"><tr><td colspan="6" class="hint">Loading&hellip;</td></tr>
     </tbody></table>
+  </div>
+</section>
+
+<section class="page" id="p-know">
+  <div class="card"><h2>What we know about each customer</h2>
+    <div class="hint">Built up after every call: how they need to be spoken
+      to, who their people are, what they order. The assistant reads this
+      before it speaks to them. Passwords and PINs are never kept here.
+      Anything you write in "the office says" is yours - the system never
+      overwrites it, and it is read first.</div>
+    <button class="sec" onclick="loadKnow()">Refresh</button>
+    <div id="knowrows" class="hint">Loading&hellip;</div>
   </div>
 </section>
 
@@ -8988,6 +9017,7 @@ document.querySelectorAll('nav a').forEach(function(a){
     document.getElementById('p-'+a.dataset.p).classList.add('on');
     if(a.dataset.p === 'changes') loadChanges();
     if(a.dataset.p === 'reviews') loadReviews();
+    if(a.dataset.p === 'know') loadKnow();
   };
 });
 
@@ -9170,6 +9200,42 @@ function loadChanges(){
           '<td class="hint">' + esc(c.undo || '') + '</td></tr>';
       }).join('');
     });
+}
+function loadKnow(){
+  fetch('/profiles?limit=100').then(function(r){ return r.json(); })
+    .then(function(rows){
+      var b = document.getElementById('knowrows');
+      if(!rows.length){ b.innerHTML =
+        'Nothing learned yet. It fills in after calls.'; return; }
+      b.innerHTML = rows.map(function(p){
+        return '<div class="card" style="margin-top:14px">' +
+          '<h2 style="font-size:16px">' + esc(p.who || ('#'+p.account_id)) +
+          ' <span class="hint" style="font-weight:400">updated ' +
+          esc(p.updated) + '</span></h2>' +
+          '<div class="hint">From earlier calls</div>' +
+          '<pre style="max-height:200px">' +
+          esc(p.notes || '(nothing yet)') + '</pre>' +
+          '<div class="hint" style="margin-top:10px">The office says' +
+          ' &mdash; the assistant reads this first</div>' +
+          '<textarea id="byhand' + p.account_id + '" rows="4" ' +
+          'style="width:100%;background:#0f1115;color:#e6e6e6;border:' +
+          '1px solid #262b36;border-radius:6px;padding:10px;' +
+          'font-size:14px">' + esc(p.by_hand) + '</textarea>' +
+          '<button class="sec" style="margin-top:8px" onclick="saveKnow(' +
+          p.account_id + ')">Save</button>' +
+          '<span class="msg" id="knowmsg' + p.account_id + '"></span>' +
+          '</div>';
+      }).join('');
+    });
+}
+function saveKnow(id){
+  var box = document.getElementById('byhand' + id);
+  var msg = document.getElementById('knowmsg' + id);
+  fetch('/profile', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({account_id:id, by_hand:box.value})})
+    .then(function(r){ msg.textContent = r.ok ? ' Saved.' : ' Did not save.';
+                       setTimeout(function(){ msg.textContent=''; }, 2500); });
 }
 function loadReviews(){
   fetch('/reviews?limit=50').then(function(r){ return r.json(); })
