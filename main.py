@@ -8015,6 +8015,35 @@ def browser_peek(request: Request, url: str, account_id: int = 0,
                         product_links: product,
                         body_text: (document.body.innerText || '').length};
             }""") or {}
+            # where the snapshot loses them, step by step
+            out["stages"] = page_eval(page, """() => {
+                const sel = 'a, button, input, textarea, select, ' +
+                  '[role=button], [role=link], [role=combobox], ' +
+                  '[contenteditable="true"]';
+                const typed = ['input', 'textarea', 'select'];
+                let matched = 0, sized = 0, shown = 0, labelled = 0;
+                for (const el of document.querySelectorAll(sel)) {
+                  matched++;
+                  const r = el.getBoundingClientRect();
+                  if (!r.width || !r.height) continue;
+                  sized++;
+                  const st = getComputedStyle(el);
+                  if (st.visibility === 'hidden' || st.display === 'none')
+                    continue;
+                  shown++;
+                  const tag = el.tagName.toLowerCase();
+                  let label = el.getAttribute('aria-label')
+                    || el.getAttribute('placeholder')
+                    || (el.innerText || '').trim()
+                    || el.getAttribute('name') || el.getAttribute('value')
+                    || el.getAttribute('title') || '';
+                  if (!label && !typed.includes(tag)) continue;
+                  labelled++;
+                }
+                return {matched: matched, with_size: sized,
+                        not_hidden: shown, with_label: labelled};
+            }""") or {}
+            out["snapshot_all"] = len(_page_snapshot(page, limit=999)[0])
             out["landed_on"] = page_url(page)
             out["text_length"] = len(text or "")
             out["text_start"] = (text or "")[:400]
