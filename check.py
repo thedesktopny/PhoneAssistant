@@ -1620,6 +1620,44 @@ def _():
     assert "learn_about_caller" in body, "the notes are only kept by hand"
 
 
+@check("a page is ranked before it is shown, so the button is in the list")
+def _():
+    """Job 88: it found the copy paper, opened it, then never found "Add to
+    Cart". A page was handed over as the first 60 things on it in the
+    page's own order, and Amazon's menu is more than 60 things."""
+    js = main._SNAPSHOT_JS
+    for must in ("add to (cart|basket|bag)", "check ?out", "score",
+                 "nav, header, footer", "cand.sort", "slice(0, limit)"):
+        assert must in js, f"the page is still taken in page order: {must}"
+    assert "args.limit" in js and "args.want" in js, \
+        "the goal's own words don't count towards what is shown"
+    src = open("main.py", encoding="utf-8").read()
+    assert "_page_snapshot(page, want=goal)" in src, \
+        "the browse loop doesn't tell the page reader what it is after"
+    body = src[src.index("def _page_snapshot("):]
+    body = body[:body.index(chr(10) + "def ", 10)]
+    assert 'page_eval(page, _SNAPSHOT_JS, {"limit"' in body
+    # ranking runs in the browser, so check the scoring by reading it back
+    for start, want in (("tag === 'button'", "+= 4"),
+                        ("typed.includes(tag)) score", "+= 3"),
+                        ("nav, header, footer", "-= 4")):
+        i = js.index(start)
+        assert want in js[i:i + 220], (start, want)
+
+
+@check("a page that ignores us doesn't cost the customer their login")
+def _():
+    """Being stuck threw the saved session away. The next call then needed
+    a fresh sign-in and another code read out over the phone - for what was
+    usually a button we simply hadn't seen."""
+    src = open("main.py", encoding="utf-8").read()
+    i = src.rindex("if stuck >= STUCK_LIMIT:")
+    block = src[i:i + 900]
+    assert "looks_signed_out(text)" in block, \
+        "a stuck page still wipes a good login"
+    assert "_forget_context(account_id, site_key)" in block
+
+
 @check("the public pages Google verification needs are there")
 def _():
     """Verification wants a privacy policy and terms on a domain you own,

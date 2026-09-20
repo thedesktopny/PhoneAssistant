@@ -4174,14 +4174,17 @@ Rules:
   plain names, prices and dates. Never include a URL."""
 
 
-_SNAPSHOT_JS = """
-(limit) => {
+_SNAPSHOT_JS = r"""
+(args) => {
+  const limit = args.limit, want = (args.want || '').toLowerCase();
+  const words = want.split(/[^a-z0-9]+/).filter(w => w.length > 3);
   const sel = 'a, button, input, textarea, select, [role=button], ' +
               '[role=link], [role=combobox], [contenteditable="true"]';
   const typed = ['input', 'textarea', 'select'];
-  const out = [];
+  const cand = [];
+  let seen = 0;
   for (const el of document.querySelectorAll(sel)) {
-    if (out.length >= limit) break;
+    if (++seen > 1500) break;
     const r = el.getBoundingClientRect();
     if (!r.width || !r.height) continue;
     const st = getComputedStyle(el);
@@ -4190,18 +4193,41 @@ _SNAPSHOT_JS = """
     let label = el.getAttribute('aria-label') || el.getAttribute('placeholder')
       || (el.innerText || '').trim() || el.getAttribute('name')
       || el.getAttribute('value') || el.getAttribute('title') || '';
-    label = label.replace(/\\s+/g, ' ').slice(0, 70);
+    label = label.replace(/\s+/g, ' ').slice(0, 70);
     if (!label && !typed.includes(tag)) continue;
-    const type = el.getAttribute('type') || '';
-    el.setAttribute('data-pa-idx', String(out.length));
-    out.push({tag: tag, type: type, label: label});
+    const type = (el.getAttribute('type') || '').toLowerCase();
+
+    // What matters on a shop page is buried under a hundred menu links,
+    // so rank rather than take the first ones in the page's own order.
+    let score = 0;
+    if (tag === 'button' || el.getAttribute('role') === 'button'
+        || type === 'submit' || type === 'button') score += 4;
+    if (typed.includes(tag)) score += 3;
+    const low = label.toLowerCase();
+    if (/add to (cart|basket|bag)|buy now|check ?out|place .*order|continue|proceed|sign in|log in|search|save|next|submit|apply|pay/
+        .test(low)) score += 4;
+    if (words.some(w => low.includes(w))) score += 3;
+    if (el.closest('nav, header, footer, [role=navigation], [role=banner], ' +
+                   '[role=contentinfo]')) score -= 4;
+    if (el.closest('main, [role=main], form, [id*=cart], [id*=checkout]'))
+      score += 2;
+    if (r.top >= 0 && r.top < 1400) score += 1;
+    cand.push({el: el, order: cand.length, score: score,
+               tag: tag, type: type, label: label});
+  }
+  cand.sort((a, b) => b.score - a.score || a.order - b.order);
+  const keep = cand.slice(0, limit).sort((a, b) => a.order - b.order);
+  const out = [];
+  for (const c of keep) {
+    c.el.setAttribute('data-pa-idx', String(out.length));
+    out.push({tag: c.tag, type: c.type, label: c.label});
   }
   return out;
 }
 """
 
 
-def _page_snapshot(page, limit: int = 60):
+def _page_snapshot(page, limit: int = 80, want: str = ""):
     """Page text plus a numbered list of things you can interact with.
 
     This used to ask the browser about each element one at a time - is it
@@ -4209,8 +4235,14 @@ def _page_snapshot(page, limit: int = 60):
     element. On a big shop that took over two minutes for a single step,
     and often timed out with an empty list, so the model was choosing
     numbers for elements that weren't there. Now the browser does the whole
-    job once and hands back the finished list."""
-    raw = page_eval(page, _SNAPSHOT_JS, limit) or []
+    job once and hands back the finished list.
+
+    It used to hand back the first 60 things in the page's own order. On
+    Amazon that is the menu - Alexa Skills, Amazon Autos, Amazon Fresh -
+    so "Add to Cart" never appeared and the model pressed things at random
+    until it was declared stuck. The page is ranked now: buttons and boxes
+    first, words from the goal next, menus and footers last."""
+    raw = page_eval(page, _SNAPSHOT_JS, {"limit": limit, "want": want}) or []
     items, seen = [], set()
     for i, it in enumerate(raw):
         tag = it.get("tag", "")
@@ -4676,7 +4708,7 @@ def _run_browse(jid: int, account_id: int, site: str):
                     _job_set(jid, "failed", "The caller hung up.",
                              reason="cancelled")
                     break
-                items, text = _page_snapshot(page)
+                items, text = _page_snapshot(page, want=goal)
                 if looks_like_bot_check(text):
                     if spares:
                         nxt = spares.pop(0)
@@ -4805,9 +4837,14 @@ def _run_browse(jid: int, account_id: int, site: str):
                     stuck += 1
                     history.append(_stuck_note(stuck))
                     if stuck >= STUCK_LIMIT:
-                        # drop the saved identity: a stale one is a common
-                        # reason a site quietly ignores everything
-                        fresh = _forget_context(account_id, site_key)
+                        # A stale identity is one reason a site ignores
+                        # everything - but so is a button we never saw.
+                        # Throwing the session away costs the customer
+                        # another sign-in and another code read out over
+                        # the phone, so only do it when the page itself
+                        # says they are signed out.
+                        fresh = (_forget_context(account_id, site_key)
+                                 if looks_signed_out(text) else False)
                         _job_set(jid, "failed",
                                  f"The page stopped responding to anything "
                                  f"it tried"
@@ -4986,7 +5023,9 @@ def _run_checkout(jid: int, account_id: int, site: str):
                     _job_set(jid, "failed", "The caller hung up.",
                              reason="cancelled")
                     break
-                items, text = _page_snapshot(page, limit=80)
+                items, text = _page_snapshot(
+                    page, limit=80,
+                    want=f"{spec.get('item', '')} add to cart checkout")
                 shot = page_shot(page) if BROWSER_VISION else ""
                 act = decide(page_url(page), text, items, history, shot)
                 a = act.get("action")
