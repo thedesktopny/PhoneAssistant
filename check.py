@@ -1722,6 +1722,28 @@ def _():
     assert '"may_buy": False' in body,         "the checkout step could buy something"
 
 
+@check("a long answer isn't cut off before the caller hears it")
+def _():
+    """A list of saved Amazon addresses stopped mid-word, and a list of
+    cards stopped at "Visa ending 6125, expi". Every job answer was being
+    cut to 500 characters on its way into the database."""
+    long_answer = "Visa ending 1234, not expired. " * 40      # ~1200 chars
+    db = main.Session()
+    job = main.Job(account_id=1, kind="browse", site="amazon",
+                   state="working")
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    jid = job.id
+    db.close()
+    main._job_set(jid, "done", long_answer)
+    db = main.Session()
+    back = db.query(main.Job).filter_by(id=jid).first().message
+    db.close()
+    assert len(back) > 900, f"cut to {len(back)} characters"
+    assert back.endswith("expired. "), back[-40:]
+
+
 @check("the public pages Google verification needs are there")
 def _():
     """Verification wants a privacy policy and terms on a domain you own,

@@ -2873,7 +2873,7 @@ def _ob_set(sid: int, state: str, message: str = "", reason: str = ""):
     row = db.query(Onboard).filter_by(id=sid).first()
     if row:
         row.state = state
-        row.message = message[:500]
+        row.message = message[:2000]
         row.reason = reason[:40]
         stamp = datetime.utcnow().strftime("%H:%M:%S")
         line = f"[{stamp}] {state}: {message[:300]}"
@@ -3615,7 +3615,10 @@ def _job_set(jid: int, state: str, message: str = "", reason: str = ""):
     row = db.query(Job).filter_by(id=jid).first()
     if row:
         row.state = state
-        row.message = message[:500]
+        # 500 characters silently cut every answer that was a list: the
+        # saved Amazon addresses stopped mid-word, and a list of cards
+        # stopped at "Visa ending 6125, expi". The column is TEXT.
+        row.message = message[:4000]
         row.reason = reason[:40]
         stamp = datetime.utcnow().strftime("%H:%M:%S")
         row.history = ((row.history or "") +
