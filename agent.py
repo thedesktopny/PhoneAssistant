@@ -110,6 +110,12 @@ def google_refusal(e: Exception, what: str) -> str:
     """What to tell the caller when Google turned a request down, decided
     by the reason code the backend sends, not by reading the message."""
     text = str(e) + (getattr(getattr(e, "response", None), "text", "") or "")
+    if "connection_expired" in text:
+        return ("Their Google connection has expired, so nothing in their "
+                "email or calendar can be reached until it is connected "
+                "again. This is not their fault and nothing is lost. Say so "
+                "plainly, then offer email_connect_code so someone with "
+                "internet can reconnect it, or leave_note_for_office.")
     if "needs_reconnect" in text:
         return (f"They haven't given permission for {what} yet - their Google "
                 f"account was connected before that was added. Say so "
@@ -1001,7 +1007,8 @@ Never pick one for them silently.
                 which=mailbox or self.mailbox, primary_only=primary_only)
         except Exception as e:
             log.error(f"unread failed: {e}")
-            return "I couldn't reach the mailbox just now."
+            return (google_refusal(e, "their email")
+                    or "I couldn't reach the mailbox just now.")
 
         self.last_list = data.get("messages", [])
         await log_turn(self.call_id, "tool", "unread check",
@@ -1031,7 +1038,8 @@ Never pick one for them silently.
                 which=self.mailbox)
         except Exception as e:
             log.error(f"read failed: {e}")
-            return "I couldn't open that message."
+            return (google_refusal(e, "their email")
+                    or "I couldn't open that message.")
         body = " ".join((data.get("body") or "").split())[:1500]
         self.last_email_body = " ".join((data.get("body") or "").split())
         return (f"From {data.get('from')}. Subject {data.get('subject')}. "
@@ -1059,7 +1067,8 @@ Never pick one for them silently.
                                      which=mailbox or self.mailbox)
         except Exception as e:
             log.error(f"search failed: {e}")
-            return "The search didn't go through."
+            return (google_refusal(e, "their email")
+                    or "The search didn't go through.")
 
         msgs = data.get("messages", [])
         if not msgs:
@@ -1094,7 +1103,8 @@ Never pick one for them silently.
                                      newest_first=True)
         except Exception as e:
             log.error(f"recent failed: {e}")
-            return "I couldn't reach the mailbox just now."
+            return (google_refusal(e, "their email")
+                    or "I couldn't reach the mailbox just now.")
         msgs = data.get("messages", [])
         if not msgs:
             return "Nothing in the inbox at all."
@@ -3069,7 +3079,8 @@ Never pick one for them silently.
                                      account_id=self.account_id, days=days)
         except Exception as e:
             log.error(f"calendar failed: {e}")
-            return "I couldn't reach the calendar."
+            return (google_refusal(e, "their email")
+                    or "I couldn't reach the calendar.")
         evs = data.get("events", [])
         if not evs:
             return "Nothing scheduled in that window."

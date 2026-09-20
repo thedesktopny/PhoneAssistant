@@ -6173,6 +6173,20 @@ def test_search(request: Request, account_id: int, q: str, limit: int = 5,
 
 
 from googleapiclient.errors import HttpError
+from google.auth.exceptions import RefreshError
+
+
+@app.exception_handler(RefreshError)
+async def google_token_dead(request: Request, exc: RefreshError):
+    """Google has stopped honouring the saved permission - revoked, or the
+    seven-day limit that applies while the app is unverified. Every email
+    and calendar tool used to answer this with a 500, which the assistant
+    reads out as "something went wrong"."""
+    emit("google", request.url.path,
+         "the Google connection has expired - the customer has to connect "
+         "again", "warn")
+    return JSONResponse({"detail": "connection_expired", "status": 401},
+                        status_code=403)
 
 
 @app.exception_handler(HttpError)

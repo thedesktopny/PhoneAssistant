@@ -75,7 +75,17 @@ def call(path, method="GET", body=None, **params):
         if e.code == 401:
             raise SetupProblem(
                 "the backend refused the token (401)") from None
-        raise
+        if e.code == 403:
+            body = e.read().decode("utf-8", "ignore")
+            if "connection_expired" in body:
+                raise SetupProblem(
+                    "the mailbox connection to Google has expired (this "
+                    "happens after 7 days while the app is unverified) - "
+                    "reconnect it at /connect and run this again") from None
+            e = urllib.error.HTTPError(e.url, e.code, e.reason, e.headers,
+                                       None)
+            e.read = lambda _b=body: _b.encode()
+        raise e
     return json.loads(raw) if raw else {}
 
 

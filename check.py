@@ -2025,6 +2025,29 @@ def _():
         "a wrong code must not send it back to asking for the password"
 
 
+@check("an expired Google connection is explained, not reported as a crash")
+def _():
+    """20 Sep: both mailboxes hit Google's 7-day limit for unverified apps.
+    Every email call answered 500, which the assistant reads out as
+    "something went wrong" instead of "it needs connecting again"."""
+    import asyncio
+    from google.auth.exceptions import RefreshError
+    from starlette.requests import Request as SReq
+    req = SReq({"type": "http", "method": "GET", "path": "/test/unread",
+                "headers": [], "query_string": b""})
+    resp = asyncio.run(main.google_token_dead(
+        req, RefreshError("invalid_grant: Token has been expired or revoked.")))
+    assert resp.status_code == 403 and b"connection_expired" in resp.body
+    line = agent.google_refusal(
+        Exception('{"detail":"connection_expired"}'), "their email")
+    assert "expired" in line and "email_connect_code" in line, line
+    src = open("agent.py", encoding="utf-8").read()
+    for fn in ("check_email", "recent_email", "search_email"):
+        body = src[src.index(f"async def {fn}("):]
+        body = body[:body.index(chr(10) + "    @function_tool")]
+        assert "google_refusal" in body, f"{fn} has no reconnect message"
+
+
 @check("nothing an email tool does is permanent")
 def _():
     """A caller cannot see what just happened, so every action has to be
