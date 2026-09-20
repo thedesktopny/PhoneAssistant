@@ -4241,6 +4241,17 @@ _SNAPSHOT_JS = r"""
 """
 
 
+def _body_mark(page) -> str:
+    """A fingerprint of what a page is showing. Deliberately ignores the
+    first part: every page on a shop starts with the same menu, and
+    comparing that told us nothing had happened when the whole page had
+    just changed."""
+    import hashlib
+    body = page_text(page, 6000) or ""
+    return hashlib.md5(body[600:4000].encode("utf-8",
+                                             "ignore")).hexdigest()
+
+
 def _page_snapshot(page, limit: int = 80, want: str = ""):
     """Page text plus a numbered list of things you can interact with.
 
@@ -4788,6 +4799,7 @@ def _run_browse(jid: int, account_id: int, site: str):
                              reason="bot_check")
                     break
                 shot = page_shot(page) if BROWSER_VISION else ""
+                url_before, body_before = page_url(page), _body_mark(page)
                 act = _decide(goal, page_url(page), text, items, history,
                               hint, shot, account_id, call_id)
                 a = act.get("action")
@@ -4910,9 +4922,15 @@ def _run_browse(jid: int, account_id: int, site: str):
                     sigs.clear()
                     continue
 
-                # Did any of that actually do something?
-                after = (page_url(page), page_text(page, 200))
-                if after == (page_url(page), text[:200]) or                         after[1] == text[:200]:
+                # Did any of that actually do something? The first 200
+                # characters of a shop page are its menu and never change,
+                # so "nothing happened" was reported after a search, after
+                # opening a product, and after going back - three real
+                # steps in a row, and the job was declared stuck.
+                was_url, was_body = url_before, body_before
+                now_url = page_url(page)
+                now_body = _body_mark(page)
+                if now_url == was_url and now_body == was_body:
                     stuck += 1
                     history.append(_stuck_note(stuck))
                     if stuck >= STUCK_LIMIT:

@@ -1816,6 +1816,33 @@ def _():
     assert "len(items) >= 15" in block and "settle(page" in block, block[:200]
 
 
+@check("a real step is not mistaken for getting nowhere")
+def _():
+    """Call 60 and jobs 101-106: it searched, opened a product, went back -
+    three real steps - and was told each time that nothing had happened,
+    because "did the page change?" compared the first 200 characters, and
+    on a shop those are the same menu on every page."""
+    class FakePage:
+        def __init__(self, text): self.text = text
+    real = main.page_text
+    menu = "Skip to main content Deliver to All Departments Alexa Skills " * 12
+    try:
+        main.page_text = lambda page, limit=0: page.text
+        results = menu + "ISUNMEA 9 Inch Solar Lighted House Numbers $22.99 "
+        product = menu + "DIBMS 9 inch Solar House Numbers, 4.3 stars, $22.99 "
+        a = main._body_mark(FakePage(results + "x" * 2000))
+        b = main._body_mark(FakePage(product + "y" * 2000))
+        assert a != b, "two different pages look identical to the detector"
+        assert a == main._body_mark(FakePage(results + "x" * 2000)),             "the same page looks different each time it is read"
+    finally:
+        main.page_text = real
+    src = open("main.py", encoding="utf-8").read()
+    body = src[src.index("def _run_browse("):]
+    body = body[:body.index(chr(10) + "def ", 10)]
+    assert "page_text(page, 200)" not in body,         "it still decides from the menu at the top of the page"
+    assert "_body_mark(page)" in body and "url_before" in body
+
+
 @check("the public pages Google verification needs are there")
 def _():
     """Verification wants a privacy policy and terms on a domain you own,
