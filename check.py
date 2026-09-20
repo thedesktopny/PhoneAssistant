@@ -1631,6 +1631,10 @@ def _():
         assert must in js, f"the page is still taken in page order: {must}"
     assert "args.limit" in js and "args.want" in js, \
         "the goal's own words don't count towards what is shown"
+    # the scan budget must be spent on controls we can use, not on the
+    # thousands of hidden menu links a shop keeps at the top of its page
+    assert "cand.length >= 600" in js,         "a page of hidden menus can exhaust the budget before the products"
+    assert "seen > 1500" not in js, "the old budget is still there"
     src = open("main.py", encoding="utf-8").read()
     assert "_page_snapshot(page, want=goal)" in src, \
         "the browse loop doesn't tell the page reader what it is after"
