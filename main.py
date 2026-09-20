@@ -4187,7 +4187,11 @@ _SNAPSHOT_JS = r"""
   const cand = [];
   let seen = 0;
   for (const el of document.querySelectorAll(sel)) {
-    if (++seen > 1500) break;
+    // Amazon keeps thousands of hidden menu links at the TOP of the page.
+    // A budget counted over everything scanned was spent entirely on those,
+    // and the visible page was never reached: "the page offers 7 things you
+    // can use" on a shop full of products. Count what we can actually use.
+    if (cand.length >= 600 || ++seen > 12000) break;
     const r = el.getBoundingClientRect();
     if (!r.width || !r.height) continue;
     const st = getComputedStyle(el);
