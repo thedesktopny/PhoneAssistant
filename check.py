@@ -1637,6 +1637,10 @@ def _():
     # sixty identical "Add to cart" buttons must not crowd out sixty
     # different product names
     assert "dupes.has(key)" in js and "dupes.add(key)" in js,         "duplicates are still removed after ranking, not before"
+    # markers from the last look must go, or a number can point at
+    # something from the previous screen
+    assert "removeAttribute('data-pa-idx')" in js,         "old element numbers are never cleared"
+    assert js.index("removeAttribute('data-pa-idx')") <         js.index("setAttribute('data-pa-idx'"),         "old numbers are cleared after the new ones are set"
     assert js.index("dupes.has(key)") < js.index("cand.sort"),         "duplicates must go before the ranking, or they fill every slot"
     assert "seen > 1500" not in js, "the old budget is still there"
     src = open("main.py", encoding="utf-8").read()

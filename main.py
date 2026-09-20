@@ -4184,6 +4184,13 @@ _SNAPSHOT_JS = r"""
   const sel = 'a, button, input, textarea, select, [role=button], ' +
               '[role=link], [role=combobox], [contenteditable="true"]';
   const typed = ['input', 'textarea', 'select'];
+  // Clear the markers left by the last look at this page. A page that
+  // only partly redraws - or a page we came BACK to - kept its old
+  // numbers, so [12] could still match something from the previous
+  // screen: the click landed on the wrong thing, or on nothing, and the
+  // model concluded the product page "wasn't opening properly".
+  for (const old of document.querySelectorAll('[data-pa-idx]'))
+    old.removeAttribute('data-pa-idx');
   const cand = [];
   const dupes = new Set();
   let seen = 0;
