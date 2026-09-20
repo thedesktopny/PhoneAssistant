@@ -1881,6 +1881,36 @@ def _():
     assert "if findings:" in body[i - 600:i],         "notes are thrown away when the steps run out"
 
 
+@check("nothing may claim it did something it never did")
+def _():
+    """Job 115 on Best Buy: a saved shortcut for "product_price" was
+    replayed for a goal that said add to cart and check out. One search box
+    was typed into, and the answer came back "the item successfully went
+    into the cart. At checkout the site asks you to sign in." Neither had
+    happened."""
+    for doing in ("add one to the cart", "proceed to checkout",
+                  "sign in and check my orders", "send it to my son",
+                  "book me an appointment", "place the order"):
+        assert main.DOING_GOAL.search(doing), f"treated as a lookup: {doing}"
+    for looking in ("what does copy paper cost", "when do they close",
+                    "how do I clean the filter", "what is my balance"):
+        assert not main.DOING_GOAL.search(looking),             f"a plain lookup can no longer use a saved shortcut: {looking}"
+    for pretending in ("The item successfully went into the cart.",
+                       "I have added it to your basket.",
+                       "You are signed in now.", "The order was placed."):
+        assert main.claims_action(pretending), f"missed: {pretending}"
+    for honest in ("It costs $18.70 and delivery is free.",
+                   "The page shows two options.",
+                   "The cart page says no items are selected."):
+        assert not main.claims_action(honest), f"flagged wrongly: {honest}"
+    src = open("main.py", encoding="utf-8").read()
+    body = src[src.index("def _run_browse("):]
+    body = body[:body.index(chr(10) + "def ", 10)]
+    assert "DOING_GOAL.search(goal)" in body,         "a saved shortcut can still answer a goal that asks for an action"
+    i = body.index('if a == "done":')
+    assert "claims_action(answer)" in body[i:i + 1200],         "an answer claiming an action is still taken at its word"
+
+
 @check("the public pages Google verification needs are there")
 def _():
     """Verification wants a privacy policy and terms on a domain you own,

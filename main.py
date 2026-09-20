@@ -4564,6 +4564,27 @@ def _record_request(site, task, goal, path, outcome, seconds, jid):
     db.close()
 
 
+# Goals that require DOING something. A saved shortcut replays a few
+# steps and then summarises whatever page it lands on - fine for "what
+# does it cost", never right for "put it in the basket". Replaying one
+# for an action goal is how a Best Buy search page became "the item
+# successfully went into the cart".
+DOING_GOAL = _re_scrub.compile(
+    r"(?i)(add .{0,20}to (the |your )?(cart|basket|bag)|"
+    r"put .{0,20}in (the |your )?(cart|basket)|"
+    r"check ?out|proceed to|place .{0,12}order|sign in|log in|"
+    r"send|book|cancel|change|update|remove|delete|reply|pay)")
+
+
+def claims_action(answer: str) -> bool:
+    """Does this answer say something was DONE, rather than seen?"""
+    return bool(_re_scrub.search(
+        r"(?i)(added to (the )?(cart|basket)|went into the (cart|basket)|"
+        r"is now in (the |your )?(cart|basket)|signed (you )?in|"
+        r"order (was )?placed|has been (sent|placed|ordered|added)|"
+        r"i (have |'ve )?(added|sent|placed|ordered|signed))", answer or ""))
+
+
 def _find_recipe(site: str, task: str):
     db = Session()
     row = (db.query(Recipe)
@@ -4774,8 +4795,10 @@ def _run_browse(jid: int, account_id: int, site: str):
             _job_set(jid, "opening", f"Opening {start}")
             do_goto(page, start, 4000)
 
-            # ---- 1. learned recipe first
-            recipe = _find_recipe(site_key, task)
+            # ---- 1. learned recipe first, but never for a goal that
+            # asks for something to be DONE
+            recipe = (None if DOING_GOAL.search(goal)
+                      else _find_recipe(site_key, task))
             if recipe and recipe["steps"]:
                 _job_set(jid, "working",
                          f"Using what worked before for {task}.")
@@ -4849,6 +4872,22 @@ def _run_browse(jid: int, account_id: int, site: str):
                     if is_blocked(answer):
                         _job_set(jid, "done", BLOCKED_REPLY)
                         break
+                    # Saying it was done does not make it done. If the
+                    # answer claims an action and nothing in this job
+                    # clicked anything, it is being imagined.
+                    if claims_action(answer) and not any(
+                            r.get("action") == "click" for r in recorded):
+                        note = ("You said something had been done, but "
+                                "nothing on this page has been clicked in "
+                                "this job. Do it, or say only what the page "
+                                "shows.")
+                        emit("browse", f"job {jid}",
+                             "refused an answer claiming an action that "
+                             "never happened", "warn", account_id)
+                        history.append(note)
+                        _job_set(jid, "working", "checking that before "
+                                                 "saying it")
+                        continue
                     _job_set(jid, "done", answer)
                     outcome = "ok"
                     if recorded:
