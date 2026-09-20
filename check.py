@@ -1602,6 +1602,15 @@ def _():
         assert "Rivky" in for_model and "Moshe" in for_model
         assert for_model.index("Rivky") < for_model.index("Moshe"), \
             "what a person wrote should come before what a model guessed"
+        # a model asked for notes often writes ABOUT the notes; that is
+        # not a fact about the person and was being read back as one
+        for junk in ("No notes available.", "None.", "Nothing to add",
+                     "N/A"):
+            main._openai_chat = (lambda t: (lambda *a, **k: {"choices": [
+                {"message": {"content": t}}]}))(junk)
+            assert main.learn_about_caller(78010).get("skipped"), junk
+        kept = c.get("/profile?account_id=" + str(aid)).json()["notes"]
+        assert "No notes" not in kept, kept
     finally:
         main._openai_chat = real
     src = open("main.py", encoding="utf-8").read()

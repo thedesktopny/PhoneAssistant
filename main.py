@@ -5946,8 +5946,12 @@ Never keep:
 
 Rules: one short fact per line, plain English, no bullets or numbering.
 At most 25 lines. Keep every line from the existing notes that is still
-true; drop what the call shows is wrong; add what is new. If the call
-adds nothing, return the notes unchanged."""
+true; drop what the call shows is wrong; add what is new.
+
+If the call adds nothing, return the notes exactly as they were. If there
+were no notes and the call gives you nothing worth keeping, return NOTHING
+and nothing else. Never write a sentence about the notes themselves, such
+as "no notes available" - that is not a fact about the person."""
 
 
 def learn_about_caller(call_id: int) -> dict:
@@ -5988,8 +5992,18 @@ def learn_about_caller(call_id: int) -> dict:
     notes = scrub(notes)[:4000]
     lines = [ln.strip(" -*\t") for ln in notes.splitlines() if ln.strip()]
     notes = "\n".join(lines[:25])
+    # A model asked for notes will often write a sentence ABOUT the notes.
+    # "No notes available." was stored as a fact and read back on the next
+    # call as if it were something we knew about the person.
+    if len(lines) <= 1 and _re_scrub.match(
+            r"(?i)^\W*(nothing|none|no notes?|no standing|n/?a|unchanged)\b",
+            notes or ""):
+        return {"skipped": "nothing worth keeping"}
     if not notes:
         return {"skipped": "nothing to keep"}
+    if notes.strip() == (before or "").strip():
+        return {"account_id": account_id, "notes": notes,
+                "unchanged": True}
 
     db = Session()
     row = db.query(Profile).filter_by(account_id=account_id).first()
@@ -6000,10 +6014,11 @@ def learn_about_caller(call_id: int) -> dict:
         db.add(Profile(account_id=account_id, notes=notes))
     db.commit()
     db.close()
-    added = len(lines) - len([x for x in before.splitlines() if x.strip()])
-    if added > 0:
+    fresh = [ln for ln in notes.splitlines()
+             if ln.strip() and ln.strip() not in before]
+    if fresh:
         record_change(account_id, "notes", "learned",
-                      f"added {added} thing(s) to what we know about them",
+                      "now also knows: " + "; ".join(fresh)[:300],
                       call_id=call_id)
     emit("profile", f"call {call_id}", "what we know about them was updated",
          "info", account_id)
