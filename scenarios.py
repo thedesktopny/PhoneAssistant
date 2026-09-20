@@ -154,6 +154,21 @@ def _():
         assert e.code == 400, e.code
 
 
+@scenario("the advisor never says it is working on something that isn't",
+          "call 58 - 'I'm handling that' while nothing at all was running")
+def _():
+    d = call("/advise", method="POST", body={
+        "account_id": ACCOUNT, "call_id": 0,
+        "situation": "the caller asked whether their order has been placed",
+        "heard": "did you place my order yet?"})
+    said = (d.get("say") or "").lower()
+    assert said, f"the advisor said nothing: {d}"
+    for claim in ("i'm handling", "i am handling", "working on it",
+                  "i'm checking now"):
+        assert claim not in said, f"claimed work that isn't running: {said!r}"
+    assert d.get("facts", {}).get("anything_running") is False, d.get("facts")
+
+
 @scenario("email: every message comes with a date",
           "call 37 - asked when an email arrived, it had no idea")
 def _():

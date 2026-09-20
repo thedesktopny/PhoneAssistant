@@ -184,6 +184,27 @@ async def find_account(caller_number: str):
 
 # ------------------------------------------------------------------ agent
 
+async def ask_advisor(account_id, call_id, situation: str,
+                      heard: str = "") -> str:
+    """What to say, decided by the slower model from the facts the backend
+    can see. Empty if it can't be reached - never a guess."""
+    try:
+        d = await backend_post("/advise", {
+            "account_id": account_id, "call_id": call_id,
+            "situation": situation[:600], "heard": heard[:300]})
+    except Exception as e:
+        log.error(f"advisor failed: {e}")
+        return ""
+    say = (d.get("say") or "").strip()
+    nxt = (d.get("next") or "").strip()
+    if not say:
+        return ""
+    out = f"Say this to them, in these words: {say}"
+    if nxt and nxt.lower() not in ("none", "nothing"):
+        out += f" Then call {nxt}."
+    return out
+
+
 def auto_report(reason: str):
     """Log any tool failure for staff, without the model being asked to.
 
@@ -201,8 +222,16 @@ def auto_report(reason: str):
                     getattr(self, "account_id", None),
                     getattr(self, "call_id", None),
                     reason, f"{fn.__name__} crashed: {e}", fn.__name__)
-                return ("Something went wrong there. Tell them you've left "
-                        "a note for the office.")
+                # Ask the advisor what this means for the caller. It reads
+                # the real state, so it can say "nothing is running" or
+                # "their email needs connecting again" instead of the shrug
+                # that used to come back here.
+                said = await ask_advisor(
+                    getattr(self, "account_id", None),
+                    getattr(self, "call_id", None),
+                    f"the {fn.__name__} step failed with: {str(e)[:200]}")
+                return said or ("Something went wrong there. Tell them "
+                                "you've left a note for the office.")
             text = str(result).lower()
             bad = ("didn't go", "did not go", "couldn't", "could not",
                    "failed", "didn't work", "didn't save", "error",
@@ -363,6 +392,22 @@ looked into this before, it's X" is exactly how a bad answer gets told to
 someone twice. If they are asking the same thing again, assume the last
 answer was wrong and get it right this time.
 
+
+WHEN YOU ARE NOT SURE — ASK, DON'T IMPROVISE
+You are the voice, not the judge. There is a second, slower part of this
+system that can see what is actually running, what failed and why, what is
+connected and what is saved. It is always right about the state; your
+memory of the call is not.
+- Any time you don't know what to do or say — they can't do what a site
+  asked, something failed, they want something you have no tool for, a
+  question you can't answer from a tool result — call what_now and say the
+  words it gives you.
+- NEVER say you are working on something, handling it, checking, or that
+  they should wait, unless a tool you just called told you it started. If
+  you are tempted to say it and you aren't sure, that is exactly when to
+  call what_now.
+- what_now is for deciding and wording. It never sends, orders or charges
+  anything: those still need the caller's spoken yes, every time.
 
 NEVER ASK THE CALLER TO WAIT
 Do not ask "would you like to keep waiting" or "should we try something
@@ -2531,6 +2576,24 @@ Never pick one for them silently.
             return f"Couldn't do that: {str(e)[:200]}"
         return (f"Marked {d.get('marked_read', 0)} messages as read in the "
                 f"{d.get('scope', 'inbox')}. Tell them the number.")
+
+    @function_tool
+    @auto_report("advice")
+    async def what_now(self, context: RunContext, situation: str,
+                       they_said: str = ""):
+        """Ask for a decision when you are not sure what to do or say: the
+        caller can't do what a site wants, something failed, they asked for
+        something you have no tool for, or you are about to say you are
+        working on something. Give the situation plainly and what they just
+        said. You get back the exact words to speak."""
+        said = await ask_advisor(self.account_id, self.call_id,
+                                 situation, they_said)
+        if not said:
+            return ("No advice came back. Say plainly what you do and don't "
+                    "know, and offer to have the office call them. Do NOT "
+                    "say you are working on anything.")
+        await log_turn(self.call_id, "tool", situation[:200], "what_now")
+        return said
 
     @function_tool
     async def what_time_is_it(self, context: RunContext):

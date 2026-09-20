@@ -1370,6 +1370,113 @@ def _():
         assert leak not in body, "a one-time code is written into a log line"
 
 
+@check("the advisor decides from facts, and can't claim work that isn't running")
+def _():
+    """Call 58: 'I don't have that phone with me now' got 'Understood, I'm
+    handling that' while nothing at all was running. Judgement now happens
+    in one place, against the real state, and the one claim the voice model
+    kept getting wrong is checked in code."""
+    db = main.Session()
+    acct = main.Account(name="Advice Tester", pin="1234")
+    db.add(acct)
+    db.commit()
+    db.refresh(acct)
+    aid = acct.id
+    db.add(main.Job(account_id=aid, call_id=77001, kind="site_login",
+                    site="amazon", state="failed", reason="bad_code",
+                    message="Amazon refused the code."))
+    db.commit()
+    db.close()
+
+    facts = main.call_state(aid, 77001)
+    assert facts["anything_running"] is False, facts["running"]
+    assert facts["finished"][0]["reason"] == "bad_code", facts["finished"]
+    assert facts["now"] and facts["name"] == "Advice Tester"
+
+    real = main._openai_chat
+    try:
+        # the model tries the exact mistake from call 58
+        main._openai_chat = lambda *a, **k: {"choices": [{"message": {
+            "content": '{"say": "Understood, I am handling that now.",'
+                       ' "next": "", "why": "x"}'}}]}
+        out = main.advise(aid, 77001, "the caller cannot reach the code")
+        assert out.get("corrected"), "a false 'handling it' went through"
+        assert out["say"].startswith("Nothing is running"), out["say"]
+        # an honest answer is left alone
+        main._openai_chat = lambda *a, **k: {"choices": [{"message": {
+            "content": '{"say": "Amazon would not take the code, so I have '
+                       'stopped. Shall I try later?", "next": "", "why": "x"}'
+        }}]}
+        out = main.advise(aid, 77001, "the code was refused")
+        assert not out.get("corrected") and "stopped" in out["say"], out
+        # a blocked subject still gets the fixed refusal
+        main._openai_chat = lambda *a, **k: {"choices": [{"message": {
+            "content": '{"say": "Here are today\'s news headlines and sports '
+                       'scores.", "next": "", "why": "x"}'}}]}
+        assert main.advise(aid, 77001, "they asked for the news")["say"] \
+            == main.BLOCKED_REPLY
+        # and a model that falls over never produces a guess
+        def boom(*a, **k):
+            raise RuntimeError("no model")
+        main._openai_chat = boom
+        assert main.advise(aid, 77001, "anything")["say"] == ""
+    finally:
+        main._openai_chat = real
+    paths = {r.path for r in main.app.routes}
+    for p in ("/advise", "/state", "/calls/review", "/reviews"):
+        assert p in paths, f"route missing: {p}"
+
+
+@check("every finished call is read back, and bad claims are flagged")
+def _():
+    """Nobody should have to ring in to report that the assistant said
+    something untrue. After each call the record is read back against what
+    actually ran, and anything unsupported becomes a note for the office."""
+    db = main.Session()
+    call = main.Call(id=77002, account_id=1, from_number="+1555",
+                     started_at=main.datetime.utcnow())
+    db.add(call)
+    for who, text in (("agent", "Hello, please tell me your PIN."),
+                      ("caller", "I don't have that phone with me now."),
+                      ("agent", "Understood. I'm handling that.")):
+        db.add(main.CallTurn(call_id=77002, who=who, text=text))
+    db.commit()
+    db.close()
+
+    real = main._openai_chat
+    try:
+        main._openai_chat = lambda *a, **k: {"choices": [{"message": {
+            "content": '{"problems": [{"quote": "Understood. I am handling '
+                       'that.", "why": "nothing was running", "severity": '
+                       '"high"}], "verdict": "claimed work that never '
+                       'started"}'}}]}
+        out = main.review_call(77002)
+        assert len(out.get("problems", [])) == 1, out
+        db = main.Session()
+        notes = (db.query(main.Followup).filter_by(reason="call_review",
+                                                   call_id=77002).all())
+        db.close()
+        assert notes, "the office never hears about it"
+        assert "handling" in notes[0].note
+        # a clean call leaves no note
+        main._openai_chat = lambda *a, **k: {"choices": [{"message": {
+            "content": '{"problems": [], "verdict": "fine"}'}}]}
+        main.review_call(77002)
+        db = main.Session()
+        again = (db.query(main.Followup).filter_by(reason="call_review",
+                                                   call_id=77002).all())
+        db.close()
+        assert len(again) == 1, "a clean call raised a note anyway"
+    finally:
+        main._openai_chat = real
+    # and it happens on its own when a call ends
+    src = open("main.py", encoding="utf-8").read()
+    body = src[src.index("def call_end("):]
+    body = body[:body.index(chr(10) + "@app.", 10)]
+    assert "background.add_task(review_call" in body, \
+        "calls are only reviewed when someone asks by hand"
+
+
 @check("the public pages Google verification needs are there")
 def _():
     """Verification wants a privacy policy and terms on a domain you own,
@@ -2102,6 +2209,31 @@ def _():
     assert "DIGITS ONLY" in text, "nothing says only digits go in a code box"
     paths = {r.path for r in main.app.routes}
     assert "/jobs/cancel" in paths, "a single job still can't be stopped"
+
+
+@check("the voice model asks instead of improvising, and a crash says why")
+def _():
+    inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                           "+1555", 1)
+    names = {getattr(t, "__name__", "") for t in inst.tools}
+    assert "what_now" in names, "no way to ask for a decision"
+    text = inst.instructions
+    assert "what_now" in text and "NEVER say you are working on something" \
+        in text, "the instructions still leave it to improvise"
+    src = open("agent.py", encoding="utf-8").read()
+    body = src[src.index("def auto_report("):]
+    body = body[:body.index("ADDRESS_RULE")]
+    assert "ask_advisor(" in body, \
+        "a crashed tool still answers with a shrug instead of the facts"
+    # the advisor decides words, never permission
+    for fn in ("send_email", "confirm_order"):
+        i = src.find(f"async def {fn}(")
+        if i < 0:
+            continue
+        j = src.find(chr(10) + "    @function_tool", i)
+        b = src[i:j if j > 0 else len(src)]
+        assert "ask_advisor" not in b, \
+            f"{fn} must not take its go-ahead from the advisor"
 
 
 @check("nothing an email tool does is permanent")

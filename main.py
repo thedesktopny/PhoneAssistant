@@ -5640,6 +5640,235 @@ def _openai_chat(messages: list, tools=None, model: str = "",
     return data
 
 
+# ------------------------------------------------------------- the advisor
+# The voice model is fast and a poor judge: told "my phone isn't with me",
+# it answered "I'm handling that" while nothing at all was running. Rules
+# were added one call at a time and there is no end to them.
+#
+# So judgement moves here. The backend reads the real state - what is
+# running, what failed and why, what is connected - and a slower model
+# decides the next step and the words. The voice model speaks them.
+#
+# What it may NOT decide is permission: reading an order total back,
+# getting a yes before sending or charging, stopping at a human check.
+# Those stay in code, where a model cannot talk itself past them.
+
+MODEL_ADVISOR = os.environ.get("MODEL_ADVISOR", MODEL_BROWSER)
+
+WORKING_CLAIMS = _re_scrub.compile(
+    r"(?i)(i.?m (working|handling|looking|checking|signing|placing|getting)"
+    r"|i am (working|handling|looking|checking)|let me (check|look|see)"
+    r"|hold on while|one moment while|i.?ll (check|look) (on )?that now"
+    r"|still (working|trying|waiting)|in progress|handling (that|it))")
+
+
+def call_state(account_id: int, call_id: int = 0) -> dict:
+    """Everything true about this caller right now, read from the database
+    and the running jobs - never from what the model believes."""
+    now = datetime.now(_tz())
+    out = {"now": f"{now:%A, %B} {now.day} at {_clock(now)}",
+           "account_id": account_id, "running": [], "finished": [],
+           "mailboxes": [], "saved_logins": [], "cards": [], "addresses": []}
+    db = Session()
+    acct = db.query(Account).filter_by(id=account_id).first()
+    out["name"] = acct.name if acct else ""
+
+    q = db.query(Job).filter_by(account_id=account_id)
+    if call_id:
+        q = q.filter_by(call_id=call_id)
+    for j in q.order_by(Job.id.desc()).limit(6).all():
+        row = {"job_id": j.id, "what": j.kind, "site": j.site,
+               "state": j.state, "reason": j.reason or "",
+               "message": (j.message or "")[:300]}
+        if j.state in ("done", "failed"):
+            out["finished"].append(row)
+        else:
+            row["still_running"] = j.id in _JOBS
+            out["running"].append(row)
+
+    for c in (db.query(Connection)
+                .filter_by(account_id=account_id, provider="google").all()):
+        days = ((datetime.utcnow() - c.linked_at).total_seconds() / 86400.0
+                if c.linked_at else 999)
+        out["mailboxes"].append({
+            "email": c.email, "label": c.label or "",
+            "connected_days_ago": round(days, 1),
+            "probably_expired": days >= 7})
+    out["saved_logins"] = [
+        s.site for s in db.query(SiteLogin)
+                          .filter_by(account_id=account_id).all()]
+    out["cards"] = [f"{c.brand} ending {c.last4}"
+                    for c in db.query(PaymentCard)
+                               .filter_by(account_id=account_id).all()]
+    out["addresses"] = [a.label or "home"
+                        for a in db.query(Address)
+                                   .filter_by(account_id=account_id).all()]
+    db.close()
+    out["anything_running"] = bool(out["running"])
+    return out
+
+
+ADVISOR_SYSTEM = """You decide what a telephone assistant does next, and the
+exact words it says.
+
+The caller is usually elderly, has no internet, no screen, and often cannot
+read a text message. Everything must be doable by voice alone.
+
+You are given FACTS read from the system a moment ago. They are the only
+truth. What the assistant said earlier may be wrong; the facts are not.
+
+Rules:
+- Never say or imply that something is being worked on unless the facts show
+  a job still running. If nothing is running, say plainly what the position
+  is.
+- Never invent a detail. If the facts don't say where a code went, or what a
+  page said, say that it isn't known.
+- Say what you DID, or what you are about to do, and then either do it or
+  ask one clear question. Never leave the caller waiting with nothing said.
+- One question at a time. Short sentences. No jargon, no menus, no lists of
+  options longer than two.
+- Money and sending: never say anything is sent, ordered or charged unless
+  the facts show it happened.
+- If the right next step needs a tool the assistant has, name it.
+
+Answer as JSON only:
+{"say": "<the words to speak, at most 45 words>",
+ "next": "<one tool name, or empty if nothing to call>",
+ "why": "<one short line for the office log>"}"""
+
+
+def advise(account_id: int, call_id: int, situation: str,
+           heard: str = "") -> dict:
+    """What should happen next, decided from the facts."""
+    state = call_state(account_id, call_id)
+    msgs = [{"role": "system", "content": ADVISOR_SYSTEM},
+            {"role": "user", "content":
+                f"FACTS:\n{json.dumps(state, default=str)[:4000]}\n\n"
+                f"WHAT IS HAPPENING: {situation[:600]}\n"
+                f"WHAT THE CALLER JUST SAID: {heard[:300] or '(nothing)'}"}]
+    try:
+        d = _openai_chat(msgs, model=MODEL_ADVISOR, account_id=account_id,
+                         call_id=call_id, cheap=False)
+        raw = (d["choices"][0]["message"].get("content") or "").strip()
+    except Exception as e:
+        emit("advisor", f"call {call_id}", f"advisor failed: {str(e)[:150]}",
+             "error", account_id)
+        return {"say": "", "next": "", "why": "advisor unavailable",
+                "error": True}
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        raw = raw[raw.find("{"):]
+    try:
+        out = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
+    except Exception:
+        out = {"say": raw[:300], "next": "", "why": "unparsed"}
+
+    said = out.get("say", "")
+    # The one thing the voice model kept getting wrong, now checked in code
+    # rather than trusted to a prompt: you cannot claim to be working on
+    # something when nothing is running.
+    if said and not state["anything_running"] and WORKING_CLAIMS.search(said):
+        emit("advisor", f"call {call_id}",
+             "advice claimed work was in progress while nothing was running "
+             "- replaced", "warn", account_id)
+        out["say"] = ("Nothing is running at the moment. " + said)
+        out["corrected"] = True
+    if is_blocked(said):
+        out["say"] = BLOCKED_REPLY
+    out["facts"] = {"anything_running": state["anything_running"],
+                    "running": state["running"],
+                    "mailboxes": state["mailboxes"]}
+    return out
+
+
+REVIEW_SYSTEM = """You are checking a finished telephone call for one thing
+only: did the assistant tell the caller anything the record does not support?
+
+You get the spoken turns and the record of what the system actually did.
+
+Count as a problem:
+- claiming something was being worked on when no job was running
+- claiming an email was sent, an order placed, or a card charged, with no
+  record of it
+- inventing a detail: a time, an address, a price, where a code was sent
+- leaving the caller waiting with no answer, or ending with their question
+  unanswered
+- asking the caller to do something they cannot do by phone
+
+Do NOT report tone, politeness, or wording you merely dislike, and do not
+report a refusal to discuss a blocked subject.
+
+Answer as JSON only:
+{"problems": [{"quote": "<what the assistant said>",
+               "why": "<one line>",
+               "severity": "high|low"}],
+ "verdict": "<one line for the office>"}"""
+
+
+def review_call(call_id: int) -> dict:
+    """Read a finished call and flag anything the assistant said that the
+    record doesn't back up. Runs on its own after every call, so a customer
+    doesn't have to ring back and report it."""
+    db = Session()
+    call = db.query(Call).filter_by(id=call_id).first()
+    if not call:
+        db.close()
+        return {"skipped": "no such call"}
+    turns = (db.query(CallTurn).filter_by(call_id=call_id)
+               .order_by(CallTurn.id).all())
+    jobs = db.query(Job).filter_by(call_id=call_id).all()
+    account_id = call.account_id
+    said = [f"{t.who}: {(t.text or '')[:300]}" for t in turns]
+    did = [f"job {j.id} {j.kind} {j.site}: {j.state} {j.reason or ''} "
+           f"{(j.message or '')[:160]}" for j in jobs]
+    db.close()
+    if len([t for t in turns if t.who == "agent"]) < 2:
+        return {"skipped": "too short to review"}
+    if not OPENAI_API_KEY:
+        return {"skipped": "no model configured"}
+    msgs = [{"role": "system", "content": REVIEW_SYSTEM},
+            {"role": "user", "content":
+                "WHAT WAS SAID:\n" + "\n".join(said)[:6000]
+                + "\n\nWHAT THE SYSTEM ACTUALLY DID:\n"
+                + ("\n".join(did)[:2000] or "(nothing ran)")}]
+    try:
+        d = _openai_chat(msgs, model=MODEL_ADVISOR, account_id=account_id,
+                         call_id=call_id, cheap=False)
+        raw = (d["choices"][0]["message"].get("content") or "").strip()
+        out = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
+    except Exception as e:
+        emit("review", f"call {call_id}", f"review failed: {str(e)[:150]}",
+             "warn", account_id)
+        return {"error": str(e)[:200]}
+
+    problems = [p for p in out.get("problems", []) if p.get("quote")]
+    if problems:
+        note = (f"CALL REVIEW - call {call_id}\n"
+                + out.get("verdict", "") + "\n\n"
+                + "\n".join(f"- [{p.get('severity', 'low')}] "
+                             f"\"{p.get('quote', '')[:160]}\" - "
+                             f"{p.get('why', '')[:200]}" for p in problems))
+        db = Session()
+        db.add(Followup(account_id=account_id, call_id=call_id,
+                        reason="call_review", note=note[:4000],
+                        channel="voice"))
+        db.commit()
+        db.close()
+        worst = ("error" if any(p.get("severity") == "high" for p in problems)
+                 else "warn")
+        emit("review", f"call {call_id}",
+             f"{len(problems)} thing(s) the assistant said aren't backed by "
+             f"the record: {out.get('verdict', '')[:160]}", worst,
+             account_id)
+    else:
+        emit("review", f"call {call_id}", "call reviewed - nothing said that "
+                                          "the record doesn't support",
+             "info", account_id)
+    out["problems"] = problems
+    out["call_id"] = call_id
+    return out
+
+
 def text_brain(account_id: int, incoming: str) -> str:
     """Answer one incoming text, using shared memory and the same tools."""
     if is_blocked(incoming):
@@ -6707,7 +6936,8 @@ def call_turn(t: TurnBody, request: Request):
 
 
 @app.post("/calls/end")
-def call_end(request: Request, call_id: int, verified: int = 0):
+def call_end(request: Request, call_id: int, background: BackgroundTasks,
+             verified: int = 0):
     require_auth(request)
     emit("call", f"call {call_id}", "call ended")
     db = Session()
@@ -6719,7 +6949,54 @@ def call_end(request: Request, call_id: int, verified: int = 0):
         row.verified = verified
         db.commit()
     db.close()
+    # Read the call back and flag anything said that the record doesn't
+    # support. Nobody should have to ring in to report it.
+    try:
+        background.add_task(review_call, call_id)
+    except Exception:
+        pass
     return {"ok": True}
+
+
+class AdviceBody(BaseModel):
+    account_id: int
+    call_id: int = 0
+    situation: str
+    heard: str = ""
+
+
+@app.post("/advise")
+def advise_now(b: AdviceBody, request: Request):
+    """What to do and say next, decided from the facts, not from memory."""
+    require_auth(request)
+    return advise(b.account_id, b.call_id, b.situation, b.heard)
+
+
+@app.get("/state")
+def state_now(request: Request, account_id: int, call_id: int = 0):
+    """The facts the advisor is given. Useful when a call goes wrong."""
+    require_auth(request)
+    return call_state(account_id, call_id)
+
+
+@app.post("/calls/review")
+def calls_review(request: Request, call_id: int):
+    """Review one finished call by hand. Every call is reviewed anyway."""
+    require_auth(request)
+    return review_call(call_id)
+
+
+@app.get("/reviews")
+def reviews_list(request: Request, limit: int = 20):
+    """What the reviewer found, newest first."""
+    require_auth(request)
+    db = Session()
+    rows = (db.query(Followup).filter_by(reason="call_review")
+              .order_by(Followup.id.desc()).limit(limit).all())
+    out = [{"id": r.id, "call_id": r.call_id, "account_id": r.account_id,
+            "at": local_str(r.at), "note": r.note} for r in rows]
+    db.close()
+    return out
 
 
 @app.get("/calls")
@@ -7311,7 +7588,7 @@ def models_list(request: Request):
     run. Change MODEL_BROWSER in Railway to switch - no deploy needed."""
     require_auth(request)
     out = {"in_use": {"browser": MODEL_BROWSER, "summary": MODEL_SUMMARY,
-                      "text": MODEL_TEXT,
+                      "text": MODEL_TEXT, "advisor": MODEL_ADVISOR,
                       "browser_sees_pictures": BROWSER_VISION},
            "openai_key_set_on_backend": bool(OPENAI_API_KEY),
            "openai_key_length": len(OPENAI_API_KEY),
