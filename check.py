@@ -1696,6 +1696,32 @@ def _():
     assert 'reason="model_refused"' in src,         "a refusal is still reported as an ordinary give-up"
 
 
+@check("nothing that browses can press Place your order")
+def _():
+    """A prompt that says "do not buy" is a wish. Pressing the button that
+    spends the money is refused in code unless the job was started to buy
+    and the caller has said yes."""
+    for label in ("button: Place your order", "input/submit: Buy Now",
+                  "button: Pay now", "a: Complete purchase",
+                  "button: Submit my order", "button: Confirm and pay"):
+        assert main.BUY_BUTTONS.search(label), f"would be pressed: {label}"
+    for safe in ("button: Proceed to checkout", "a: Change address",
+                 "button: Add to Cart", "a: Your Orders", "button: Continue"):
+        assert not main.BUY_BUTTONS.search(safe), f"blocked wrongly: {safe}"
+    src = open("main.py", encoding="utf-8").read()
+    body = src[src.index("def _run_browse("):]
+    body = body[:body.index(chr(10) + "def ", 10)]
+    i = body.index('if a == "click":')
+    block = body[i:i + 1400]
+    assert "BUY_BUTTONS.search" in block and 'payload.get("may_buy")' in block,         "a browsing job can still press the button that spends the money"
+    assert block.index("BUY_BUTTONS") < block.index("do_click"),         "it is checked after the click, which is no check at all"
+    paths = {r.path for r in main.app.routes}
+    assert "/jobs/checkout" in paths
+    body = src[src.index("def job_checkout("):]
+    body = body[:body.index(chr(10) + "@app.", 10)]
+    assert '"may_buy": False' in body,         "the checkout step could buy something"
+
+
 @check("the public pages Google verification needs are there")
 def _():
     """Verification wants a privacy policy and terms on a domain you own,
@@ -2474,6 +2500,17 @@ def _():
     assert "first time" in blank.instructions,         "with no notes it should say so, not show an empty heading"
     src = open("agent.py", encoding="utf-8").read()
     assert 'backend_get("/profile"' in src,         "nothing loads the notes when a call starts"
+
+
+@check("a caller can hear the whole basket before deciding")
+def _():
+    inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                           "+1555", 1)
+    names = {getattr(t, "__name__", "") for t in inst.tools}
+    assert "review_checkout" in names
+    text = inst.instructions
+    assert "CHECKING A BASKET BEFORE BUYING" in text
+    assert "more in it than they asked for" in text,         "nothing tells it to read out what was already in the cart"
 
 
 @check("nothing an email tool does is permanent")

@@ -663,6 +663,20 @@ WHEN A SITE ASKS FOR A ONE-TIME CODE
   waiting. Call stop_waiting_for_code, say plainly that you have stopped,
   and offer to try again later or to have the office ring them.
 
+CHECKING A BASKET BEFORE BUYING
+- "What's in my cart?", "how much is it altogether?", "is it going to the
+  right address?" -> review_checkout. It reads the checkout page back:
+  every item, the delivery address, the card, and the total. It cannot buy
+  anything, so it is always safe to look.
+- If they want it somewhere else or on a different card, pass a few words
+  in deliver_to or pay_with ("Monsey", "the Visa ending 6158"). If the shop
+  won't let it be changed, say so and offer to have the office do it.
+- Read the WHOLE thing back before asking about buying: each item with its
+  price, the address, the card ending, and the total. If the total is more
+  than they expected, say so plainly before anything else.
+- The cart may hold things they put there themselves weeks ago. If there
+  is more in it than they asked for, tell them item by item.
+
 PLACING AN ORDER — do it exactly like a careful person would
 1. Find out what they want: the item, how many, and which site. If they're
    vague, use search_site or do_on_website to find it and read them the
@@ -2003,6 +2017,38 @@ Never pick one for them silently.
                 f". Ship to {d.get('address') or 'the site\'s saved address'}. "
                 f"Pay with {d.get('card') or 'the site\'s saved card'}. "
                 f"Read all of that back and ask: Should I place this order?")
+
+    @function_tool
+    @auto_report("orders")
+    async def review_checkout(self, context: RunContext, site: str,
+                              deliver_to: str = "", pay_with: str = ""):
+        """Take what is in the caller's basket on a shop as far as the
+        checkout page and read everything back: items, address, card and
+        total. It CANNOT buy anything - the buttons that would are blocked.
+        deliver_to and pay_with are optional: a few words to pick between
+        saved ones, like "Monsey" or "the Visa ending 6158"."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            async with httpx.AsyncClient(timeout=25) as c:
+                r = await c.post(f"{BACKEND}/jobs/checkout", headers=AUTH,
+                                 params={"account_id": self.account_id,
+                                         "site": site,
+                                         "deliver_to": deliver_to,
+                                         "pay_with": pay_with,
+                                         "call_id": self.call_id or 0})
+                d = r.json()
+        except Exception as e:
+            log.error(f"checkout failed: {e}")
+            return (google_refusal(e, "the checkout")
+                    or "Couldn't open the checkout.")
+        self.job_id = d.get("job_id")
+        self.job_site = site
+        self._watch_job(f"opening the {site} checkout")
+        return (f"Opening the {site} checkout. Tell them it takes a minute "
+                f"and that NOTHING is being bought yet. Wait to be told what "
+                f"it says, then read it all back - each item, the address, "
+                f"the card and the total - and ask whether to go ahead.")
 
     @function_tool
     @auto_report("orders")

@@ -4607,6 +4607,16 @@ def _replay_recipe(page, steps: list, creds: dict, log_fn,
     return True, page_text(page, 5000)
 
 
+# Pressing this is spending someone else's money. A prompt saying "do not
+# buy" is a wish; this is a rule. A browsing job may never press it, and an
+# order may only press it once the caller has said yes out loud and the job
+# was started with may_buy set.
+BUY_BUTTONS = _re_scrub.compile(
+    r"(?i)(place (your )?order|buy now|complete (the )?(purchase|order)|"
+    r"confirm (and )?(pay|purchase|order)|submit (my |your )?order|"
+    r"pay now|place order)")
+
+
 def _run_browse(jid: int, account_id: int, site: str):
     """Pursue a goal on any site. Try the learned recipe first; fall back to
     the step-by-step agent; record what worked."""
@@ -4819,6 +4829,18 @@ def _run_browse(jid: int, account_id: int, site: str):
                 try:
                     if a == "click":
                         it = items[int(act["index"])]
+                        if (BUY_BUTTONS.search(it["desc"])
+                                and not payload.get("may_buy")):
+                            note = (f"Refused to press '{it['desc'][:60]}'. "
+                                    f"Nothing here may complete a purchase. "
+                                    f"Report what the page shows instead.")
+                            emit("browse", f"job {jid}",
+                                 f"refused to press {it['desc'][:60]}",
+                                 "warn", account_id)
+                            history.append(note)
+                            _job_set(jid, "working", "stopped short of "
+                                                     "buying anything")
+                            continue
                         do_click(page, _handle(page, it))
                         recorded.append({"action": "click",
                                          "desc": it["desc"]})
@@ -7610,6 +7632,53 @@ def job_site_search(request: Request, account_id: int, site: str,
     return {"job_id": start_job(account_id, "site_search", site,
                                 call_id=call_id or None,
                                 payload={"query": query})}
+
+
+CHECKOUT_GOAL = """The account is already signed in. Open the shopping
+cart and press Proceed to checkout, then stop on the checkout or order
+review page.
+
+{changes}
+
+Then READ the page and report exactly what it shows. Do not guess at
+anything that is not written there.
+
+You must NOT place the order. Do not press Place your order, Buy now, Pay
+now or anything that completes a purchase - pressing them is blocked
+anyway, and trying wastes the call.
+
+Reply done with, each on its own line: every item with its quantity and
+price; the delivery address; the payment method exactly as written, such
+as "Visa ending 1234"; the delivery date or shipping choice; and the
+order total. If the page does not show one of them, say which one."""
+
+CHECKOUT_CHANGES = """If a delivery address is wanted: open Change beside
+the delivery address, pick the saved address matching "{deliver_to}", and
+use it. If a payment method is wanted: open Change under the payment
+section and pick the saved card matching "{pay_with}". If you cannot find
+the Change control after two tries, leave it as it is and say so in your
+answer - do not keep trying."""
+
+
+@app.post("/jobs/checkout")
+def job_checkout(request: Request, account_id: int, site: str,
+                 deliver_to: str = "", pay_with: str = "",
+                 call_id: int = 0):
+    """Take a cart as far as the review page and read everything back.
+    Never completes a purchase: the buttons that would are blocked."""
+    require_auth(request)
+    if not BROWSERBASE_API_KEY:
+        raise HTTPException(400, "Browserbase isn't configured.")
+    changes = ""
+    if deliver_to or pay_with:
+        changes = CHECKOUT_CHANGES.format(
+            deliver_to=deliver_to or "the one already chosen",
+            pay_with=pay_with or "the one already chosen")
+    goal = CHECKOUT_GOAL.format(changes=changes)
+    jid = start_job(account_id, "browse", site, call_id=call_id or None,
+                    payload={"goal": goal, "url": "",
+                             "max_steps": 18, "may_buy": False})
+    return {"job_id": jid, "state": "queued"}
 
 
 @app.post("/jobs/browse")
