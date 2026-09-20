@@ -7999,6 +7999,22 @@ def browser_peek(request: Request, url: str, account_id: int = 0,
                     settle(page, 2500)
                 out["clicked"] = bool(el)
             items, text = _page_snapshot(page, want=want)
+            # counted in the page itself, so a missing product link can be
+            # told apart from a page that never loaded
+            out["raw"] = page_eval(page, """() => {
+                const all = document.querySelectorAll('a, button, input');
+                let visible = 0, product = 0;
+                for (const el of all) {
+                  const r = el.getBoundingClientRect();
+                  if (r.width && r.height) visible++;
+                  const href = el.getAttribute('href') || '';
+                  if (href.includes('/dp/') || href.includes('/gp/product'))
+                    product++;
+                }
+                return {clickable: all.length, visible: visible,
+                        product_links: product,
+                        body_text: (document.body.innerText || '').length};
+            }""") or {}
             out["landed_on"] = page_url(page)
             out["text_length"] = len(text or "")
             out["text_start"] = (text or "")[:400]
