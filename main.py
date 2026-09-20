@@ -4377,7 +4377,7 @@ as JSON and nothing else - never prose, never an explanation."""
 
 def _decide(goal: str, url: str, text: str, items: list, history: list,
             answer_hint: str = "", shot: str = "", account_id=None,
-            call_id=None, findings=None):
+            call_id=None, findings=None, model: str = ""):
     listing = "\n".join(f"[{i}] {it['desc']}" for i, it in enumerate(items))
     steps = "\n".join(history[-8:]) or "(none yet)"
     # What it has already read. Without this it walked into a product page,
@@ -4393,7 +4393,8 @@ def _decide(goal: str, url: str, text: str, items: list, history: list,
            f"PAGE TEXT:\n{text}")
     turns = [{"role": "system", "content": BROWSE_SYSTEM},
              _user_turn(msg, shot)]
-    d = _openai_chat(turns, model=MODEL_BROWSER, account_id=account_id,
+    use = model or MODEL_BROWSER
+    d = _openai_chat(turns, model=use, account_id=account_id,
                      call_id=call_id, cheap=False)
     raw = (d["choices"][0]["message"].get("content") or "").strip()
     act = _first_json(raw)
@@ -4406,7 +4407,7 @@ def _decide(goal: str, url: str, text: str, items: list, history: list,
     try:
         d = _openai_chat(turns + [{"role": "assistant", "content": raw[:400]},
                                   {"role": "system", "content": REFUSAL_HINT}],
-                         model=MODEL_BROWSER, account_id=account_id,
+                         model=use, account_id=account_id,
                          call_id=call_id, cheap=False)
         again = (d["choices"][0]["message"].get("content") or "").strip()
         act = _first_json(again)
@@ -4832,7 +4833,8 @@ def _run_browse(jid: int, account_id: int, site: str):
                 shot = page_shot(page) if BROWSER_VISION else ""
                 url_before, body_before = page_url(page), _body_mark(page)
                 act = _decide(goal, page_url(page), text, items, history,
-                              hint, shot, account_id, call_id, findings)
+                              hint, shot, account_id, call_id, findings,
+                              payload.get("model", ""))
                 noted = (act.get("found") or "").strip()
                 if noted and noted not in findings:
                     findings.append(noted[:300])
@@ -7767,7 +7769,7 @@ def job_checkout(request: Request, account_id: int, site: str,
 @app.post("/jobs/browse")
 def job_browse(request: Request, account_id: int, goal: str,
                site: str = "", url: str = "", call_id: int = 0,
-               max_steps: int = 0, urls: str = ""):
+               max_steps: int = 0, urls: str = "", model: str = ""):
     """Pursue any goal on any site. No per-site setup. max_steps lets a
     quick probe stay quick."""
     require_auth(request)
@@ -7779,6 +7781,9 @@ def job_browse(request: Request, account_id: int, goal: str,
     if not BROWSERBASE_API_KEY:
         raise HTTPException(400, "Browserbase isn't configured.")
     payload = {"goal": goal, "url": url}
+    if model:
+        # try a different brain for one job, without changing Railway
+        payload["model"] = model
     if urls:
         # space separated - a URL can't contain a space
         payload["urls"] = [u for u in urls.split() if u]

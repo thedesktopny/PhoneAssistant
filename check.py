@@ -1875,7 +1875,7 @@ def _():
     body = src[src.index("def _run_browse("):]
     body = body[:body.index(chr(10) + "def ", 10)]
     assert "findings.append(noted[:300])" in body, "notes are never kept"
-    assert "call_id, findings)" in body, "notes are never handed back"
+    assert "call_id, findings," in body or "call_id, findings)" in body,         "notes are never handed back"
     # and a run that runs out of steps still gives back what it read
     i = body.index("Ran out of steps before finishing.")
     assert "if findings:" in body[i - 600:i],         "notes are thrown away when the steps run out"
