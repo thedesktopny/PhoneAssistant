@@ -133,6 +133,17 @@ except Exception as _e:
 
 # ----------------------------------------------------------------- email
 
+@scenario("sign-in: words are never accepted as a one-time code",
+          "call 57 - 'another way' was typed into Amazon's code box")
+def _():
+    try:
+        call("/jobs/code", method="POST",
+             body={"job_id": 999999, "code": "another way"})
+        raise AssertionError("an unknown job accepted a code")
+    except urllib.error.HTTPError as e:
+        assert e.code == 400, e.code
+
+
 @scenario("email: every message comes with a date",
           "call 37 - asked when an email arrived, it had no idea")
 def _():
