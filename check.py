@@ -1793,6 +1793,21 @@ def _():
         main._summarise_page = real
 
 
+@check("a page is given time to draw before it is read")
+def _():
+    """Job 103 on a search results page: "there is no [16] - the page
+    offers 9 things you can use". Amazon draws its results after the shell,
+    and we were reading in between, then wandering off to the next page of
+    results that didn't exist yet."""
+    src = open("main.py", encoding="utf-8").read()
+    body = src[src.index("def _run_browse("):]
+    body = body[:body.index(chr(10) + "def ", 10)]
+    i = body.index("_page_snapshot(page, want=goal)")
+    block = body[i:i + 500]
+    assert "for _ in range(3)" in block, "it still reads a half-drawn page"
+    assert "len(items) >= 15" in block and "settle(page" in block, block[:200]
+
+
 @check("the public pages Google verification needs are there")
 def _():
     """Verification wants a privacy policy and terms on a domain you own,

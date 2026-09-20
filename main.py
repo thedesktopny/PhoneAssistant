@@ -4754,7 +4754,15 @@ def _run_browse(jid: int, account_id: int, site: str):
                     _job_set(jid, "failed", "The caller hung up.",
                              reason="cancelled")
                     break
+                # A shop draws its results after the shell, and we were
+                # reading the page in between: "the page offers 9 things
+                # you can use" on a search results page full of products.
                 items, text = _page_snapshot(page, want=goal)
+                for _ in range(3):
+                    if len(items) >= 15 and len(text) >= 800:
+                        break
+                    settle(page, 1500)
+                    items, text = _page_snapshot(page, want=goal)
                 if looks_like_bot_check(text):
                     if spares:
                         nxt = spares.pop(0)
