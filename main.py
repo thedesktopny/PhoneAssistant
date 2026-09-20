@@ -7036,6 +7036,21 @@ def job_code(b: JobCode, request: Request):
     raise HTTPException(400, "That job is no longer running.")
 
 
+@app.post("/jobs/cancel")
+def job_cancel(request: Request, job_id: int, why: str = "stopped"):
+    """Stop one job. A sign-in waiting for a code the caller cannot get
+    would otherwise sit there for four minutes, holding a browser open,
+    while the caller listens to silence."""
+    require_auth(request)
+    if job_id in _JOBS:
+        _JOBS[job_id]["cancelled"] = True
+        _job_set(job_id, "failed", f"Stopped: {why[:120]}",
+                 reason="cancelled")
+        emit("job", f"job {job_id}", f"stopped: {why[:120]}", "warn")
+        return {"ok": True}
+    return {"ok": False, "reason": "not_running"}
+
+
 @app.post("/jobs/cancel_for_call")
 def jobs_cancel_for_call(request: Request, call_id: int):
     """The caller hung up - stop anything still running for them. A browser

@@ -585,6 +585,18 @@ slowly, same as before. Read it back, get a yes, then save_site_login.
 - Once a site is signed in, we stay signed in, so they won't be asked again
   every time.
 
+WHEN A SITE ASKS FOR A ONE-TIME CODE
+- Say where the site sent it, in the words you were given ("to the phone
+  ending 96"). Never say just "they sent a code".
+- If the code was EMAILED and we can read that mailbox, it is read and
+  typed in automatically. Say nothing; wait to be told.
+- submit_site_code takes DIGITS ONLY, read out by the caller. Never send
+  words, never send "resend", never make a code up.
+- If they cannot get the code - the phone is in another room, no message
+  arrived, they are out - do NOT say "I'm handling it" and do NOT sit
+  waiting. Call stop_waiting_for_code, say plainly that you have stopped,
+  and offer to try again later or to have the office ring them.
+
 PLACING AN ORDER — do it exactly like a careful person would
 1. Find out what they want: the item, how many, and which site. If they're
    vague, use search_site or do_on_website to find it and read them the
@@ -2210,6 +2222,34 @@ Never pick one for them silently.
             return "That code didn't go through."
         return ("Code sent. Say nothing more about it - I will tell you when "
                 "it changes.")
+
+    @function_tool
+    @auto_report("logins")
+    async def stop_waiting_for_code(self, context: RunContext,
+                                    why: str = "they can't get the code"):
+        """Stop a sign-in that is waiting for a one-time code the caller
+        cannot get - their phone is elsewhere, the message never came, they
+        can't reach their email. Use this INSTEAD of saying you'll handle
+        it. Nothing carries on afterwards."""
+        jid = getattr(self, "job_id", None)
+        if not jid:
+            return ("Nothing is waiting. Do not say you are working on "
+                    "anything.")
+        try:
+            async with httpx.AsyncClient(timeout=20) as c:
+                await c.post(f"{BACKEND}/jobs/cancel", headers=AUTH,
+                             params={"job_id": jid, "why": why[:120]})
+        except Exception as e:
+            log.error(f"cancel job failed: {e}")
+        site = getattr(self, "job_site", "") or "the site"
+        self.job_id = None
+        await log_turn(self.call_id, "tool", f"stopped sign-in: {why}",
+                       "stop_waiting_for_code")
+        return (f"Stopped. Tell them plainly that you have stopped trying to "
+                f"sign in to {site}, because the code can't be reached right "
+                f"now. Their login is still saved. Offer: try again later "
+                f"when they have the code in front of them, or have the "
+                f"office call them back. Then ask what else they need.")
 
     @function_tool
     @auto_report("logins")

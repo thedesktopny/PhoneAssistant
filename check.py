@@ -2088,6 +2088,22 @@ def _():
         assert "google_refusal" in body, f"{fn} has no reconnect message"
 
 
+@check("a code the caller can't get ends the sign-in, not the call")
+def _():
+    """Call 58: 'I don't have that phone with me now' got 'Understood, I'm
+    handling that' - and the caller listened to silence for 45 seconds and
+    hung up. Nothing was being handled."""
+    inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                           "+1555", 1)
+    names = {getattr(t, "__name__", "") for t in inst.tools}
+    assert "stop_waiting_for_code" in names, "no way to give up on a code"
+    text = inst.instructions
+    assert "stop_waiting_for_code" in text and "I'm handling it" in text,         "the instructions don't cover a caller who can't get the code"
+    assert "DIGITS ONLY" in text, "nothing says only digits go in a code box"
+    paths = {r.path for r in main.app.routes}
+    assert "/jobs/cancel" in paths, "a single job still can't be stopped"
+
+
 @check("nothing an email tool does is permanent")
 def _():
     """A caller cannot see what just happened, so every action has to be
