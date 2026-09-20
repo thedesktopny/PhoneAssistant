@@ -7970,6 +7970,52 @@ def events_list(request: Request, after_id: int = 0, limit: int = 200,
     return out
 
 
+@app.get("/browser/peek")
+def browser_peek(request: Request, url: str, account_id: int = 0,
+                 site: str = "", want: str = "", after: str = ""):
+    """What the browser actually sees on one page: how much text, how many
+    controls, and the first of each. Built while chasing "the page offers 6
+    things you can use" on a shop full of products - guessing at that from
+    a job's history wastes an hour every time."""
+    require_auth(request)
+    from playwright.sync_api import sync_playwright
+    out = {"url": url}
+    browser = None
+    try:
+        with sync_playwright() as p:
+            if account_id and site:
+                browser, page, _ = _open_with_session(p, account_id, site)
+            else:
+                browser = p.chromium.connect_over_cdp(_bb_connect_url())
+                ctx = (browser.contexts[0] if browser.contexts
+                       else browser.new_context())
+                page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            do_goto(page, url, 5000)
+            settle(page, 2500)
+            if after:
+                el = q(page, after)
+                if el:
+                    do_click(page, el, 5000)
+                    settle(page, 2500)
+                out["clicked"] = bool(el)
+            items, text = _page_snapshot(page, want=want)
+            out["landed_on"] = page_url(page)
+            out["text_length"] = len(text or "")
+            out["text_start"] = (text or "")[:400]
+            out["control_count"] = len(items)
+            out["first_controls"] = [i["desc"][:60] for i in items[:25]]
+            out["pages_open"] = len(page.context.pages)
+            browser.close()
+    except Exception as e:
+        out["error"] = str(e)[:300]
+        try:
+            if browser:
+                browser.close()
+        except Exception:
+            pass
+    return out
+
+
 @app.get("/browser/where")
 def browser_where(request: Request, phone: str = ""):
     """Open a browser and report where it appears to be. Pass a phone
