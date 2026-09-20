@@ -7725,6 +7725,11 @@ CHECKOUT_GOAL = """The account is already signed in. Open the shopping
 cart and press Proceed to checkout, then stop on the checkout or order
 review page.
 
+Some carts tick each item separately and start with nothing ticked - the
+page says something like "No items selected" and checkout does nothing
+when pressed. If you see that, use "Select all items", or tick the items
+one by one, before pressing Proceed to checkout.
+
 {changes}
 
 Then READ the page and report exactly what it shows. Do not guess at
