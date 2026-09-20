@@ -5784,7 +5784,11 @@ def advise(account_id: int, call_id: int, situation: str,
 REVIEW_SYSTEM = """You are checking a finished telephone call for one thing
 only: did the assistant tell the caller anything the record does not support?
 
-You get the spoken turns and the record of what the system actually did.
+You get the spoken turns and the record of what the system actually did,
+including each step a job went through. A job's own steps are evidence: if
+the record shows a sign-in was opened, then "I'm signing in now" was true,
+even if the sign-in later failed. Only flag what the record contradicts or
+does not mention at all.
 
 Count as a problem:
 - claiming something was being worked on when no job was running
@@ -5819,8 +5823,15 @@ def review_call(call_id: int) -> dict:
     jobs = db.query(Job).filter_by(call_id=call_id).all()
     account_id = call.account_id
     said = [f"{t.who}: {(t.text or '')[:300]}" for t in turns]
-    did = [f"job {j.id} {j.kind} {j.site}: {j.state} {j.reason or ''} "
-           f"{(j.message or '')[:160]}" for j in jobs]
+    # The step-by-step history, not just the final state. Without it the
+    # reviewer called "I'm signing in to Amazon now" a false claim, when a
+    # sign-in really was running - it just ended badly.
+    did = []
+    for j in jobs:
+        did.append(f"job {j.id} {j.kind} {j.site}: ended {j.state} "
+                   f"{j.reason or ''} {(j.message or '')[:200]}")
+        for line in (j.history or "").strip().splitlines()[-12:]:
+            did.append(f"    {line.strip()[:200]}")
     db.close()
     if len([t for t in turns if t.who == "agent"]) < 2:
         return {"skipped": "too short to review"}
