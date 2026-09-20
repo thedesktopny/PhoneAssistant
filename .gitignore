@@ -7,3 +7,7 @@ check_tmp.db
 
 # local secrets, never commit
 .env
+
+# coding-agent tooling state, created in the repo root per session
+.qwen/
+.claude/

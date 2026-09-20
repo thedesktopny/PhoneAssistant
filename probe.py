@@ -71,10 +71,15 @@ def call(path, method="GET", **params):
 def verdict(job: dict) -> str:
     reason = job.get("reason") or ""
     msg = (job.get("message") or "").strip()
-    if reason == "bot_check" or "BLOCKED" in msg.upper():
+    up = msg.upper()
+    if reason == "bot_check" or "BLOCKED" in up:
+        return "BLOCKED"
+    # A WAF refusal surfaces as a page error rather than a bot check, but the
+    # site is turning us away all the same. macys answered "Access denied to
+    # the page" and was filed UNCLEAR, so the sweep under-reported the blocks.
+    if any(w in up for w in ("ACCESS DENIED", "403", "FORBIDDEN")):
         return "BLOCKED"
     if job.get("state") == "done":
-        up = msg.upper()
         if "GUEST_OK" in up:
             return "GUEST_OK"
         if "SIGN_IN" in up:

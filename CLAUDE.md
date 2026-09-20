@@ -14,7 +14,10 @@ PowerShell block per change, never two.
 - Phone number: +1 484 518 2072
 - Admin panel: `/admin` (password in Railway `ADMIN_PASSWORD`)
 - Database: Railway Postgres
-- Browsers: Browserbase (proxies NOT enabled on the plan — 402 is expected)
+- Browsers: Browserbase, residential proxies ON. Verified 20 Sep 2026 —
+  `/browser/where` returns a Cablevision/Optimum NYC IP with
+  `proxy_used: true`. Check `/browser/proxy_status` before assuming a
+  block is about the IP; the ones we've measured are not.
 
 ## Reading the live log (do this before guessing at any bug)
 The `/events` endpoint is the live log. Needs `Authorization: Bearer
@@ -79,9 +82,21 @@ Railway auto-deploys both services from `main` on push.
 ## Known state (Sep 2026)
 - Gmail sign-in by voice works end to end (spelled password, tap prompt
   with number, unverified-app consent screen).
-- Site logins (Amazon/Walmart) save and encrypt fine; a login session must
-  succeed once before order lookups work. Amazon fights automation —
-  prefer Walmart for testing.
+- Site logins save and encrypt fine; a login session must succeed once
+  before order lookups work.
+- **Which shops let the browser in — measured 20 Sep 2026 with `probe.py`
+  across 16 sites.** Re-run it before trusting this list; it decays.
+  - workable (`SIGN_IN`): amazon, chewy, instacart, bestbuy, homedepot,
+    costco, etsy, lowes
+  - blocked (`BLOCKED`): walmart, target, kroger, cvs, kohls, wayfair, macys
+  - inconclusive: walgreens
+  **Walmart is the blocked one, not the easy one.** It walls the homepage
+  6-11 seconds after load, on a residential IP — so it is fingerprint
+  detection, and a proxy does not fix it. Test against lowes or etsy.
+  `SIGN_IN` means the site isn't fighting the browser; it does NOT mean a
+  checkout completes. No end-to-end order has been proven on any site yet.
+- No site on that list allows guest checkout (zero `GUEST_OK`), so every
+  automated order needs stored credentials.
 - SMS is blocked on 10DLC campaign registration (BulkVS / Telnyx). Not a
   code problem.
 - Real cost is ~$0.44/min, ~94% of it the OpenAI Realtime model. Rates

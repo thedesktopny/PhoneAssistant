@@ -1324,6 +1324,29 @@ def _():
     assert r.get("cost_usd", 0) > 0
 
 
+@check("a WAF refusal is filed as a block, not as unclear")
+def _():
+    """macys answered 'Access denied to the page, unable to proceed' and
+    verdict() filed it UNCLEAR, so the 16-site sweep under-reported the
+    blocks by one."""
+    import probe
+    denied = {"state": "failed", "reason": "",
+              "message": "Access denied to the page, unable to proceed"}
+    assert probe.verdict(denied) == "BLOCKED", probe.verdict(denied)
+    # a page that merely stopped responding is still genuinely unclear
+    stuck = {"state": "failed", "reason": "stuck",
+             "message": "The page stopped responding to anything it tried."}
+    assert probe.verdict(stuck) == "UNCLEAR", probe.verdict(stuck)
+    # and the verdicts that already worked must not move
+    for job, want in (({"state": "failed", "reason": "bot_check",
+                       "message": "asking for a human check"}, "BLOCKED"),
+                      ({"state": "done", "message": "SIGN_IN"}, "SIGN_IN"),
+                      ({"state": "done", "message": "GUEST_OK"}, "GUEST_OK"),
+                      ({"state": "done", "message": "LOGIN_WALL"},
+                       "LOGIN_WALL")):
+        assert probe.verdict(job) == want, (job, probe.verdict(job))
+
+
 # ------------------------------------------------------------ agent
 print("voice agent")
 
