@@ -1330,6 +1330,46 @@ def _():
         "the raw page is still read out to the caller on a failure"
 
 
+@check("a code that was emailed is read from their inbox, not asked for")
+def _():
+    """Call 57: the caller was told to go and find a code. He has no
+    screen - that is the whole reason he rings us. When the code arrives
+    by email and we can already read that mailbox, we fetch it."""
+    import time as _t
+    real = main.tool_search_email
+    now = int(_t.time() * 1000)
+    try:
+        main.tool_search_email = lambda *a, **k: {"messages": [
+            {"from": "account-update@amazon.com", "at_ms": now,
+             "subject": "Your Amazon verification code is 418302",
+             "snippet": "Never share this code."}]}
+        assert main.code_from_email(1, "amazon", now - 5000) == "418302"
+        # an order number in an ordinary email is not a code
+        main.tool_search_email = lambda *a, **k: {"messages": [
+            {"from": "amazon.com", "at_ms": now, "subject": "Shipped 2 items",
+             "snippet": "order 112-3334445"}]}
+        assert main.code_from_email(1, "amazon", now - 5000) == ""
+        # and a code from before this sign-in is never reused
+        main.tool_search_email = lambda *a, **k: {"messages": [
+            {"from": "amazon.com", "at_ms": now - 3600000,
+             "subject": "Your sign-in code: 123456", "snippet": ""}]}
+        assert main.code_from_email(1, "amazon", now - 5000) == ""
+        # nor one from a different site
+        main.tool_search_email = lambda *a, **k: {"messages": [
+            {"from": "security@walmart.com", "at_ms": now,
+             "subject": "Your verification code is 999111", "snippet": ""}]}
+        assert main.code_from_email(1, "amazon", now - 5000) == ""
+    finally:
+        main.tool_search_email = real
+    src = open("main.py", encoding="utf-8").read()
+    body = src[src.index("def _do_site_login("):]
+    body = body[:body.index(chr(10) + "def ", 10)]
+    assert "code_from_email(account_id, site, code_since)" in body,         "the sign-in still asks the caller before looking in their email"
+    assert "read the sign-in code from their email" in body,         "nothing records that the code was fetched"
+    for leak in ("{mailed}", "{code}", "code: {"):
+        assert leak not in body, "a one-time code is written into a log line"
+
+
 @check("the public pages Google verification needs are there")
 def _():
     """Verification wants a privacy policy and terms on a domain you own,

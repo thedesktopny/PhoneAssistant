@@ -1399,6 +1399,44 @@ def tool_search_email(account_id: int, query: str, limit: int = 5,
     return {"found": len(items), "messages": items}
 
 
+CODE_MAIL = _re_scrub.compile(
+    r"(?i)(verification|security|one.?time|sign.?in|log.?in|confirm)")
+CODE_DIGITS = _re_scrub.compile(r"(?<![\d-])(\d{4,8})(?![\d-])")
+
+
+def code_from_email(account_id: int, site: str, since_ms: int,
+                    which: str = "") -> str:
+    """The code a site just emailed, read from the customer's own inbox.
+
+    Callers were being asked to find a message they cannot see: no screen,
+    often no text messages. If the code came by email and we already have
+    permission to read that mailbox, there is nothing to ask them for.
+    Only messages that arrived AFTER the sign-in started are considered,
+    so an old code is never reused. The code itself is never logged."""
+    site_word = (site or "").split(".")[0].lower()
+    try:
+        found = tool_search_email(
+            account_id, "newer_than:1d in:anywhere", limit=8, which=which,
+            newest_first=True)
+    except Exception:
+        return ""
+    for m in found.get("messages", []):
+        if int(m.get("at_ms") or 0) < since_ms - 60000:
+            continue
+        who = (m.get("from") or "").lower()
+        subject = m.get("subject", "") or ""
+        snippet = m.get("snippet", "") or ""
+        if site_word and site_word not in who and site_word not in \
+                subject.lower():
+            continue
+        if not CODE_MAIL.search(subject + " " + snippet):
+            continue
+        hit = CODE_DIGITS.search(subject) or CODE_DIGITS.search(snippet)
+        if hit:
+            return hit.group(1)
+    return ""
+
+
 def tool_find_contact(account_id: int, name: str, which: str = "") -> dict:
     """Find someone's email address: their Google Contacts first, then
     anyone they've emailed with."""
@@ -3759,11 +3797,38 @@ def _do_site_login(jid: int, account_id: int, site: str):
 
             # One-time code? Up to three goes: a misheard digit is the
             # normal case, and one wrong code used to end the sign-in.
+            code_since = int(time.time() * 1000)
             for code_try in range(3):
                 if not q(page, cfg["otp_sel"]):
                     break
                 seen = page_text(page, 1500)
                 where = code_destination(seen)
+
+                # If the site emailed the code, fetch it ourselves. The
+                # caller has no screen; asking them to go and find it is
+                # asking for the one thing they rang us to avoid.
+                mailed = ""
+                if "mail" in (where or "").lower() or not where:
+                    _job_set(jid, "working",
+                             f"{site.title()} wants a code - looking in "
+                             f"their email for it.")
+                    for _ in range(6):
+                        time.sleep(5)
+                        mailed = code_from_email(account_id, site, code_since)
+                        if mailed:
+                            break
+                if mailed:
+                    otp_el = q(page, cfg["otp_sel"])
+                    if otp_el:
+                        do_fill(page, otp_el, mailed, True, 6000)
+                        settle(page, 4000)
+                        emit("signin", site,
+                             "read the sign-in code from their email",
+                             "info", account_id)
+                        if not CODE_BAD.search(page_text(page, 1500) or ""):
+                            break
+                    seen = page_text(page, 1500)
+                    where = code_destination(seen)
                 if CODE_BAD.search(seen or ""):
                     note = (f"That code wasn't accepted by {site.title()}. "
                             f"Ask them to read the newest code again, "
