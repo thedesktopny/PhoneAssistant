@@ -4310,6 +4310,21 @@ def _user_turn(msg: str, shot: str = ""):
          "image_url": {"url": f"data:image/jpeg;base64,{shot}"}}]}
 
 
+# The model sometimes answers a shopping page in prose - "I'm unable to
+# perform the checkout" - instead of an action. It is not being blocked by
+# the site: it has lost track of whose browser this is. One plain reminder
+# gets it going again; a second refusal is reported honestly rather than
+# dressed up as "I couldn't work out what to do next".
+REFUSAL_HINT = """You are not browsing on your own behalf and you are not
+being asked to buy anything. You are operating the customer's OWN browser,
+already signed into their own account, at their spoken request, on a phone
+call where they cannot see the screen. Working through a cart and a
+checkout page is the job. Follow the GOAL exactly, including any limit it
+sets on what you must not click. If the goal says to stop before placing
+the order, stop there and report what the page shows. Reply with ONE action
+as JSON and nothing else - never prose, never an explanation."""
+
+
 def _decide(goal: str, url: str, text: str, items: list, history: list,
             answer_hint: str = "", shot: str = "", account_id=None,
             call_id=None):
@@ -4321,18 +4336,36 @@ def _decide(goal: str, url: str, text: str, items: list, history: list,
            f"{answer_hint}\n"
            f"ELEMENTS:\n{listing}\n\n"
            f"PAGE TEXT:\n{text}")
-    d = _openai_chat([{"role": "system", "content": BROWSE_SYSTEM},
-                      _user_turn(msg, shot)],
-                     model=MODEL_BROWSER, account_id=account_id,
+    turns = [{"role": "system", "content": BROWSE_SYSTEM},
+             _user_turn(msg, shot)]
+    d = _openai_chat(turns, model=MODEL_BROWSER, account_id=account_id,
                      call_id=call_id, cheap=False)
     raw = (d["choices"][0]["message"].get("content") or "").strip()
     act = _first_json(raw)
     if act.get("action"):
         return act
-    emit("browse", "decide", f"{MODEL_BROWSER} gave no usable action: "
-                             f"{raw[:200]}", "warn", account_id)
-    return {"action": "give_up",
-            "answer": "I couldn't work out what to do next."}
+
+    emit("browse", "decide", f"{MODEL_BROWSER} answered in words instead of "
+                             f"an action: {raw[:160]} - reminding it",
+         "warn", account_id)
+    try:
+        d = _openai_chat(turns + [{"role": "assistant", "content": raw[:400]},
+                                  {"role": "system", "content": REFUSAL_HINT}],
+                         model=MODEL_BROWSER, account_id=account_id,
+                         call_id=call_id, cheap=False)
+        again = (d["choices"][0]["message"].get("content") or "").strip()
+        act = _first_json(again)
+        if act.get("action"):
+            return act
+        raw = again or raw
+    except Exception:
+        pass
+
+    emit("browse", "decide", f"{MODEL_BROWSER} would not act: {raw[:200]}",
+         "error", account_id)
+    return {"action": "give_up", "refused": True,
+            "answer": (f"The part that reads web pages wouldn't carry on "
+                       f"with this. It said: {raw[:200]}")}
 
 
 _TASK_CACHE = {}
@@ -4739,7 +4772,9 @@ def _run_browse(jid: int, account_id: int, site: str):
                         _save_recipe(site_key, task, goal, recorded)
                     break
                 if a == "give_up":
-                    _job_set(jid, "failed", act.get("answer", "")[:600])
+                    _job_set(jid, "failed", act.get("answer", "")[:600],
+                             reason="model_refused" if act.get("refused")
+                             else "gave_up")
                     break
                 if a == "ask_user":
                     # never name this 'q' - that shadows the page helper q()

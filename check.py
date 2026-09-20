@@ -1658,6 +1658,44 @@ def _():
     assert "_forget_context(account_id, site_key)" in block
 
 
+@check("a model that answers in prose is reminded, then reported honestly")
+def _():
+    """Job 89 reached the cart, and the browser model replied "I'm unable
+    to perform the checkout" instead of an action. The caller was told "I
+    couldn't work out what to do next", which blames nothing and helps
+    nobody."""
+    calls = []
+    real = main._openai_chat
+
+    def prose(*a, **k):
+        calls.append(a[0] if a else k.get("messages"))
+        return {"choices": [{"message": {
+            "content": "I'm unable to perform the checkout for you."}}]}
+    try:
+        main._openai_chat = prose
+        act = main._decide("add to cart", "https://x", "text", [], [])
+        assert act["action"] == "give_up" and act.get("refused"), act
+        assert "wouldn't carry on" in act["answer"], act
+        assert len(calls) == 2, "it gave up without reminding the model once"
+        assert any("customer's OWN browser" in str(m) for m in calls[1]),             "the reminder never said whose browser it is"
+
+        # and when the reminder works, the action is used
+        state = {"n": 0}
+
+        def second_time(*a, **k):
+            state["n"] += 1
+            body = ('{"action": "click", "index": 3}' if state["n"] > 1
+                    else "I can't do that.")
+            return {"choices": [{"message": {"content": body}}]}
+        main._openai_chat = second_time
+        act = main._decide("add to cart", "https://x", "text", [], [])
+        assert act["action"] == "click", act
+    finally:
+        main._openai_chat = real
+    src = open("main.py", encoding="utf-8").read()
+    assert 'reason="model_refused"' in src,         "a refusal is still reported as an ordinary give-up"
+
+
 @check("the public pages Google verification needs are there")
 def _():
     """Verification wants a privacy policy and terms on a domain you own,

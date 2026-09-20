@@ -310,6 +310,12 @@ def login_failure_line(site: str, reason: str, msg: str, fails: int,
     if reason == "no_code":
         return (f"Nobody read a code out, so {site} timed us out. Offer to "
                 f"start again when they have the code in front of them.")
+    if reason == "model_refused":
+        return ("The part of the system that works through web pages "
+                "wouldn't carry on. That is our problem, not theirs and not "
+                "the shop's. Say plainly that you couldn't finish it this "
+                "time, offer to have the office do it, and call "
+                "leave_note_for_office.")
     if reason == "no_results":
         return (f"The {site} page opened but nothing readable came back. Say "
                 f"exactly that - do NOT say they have no orders, and do NOT "
