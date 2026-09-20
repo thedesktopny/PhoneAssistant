@@ -1847,6 +1847,40 @@ def _():
     assert "_body_mark(page)" in body and "url_before" in body
 
 
+@check("what a page said is kept after leaving it")
+def _():
+    """Job 108 opened a product, went back, opened another, went back -
+    sixteen times - and answered nothing. Each step it saw only the page in
+    front of it, so a page it had left may as well never have been read."""
+    seen = {}
+    real = main._openai_chat
+
+    def capture(msgs, **k):
+        seen["msg"] = str(msgs)
+        return {"choices": [{"message": {"content":
+                '{"action":"click","index":1,"found":"ISUNMEA is 9 inches, '
+                '$22.99","why":"read it"}'}}]}
+    try:
+        main._openai_chat = capture
+        act = main._decide("compare two", "https://x", "text", [], [],
+                           findings=["DIBMS is 9 inches, $22.99"])
+        assert "WHAT YOU HAVE WRITTEN DOWN SO FAR" in seen["msg"],             "notes are not given back to it"
+        assert "DIBMS is 9 inches" in seen["msg"]
+        assert act.get("found", "").startswith("ISUNMEA"), act
+    finally:
+        main._openai_chat = real
+    js_prompt = main.BROWSE_SYSTEM
+    assert '"found"' in js_prompt and "before you leave a page" in         js_prompt.lower(), "nothing tells it to write things down"
+    src = open("main.py", encoding="utf-8").read()
+    body = src[src.index("def _run_browse("):]
+    body = body[:body.index(chr(10) + "def ", 10)]
+    assert "findings.append(noted[:300])" in body, "notes are never kept"
+    assert "call_id, findings)" in body, "notes are never handed back"
+    # and a run that runs out of steps still gives back what it read
+    i = body.index("Ran out of steps before finishing.")
+    assert "if findings:" in body[i - 600:i],         "notes are thrown away when the steps run out"
+
+
 @check("the public pages Google verification needs are there")
 def _():
     """Verification wants a privacy policy and terms on a domain you own,

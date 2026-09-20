@@ -4161,6 +4161,10 @@ Actions:
                                                       a choice, or anything
                                                       only they can answer
 {"action":"done","answer":"what to say out loud","why":"..."}
+Any action may also carry "found":"..." - a fact this page told you that
+the goal needs: a price, a size, what something is made of. It is kept and
+given back to you on every later step, so once you have written something
+down you never need to open that page again.
 {"action":"give_up","answer":"why it can't be done","why":"..."}
 
 Rules:
@@ -4173,6 +4177,10 @@ Rules:
 - If a click led somewhere useless, use back rather than repeating it. If
   the same approach has failed twice, try a different route to the goal.
 - If you can already answer the goal from the page, use done.
+- Write down what you read, with "found", BEFORE you leave a page. To
+  compare two things: open the first, note what matters with "found", go
+  back, open the second, note that too, then answer from your notes. Never
+  open a page you have already noted.
 - The answer field is read aloud, so keep it to two or three sentences with
   plain names, prices and dates. Never include a URL."""
 
@@ -4359,12 +4367,17 @@ as JSON and nothing else - never prose, never an explanation."""
 
 def _decide(goal: str, url: str, text: str, items: list, history: list,
             answer_hint: str = "", shot: str = "", account_id=None,
-            call_id=None):
+            call_id=None, findings=None):
     listing = "\n".join(f"[{i}] {it['desc']}" for i, it in enumerate(items))
     steps = "\n".join(history[-8:]) or "(none yet)"
+    # What it has already read. Without this it walked into a product page,
+    # walked out again, and had nothing - so it walked back in.
+    notes = "\n".join(f"- {n}" for n in (findings or [])[-12:])
     msg = (f"GOAL: {goal}\n"
            f"URL: {url}\n"
-           f"STEPS SO FAR:\n{steps}\n"
+           + (f"WHAT YOU HAVE WRITTEN DOWN SO FAR:\n{notes}\n"
+              if notes else "")
+           + f"STEPS SO FAR:\n{steps}\n"
            f"{answer_hint}\n"
            f"ELEMENTS:\n{listing}\n\n"
            f"PAGE TEXT:\n{text}")
@@ -4778,6 +4791,7 @@ def _run_browse(jid: int, account_id: int, site: str):
 
             # ---- 2. step-by-step agent
             outcome = "failed"
+            findings = []
             for step in range(max_steps):
                 if (_JOBS.get(jid) or {}).get("cancelled"):
                     _job_set(jid, "failed", "The caller hung up.",
@@ -4808,7 +4822,11 @@ def _run_browse(jid: int, account_id: int, site: str):
                 shot = page_shot(page) if BROWSER_VISION else ""
                 url_before, body_before = page_url(page), _body_mark(page)
                 act = _decide(goal, page_url(page), text, items, history,
-                              hint, shot, account_id, call_id)
+                              hint, shot, account_id, call_id, findings)
+                noted = (act.get("found") or "").strip()
+                if noted and noted not in findings:
+                    findings.append(noted[:300])
+                    _job_set(jid, "working", f"Noted: {noted[:120]}")
                 a = act.get("action")
                 why = act.get("why", "")[:120]
 
@@ -4968,7 +4986,15 @@ def _run_browse(jid: int, account_id: int, site: str):
                                f" {shown} — {why}")
                 _job_set(jid, "working", f"Step {step + 1}: {why}")
             else:
-                _job_set(jid, "failed", "Ran out of steps before finishing.")
+                # Notes taken along the way are worth more than nothing,
+                # and the caller is waiting.
+                if findings:
+                    _job_set(jid, "done",
+                             "It didn't get all the way, but here is what "
+                             "it read: " + " ".join(findings)[:1200])
+                else:
+                    _job_set(jid, "failed",
+                             "Ran out of steps before finishing.")
 
             _record_request(site_key, task, goal, path_used, outcome,
                             time.time() - t0, jid)
