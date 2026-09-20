@@ -2766,7 +2766,9 @@ def page_text(page, limit: int = 4000) -> str:
     departments, sign-in, gift cards - and a model given that went hunting
     for a "details" section that had been in front of it all along."""
     js = (r"(n) => { const m = document.querySelector("
-          r"'main, [role=main], #dp-container, #centerCol, #search') "
+          r"'main, [role=main], #main-content, #content, #main, "
+          r"[id*=product-detail], article, "
+          r"#dp-container, #centerCol, #search') "
           r"|| document.body; "
           r"const t = (m && m.innerText ? m.innerText : "
           r"(document.body ? document.body.innerText : '')); "
