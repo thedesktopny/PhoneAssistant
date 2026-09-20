@@ -2759,9 +2759,18 @@ def q_all(page, selector):
 def page_text(page, limit: int = 4000) -> str:
     """The visible text, trimmed INSIDE the browser. Pulling a whole shop
     page across the network and then keeping the first 4000 characters was
-    costing seconds per step."""
-    js = (r"(n) => (document.body ? document.body.innerText : '')"
-          r".replace(/\s+/g, ' ').slice(0, n)")
+    costing seconds per step.
+
+    It takes the page's MAIN content where the page marks one. Otherwise
+    the first thousand characters of every shop page are its menu -
+    departments, sign-in, gift cards - and a model given that went hunting
+    for a "details" section that had been in front of it all along."""
+    js = (r"(n) => { const m = document.querySelector("
+          r"'main, [role=main], #dp-container, #centerCol, #search') "
+          r"|| document.body; "
+          r"const t = (m && m.innerText ? m.innerText : "
+          r"(document.body ? document.body.innerText : '')); "
+          r"return t.replace(/\s+/g, ' ').slice(0, n); }")
     got = page_eval(page, js, limit)
     if got:
         return got
@@ -4176,7 +4185,8 @@ Rules:
   the goal on any site - work it out from the page in front of you.
 - If a click led somewhere useless, use back rather than repeating it. If
   the same approach has failed twice, try a different route to the goal.
-- If you can already answer the goal from the page, use done.
+- If you can already answer the goal from the page, use done. PAGE TEXT is
+  what the page says: read it before clicking anything to "see details".
 - Write down what you read, with "found", BEFORE you leave a page. To
   compare two things: open the first, note what matters with "found", go
   back, open the second, note that too, then answer from your notes. Never
