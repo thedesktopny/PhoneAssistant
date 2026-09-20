@@ -34,6 +34,7 @@ ACCOUNT = int(os.environ.get("TEST_ACCOUNT_ID", "1"))
 LOCAL_TZ = os.environ.get("LOCAL_TZ", "America/New_York")
 
 RESULTS = []
+SKIPPED = []
 
 
 class SetupProblem(Exception):
@@ -100,7 +101,12 @@ def scenario(name, because):
             print(f"  ok   {name}")
             RESULTS.append(True)
         except SetupProblem as e:
-            stop(str(e))
+            # Not a fault in the phone system - something it needs isn't
+            # connected. Say so and carry on; one expired mailbox used to
+            # stop the whole suite, so nothing else got tested.
+            print(f"  skip {name}")
+            print(f"       {e}")
+            SKIPPED.append(f"{name}: {e}")
         except Exception as e:
             print(f"  FAIL {name}")
             print(f"       {e}")
@@ -346,12 +352,18 @@ def _():
 # --------------------------------------------------------------- result
 
 print()
+for line in SKIPPED:
+    print(f"SKIPPED - {line}")
+if SKIPPED:
+    print("These were not tested. Fix the connection and run again.")
+    print()
 if not RESULTS:
-    print("nothing matched - check the name you passed")
+    print("nothing was tested - check the name you passed, or the skips above")
     raise SystemExit(2)
 bad = RESULTS.count(False)
 if bad:
     print(f"{bad} of {len(RESULTS)} scenarios FAILED - the live system is "
           f"still doing the thing a customer complained about")
     raise SystemExit(1)
-print(f"all {len(RESULTS)} scenarios pass against the live system")
+print(f"all {len(RESULTS)} scenarios pass against the live system"
+      + (f" ({len(SKIPPED)} skipped)" if SKIPPED else ""))
