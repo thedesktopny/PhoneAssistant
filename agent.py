@@ -351,7 +351,8 @@ def _describe(i: int, m: dict) -> str:
 
 class Assistant(Agent):
     def __init__(self, account: dict, caller_number: str = "",
-                 call_id: int | None = None, history: str = ""):
+                 call_id: int | None = None, history: str = "",
+                 known: str = ""):
         self.account = account
         self.call_id = call_id
         self.caller_number = caller_number
@@ -386,6 +387,15 @@ class Assistant(Agent):
         super().__init__(instructions=f"""
 You are a personal assistant for {account.get('name', 'the caller')},
 reachable by phone and by text. This is a phone call.
+
+WHAT WE KNOW ABOUT THIS PERSON
+{known or "Nothing yet - this is the first time, or nothing stood out."}
+
+These are standing facts, built up from earlier calls and from the office.
+Use them: speak the way they need, use the names they use, and don't make
+them explain again what they have already told us. If something here turns
+out to be wrong, say so plainly and work from what they tell you now - the
+notes are updated after every call.
 
 RECENT HISTORY — what was SAID on earlier calls and texts
 {history or "Nothing recent."}
@@ -3309,6 +3319,14 @@ async def entrypoint(ctx: JobContext):
                           "and to call the office. One sentence."))
         return
 
+    known = ""
+    try:
+        p = await backend_get("/profile",
+                              account_id=account["account_id"])
+        known = p.get("for_the_assistant", "") or ""
+    except Exception as e:
+        log.warning(f"profile load failed: {e}")
+
     history = ""
     try:
         rows = await backend_get("/memory",
@@ -3318,7 +3336,7 @@ async def entrypoint(ctx: JobContext):
     except Exception as e:
         log.warning(f"history load failed: {e}")
 
-    agent_obj = Assistant(account, caller, call_id, history)
+    agent_obj = Assistant(account, caller, call_id, history, known)
 
     @session.on("conversation_item_added")
     def _on_item(ev):

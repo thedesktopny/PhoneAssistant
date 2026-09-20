@@ -1555,6 +1555,61 @@ def _():
         assert 'reason="no_results"' in body,             f"{fn} can't tell 'nothing readable' from 'nothing there'"
 
 
+@check("what we know about a customer is kept, and holds no secrets")
+def _():
+    """A caller shouldn't have to explain twice that he is hard of hearing,
+    that "the office" means his bookkeeper, or that he only orders after
+    Sunday. The notes are built after each call and read before the next."""
+    from fastapi.testclient import TestClient
+    db = main.Session()
+    acct = main.Account(name="Notes Tester", pin="1234")
+    db.add(acct)
+    db.commit()
+    db.refresh(acct)
+    aid = acct.id
+    db.add(main.Call(id=78010, account_id=aid, from_number="+1555",
+                     started_at=main.datetime.utcnow()))
+    for who, text in (("agent", "Hello."), ("caller", "Speak up please."),
+                      ("agent", "Of course."),
+                      ("caller", "My son Moshe orders my paper.")):
+        db.add(main.CallTurn(call_id=78010, who=who, text=text))
+    db.commit()
+    db.close()
+
+    made = ("Hard of hearing - speak up and slow down." + chr(10)
+            + "- His son Moshe orders his copy paper." + chr(10)
+            + "His PIN is 1234 and the password is Hunter22.")
+    real = main._openai_chat
+    try:
+        main._openai_chat = lambda *a, **k: {
+            "choices": [{"message": {"content": made}}]}
+        notes = main.learn_about_caller(78010)["notes"]
+        assert "Hard of hearing" in notes and "Moshe" in notes, notes
+        assert "Hunter22" not in notes, "a password was written into the notes"
+        assert not notes.splitlines()[1].startswith("-"), \
+            "bullets left in - they get read aloud"
+
+        c = TestClient(main.app, raise_server_exceptions=False,
+                       base_url="https://t")
+        c.post("/admin/login", json={"password": os.environ.get(
+            "ADMIN_PASSWORD", "changeme")})
+        c.post("/profile", json={"account_id": aid,
+                                 "by_hand": "Daughter Rivky handles money."})
+        main.learn_about_caller(78010)
+        got = c.get("/profile?account_id=" + str(aid)).json()
+        assert "Rivky" in got["by_hand"], "staff notes were overwritten"
+        for_model = got["for_the_assistant"]
+        assert "Rivky" in for_model and "Moshe" in for_model
+        assert for_model.index("Rivky") < for_model.index("Moshe"), \
+            "what a person wrote should come before what a model guessed"
+    finally:
+        main._openai_chat = real
+    src = open("main.py", encoding="utf-8").read()
+    body = src[src.index("def call_end("):]
+    body = body[:body.index(chr(10) + "@app.", 10)]
+    assert "learn_about_caller" in body, "the notes are only kept by hand"
+
+
 @check("the public pages Google verification needs are there")
 def _():
     """Verification wants a privacy policy and terms on a domain you own,
@@ -2319,6 +2374,20 @@ def _():
     line = agent.login_failure_line("amazon", "no_results", "m", 0, "u@x.com")
     assert "do NOT say they have no orders" in line, line
     assert "doesn't exist" in line, line
+
+
+@check("the assistant is told what it already knows about the caller")
+def _():
+    inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                           "+1555", 1, "", "Hard of hearing - speak up.")
+    text = inst.instructions
+    assert "WHAT WE KNOW ABOUT THIS PERSON" in text
+    assert "Hard of hearing" in text, "the notes never reach the model"
+    blank = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                            "+1555", 1)
+    assert "first time" in blank.instructions,         "with no notes it should say so, not show an empty heading"
+    src = open("agent.py", encoding="utf-8").read()
+    assert 'backend_get("/profile"' in src,         "nothing loads the notes when a call starts"
 
 
 @check("nothing an email tool does is permanent")

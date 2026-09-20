@@ -378,6 +378,20 @@ class Usage(Base):
     breakdown = Column(Text, default="")
 
 
+class Profile(Base):
+    """The standing facts about one customer - not what was said, what is
+    TRUE: how they like things done, who their family are, what they order,
+    what they can and can't manage. Built up after each call and read at the
+    start of the next, so nobody has to explain themselves twice."""
+    __tablename__ = "profiles"
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"), unique=True)
+    notes = Column(Text, default="")          # one fact per line
+    updated = Column(DateTime, default=datetime.utcnow)
+    by_hand = Column(Text, default="")        # what staff added; never
+    #                                           overwritten by the system
+
+
 class Change(Base):
     """Everything done on a customer's behalf: an email sent, a file
     changed, a card charged. The live log carries every step of every job
@@ -5906,6 +5920,113 @@ Answer as JSON only:
  "verdict": "<one line for the office>"}"""
 
 
+PROFILE_SYSTEM = """You keep the notes a telephone assistant reads before
+speaking to someone it has helped before.
+
+You are given the notes so far and a transcript of the call that just
+finished. Return the notes as they should now stand.
+
+Keep only STANDING facts - things likely to matter on a future call:
+- how they need to be spoken to (hard of hearing, prefers Yiddish words,
+  speaks slowly, gets tired)
+- who their people are and how they refer to them ("my son Moshe",
+  "the office" = their bookkeeper)
+- which mailbox is which, which shops they use, what they buy regularly
+- how they like things done ("always read the total twice", "never order
+  before Sunday")
+- what has gone wrong for them before, and what worked instead
+- anything they asked us to remember
+
+Never keep:
+- passwords, PINs, codes, card numbers, or anything secret
+- one-off details of a single call (what was said, an order number)
+- guesses. If you are not sure it is true, leave it out.
+- anything about health, religion or family circumstances beyond what is
+  needed to do the job
+
+Rules: one short fact per line, plain English, no bullets or numbering.
+At most 25 lines. Keep every line from the existing notes that is still
+true; drop what the call shows is wrong; add what is new. If the call
+adds nothing, return the notes unchanged."""
+
+
+def learn_about_caller(call_id: int) -> dict:
+    """Update what we know about this customer from the call that just
+    ended. Runs on its own after every call."""
+    db = Session()
+    call = db.query(Call).filter_by(id=call_id).first()
+    if not call or not call.account_id:
+        db.close()
+        return {"skipped": "no account"}
+    account_id = call.account_id
+    turns = (db.query(CallTurn).filter_by(call_id=call_id)
+               .order_by(CallTurn.id).all())
+    row = db.query(Profile).filter_by(account_id=account_id).first()
+    before = (row.notes if row else "") or ""
+    by_hand = (row.by_hand if row else "") or ""
+    db.close()
+    said = [f"{t.who}: {(t.text or '')[:300]}" for t in turns
+            if t.who in ("caller", "agent")]
+    if len(said) < 4 or not OPENAI_API_KEY:
+        return {"skipped": "too short"}
+    msgs = [{"role": "system", "content": PROFILE_SYSTEM},
+            {"role": "user", "content":
+                f"NOTES SO FAR:\n{before or '(none yet)'}\n\n"
+                f"THE CALL:\n" + "\n".join(said)[:6000]}]
+    try:
+        d = _openai_chat(msgs, model=MODEL_ADVISOR, account_id=account_id,
+                         call_id=call_id, cheap=False)
+        notes = (d["choices"][0]["message"].get("content") or "").strip()
+    except Exception as e:
+        emit("profile", f"call {call_id}", f"could not update the notes: "
+                                           f"{str(e)[:150]}", "warn",
+             account_id)
+        return {"error": str(e)[:200]}
+
+    # Same rule as everywhere else: a secret never gets written down, even
+    # if a model decides it is worth remembering.
+    notes = scrub(notes)[:4000]
+    lines = [ln.strip(" -*\t") for ln in notes.splitlines() if ln.strip()]
+    notes = "\n".join(lines[:25])
+    if not notes:
+        return {"skipped": "nothing to keep"}
+
+    db = Session()
+    row = db.query(Profile).filter_by(account_id=account_id).first()
+    if row:
+        row.notes = notes
+        row.updated = datetime.utcnow()
+    else:
+        db.add(Profile(account_id=account_id, notes=notes))
+    db.commit()
+    db.close()
+    added = len(lines) - len([x for x in before.splitlines() if x.strip()])
+    if added > 0:
+        record_change(account_id, "notes", "learned",
+                      f"added {added} thing(s) to what we know about them",
+                      call_id=call_id)
+    emit("profile", f"call {call_id}", "what we know about them was updated",
+         "info", account_id)
+    return {"account_id": account_id, "notes": notes, "by_hand": by_hand}
+
+
+def profile_for(account_id: int) -> str:
+    """What the assistant is told before it speaks to them. Staff notes
+    first: a person who took the trouble to write something knows more
+    than the model does."""
+    db = Session()
+    row = db.query(Profile).filter_by(account_id=account_id).first()
+    db.close()
+    if not row:
+        return ""
+    parts = []
+    if (row.by_hand or "").strip():
+        parts.append("FROM THE OFFICE:\n" + row.by_hand.strip())
+    if (row.notes or "").strip():
+        parts.append("FROM EARLIER CALLS:\n" + row.notes.strip())
+    return "\n\n".join(parts)
+
+
 def review_call(call_id: int) -> dict:
     """Read a finished call and flag anything the assistant said that the
     record doesn't back up. Runs on its own after every call, so a customer
@@ -7090,6 +7211,7 @@ def call_end(request: Request, call_id: int, background: BackgroundTasks,
     # support. Nobody should have to ring in to report it.
     try:
         background.add_task(review_call, call_id)
+        background.add_task(learn_about_caller, call_id)
     except Exception:
         pass
     return {"ok": True}
@@ -7121,6 +7243,53 @@ def calls_review(request: Request, call_id: int):
     """Review one finished call by hand. Every call is reviewed anyway."""
     require_auth(request)
     return review_call(call_id)
+
+
+@app.get("/profile")
+def profile_get(request: Request, account_id: int):
+    """What we know about one customer."""
+    require_auth(request)
+    db = Session()
+    row = db.query(Profile).filter_by(account_id=account_id).first()
+    acct = db.query(Account).filter_by(id=account_id).first()
+    out = {"account_id": account_id, "name": acct.name if acct else "",
+           "notes": (row.notes if row else ""),
+           "by_hand": (row.by_hand if row else ""),
+           "updated": local_str(row.updated) if row and row.updated else ""}
+    db.close()
+    out["for_the_assistant"] = profile_for(account_id)
+    return out
+
+
+class ProfileBody(BaseModel):
+    account_id: int
+    by_hand: str = ""
+
+
+@app.post("/profile")
+def profile_set(b: ProfileBody, request: Request):
+    """Staff notes. The system never overwrites these."""
+    require_auth(request)
+    db = Session()
+    row = db.query(Profile).filter_by(account_id=b.account_id).first()
+    if not row:
+        row = Profile(account_id=b.account_id)
+        db.add(row)
+    row.by_hand = scrub(b.by_hand or "")[:4000]
+    row.updated = datetime.utcnow()
+    db.commit()
+    db.close()
+    emit("profile", f"account {b.account_id}", "the office changed their "
+                                               "notes", "info", b.account_id)
+    return {"ok": True}
+
+
+@app.post("/profile/learn")
+def profile_learn(request: Request, call_id: int):
+    """Update the notes from one call by hand. Happens anyway after every
+    call."""
+    require_auth(request)
+    return learn_about_caller(call_id)
 
 
 @app.get("/changes")
