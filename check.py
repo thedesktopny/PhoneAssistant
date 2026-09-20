@@ -1282,6 +1282,54 @@ def _():
     assert r.status_code in (401, 403), f"/charges without auth: {r.status_code}"
 
 
+@check("only a real code is ever typed into a code box")
+def _():
+    """Call 57: the caller had no code, the model called /jobs/code with
+    the words "another way", they survived the cleaner as "anotherway",
+    got typed into Amazon's box, and Amazon said the code was wrong - so
+    the caller was blamed for a mistake we made."""
+    from fastapi.testclient import TestClient
+    c = TestClient(main.app, raise_server_exceptions=False, base_url="https://t")
+    c.post("/admin/login", json={"password": os.environ.get(
+        "ADMIN_PASSWORD", "changeme")})
+    main._JOBS[424243] = {"code": None}
+    for junk in ("another way", "resend", "I didn't get one", "", "???"):
+        r = c.post("/jobs/code", json={"job_id": 424243, "code": junk})
+        assert r.json().get("ok") is False, f"{junk!r} was sent to the site"
+        assert not main._JOBS[424243]["code"], f"{junk!r} was stored"
+    for good in ("123456", "1 2 3 4 5 6", "code is 4821"):
+        r = c.post("/jobs/code", json={"job_id": 424243, "code": good})
+        assert r.json().get("ok") is True, f"{good!r} was refused"
+        main._JOBS[424243]["code"] = None
+    main._JOBS.pop(424243, None)
+
+
+@check("a caller is told where the code was sent, and a wrong one is retried")
+def _():
+    """Call 57: all it said was "Amazon sent them a code". The page said
+    "to your phone ***-***-**96" and the caller asked, fairly, why we
+    couldn't tell them where to look."""
+    seen = ("Enter verification code For your security, we've sent the code "
+            "to your phone ***-***-**96. Resend code")
+    assert main.code_destination(seen) == \
+        "sent the code to your phone ***-***-**96", main.code_destination(seen)
+    assert main.code_destination("Enter the code we emailed to j***@gmail.com")
+    assert main.code_destination("Please enter your password") == ""
+    assert main.CODE_BAD.search("The code you entered is not valid.")
+    assert not main.CODE_BAD.search("Enter the code we sent you.")
+    src = open("main.py", encoding="utf-8").read()
+    body = src[src.index("def _do_site_login("):]
+    body = body[:body.index("\ndef ", 10)]
+    assert "code_destination(seen)" in body, \
+        "the code prompt doesn't say where the code went"
+    assert "for code_try in range(3)" in body, \
+        "one wrong digit still ends the whole sign-in"
+    assert 'reason="bad_code"' in body and 'reason="no_code"' in body, \
+        "a code failure has no reason code, so nothing can act on it"
+    assert "screen: {page_text" not in body, \
+        "the raw page is still read out to the caller on a failure"
+
+
 @check("the public pages Google verification needs are there")
 def _():
     """Verification wants a privacy policy and terms on a domain you own,
@@ -1955,6 +2003,26 @@ def _():
     assert "call started at" in inst.instructions, \
         "the instructions don't say when the call started"
     assert "Never guess a time" in inst.instructions
+
+
+@check("the assistant can't put words in a code box or invent a way out")
+def _():
+    src = open("agent.py", encoding="utf-8").read()
+    body = src[src.index("async def submit_site_code("):]
+    body = body[:body.index("\n    @function_tool")]
+    assert "len(digits) < 3" in body, \
+        "submit_site_code still forwards whatever it is given"
+    body = src[src.index("async def try_another_way("):]
+    body = body[:body.index("\n    @function_tool")]
+    assert "shop sign-in" in body, \
+        "with no Google sign-in running it says nothing useful, and the " \
+        "model invents 'requesting another method'"
+    for reason in ("bad_code", "no_code"):
+        line = agent.login_failure_line("amazon", reason, "msg", 0, "u@x.com")
+        assert line and "amazon" in line.lower(), reason
+    assert "password" in agent.login_failure_line(
+        "amazon", "bad_code", "msg", 0, "u@x.com").lower(), \
+        "a wrong code must not send it back to asking for the password"
 
 
 @check("nothing an email tool does is permanent")

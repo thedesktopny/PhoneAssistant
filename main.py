@@ -1059,6 +1059,28 @@ def looks_like_bot_check(text: str) -> bool:
     return bool(text and BOT_CHECK_MARKS.search(text))
 
 
+CODE_DEST = _re_scrub.compile(
+    r"(?i)(sent (?:the |a |your )?(?:code|otp)[^.<]{0,60}|"
+    r"code (?:was )?sent to[^.<]{0,40}|"
+    r"(?:emailed|texted|messaged|called) (?:it )?to[^.<]{0,40}|"
+    r"(?:to|on) your (?:phone|email|mobile|number)[^.<]{0,40}|"
+    r"(?:phone|email|number|address) (?:ending|ending in)[^.<]{0,20}|"
+    r"\*{2,}[-\s]*\d{2,4})")
+
+CODE_BAD = _re_scrub.compile(
+    r"(?i)(code (?:you entered )?is not valid|invalid code|"
+    r"incorrect code|wrong code|code (?:is )?expired|"
+    r"couldn.t verify the code|enter a valid code)")
+
+
+def code_destination(text: str) -> str:
+    """Where a site says it sent its one-time code. A caller who is told
+    only "they sent a code" has nowhere to look; the page nearly always
+    says "to your phone ***-**96" and we were throwing that away."""
+    m = CODE_DEST.search(text or "")
+    return " ".join(m.group(0).split())[:120] if m else ""
+
+
 def looks_signed_out(text: str) -> bool:
     """A page that shows sign-in prompts and no account name."""
     if not text:
@@ -3735,28 +3757,54 @@ def _do_site_login(jid: int, account_id: int, site: str):
                     pass
                 settle(page, 6000)
 
-            # One-time code?
-            if q(page, cfg["otp_sel"]):
-                _job_set(jid, "needs_code",
-                         f"{site.title()} sent them a code. Ask them to read "
-                         f"it out.")
+            # One-time code? Up to three goes: a misheard digit is the
+            # normal case, and one wrong code used to end the sign-in.
+            for code_try in range(3):
+                if not q(page, cfg["otp_sel"]):
+                    break
+                seen = page_text(page, 1500)
+                where = code_destination(seen)
+                if CODE_BAD.search(seen or ""):
+                    note = (f"That code wasn't accepted by {site.title()}. "
+                            f"Ask them to read the newest code again, "
+                            f"digit by digit.")
+                elif where:
+                    note = (f"{site.title()} sent a code - {where}. Ask them "
+                            f"to read it out.")
+                else:
+                    note = (f"{site.title()} is asking for a code but does "
+                            f"not say where it sent it. Tell them that, and "
+                            f"ask them to check their phone and their email.")
+                _job_set(jid, "needs_code", note)
                 waited = 0
-                got = False
+                code = None
                 while waited < 240:
                     time.sleep(3)
                     waited += 3
+                    if (_JOBS.get(jid) or {}).get("cancelled"):
+                        break
                     code = (_JOBS.get(jid) or {}).get("code")
                     if code:
                         _JOBS[jid]["code"] = None
-                        otp_el = q(page, cfg["otp_sel"])
-                        if otp_el:
-                            do_fill(page, otp_el, code, True, 6000)
-                            got = True
                         break
-                if not got:
-                    _job_set(jid, "failed", "Timed out waiting for the code.")
+                if not code:
+                    _job_set(jid, "failed", "Timed out waiting for the code.",
+                             reason="no_code")
                     browser.close()
                     return
+                otp_el = q(page, cfg["otp_sel"])
+                if not otp_el:
+                    break
+                do_fill(page, otp_el, code, True, 6000)
+                settle(page, 4000)
+                if not CODE_BAD.search(page_text(page, 1500) or ""):
+                    break
+            else:
+                _job_set(jid, "failed",
+                         f"{site.title()} refused the code three times.",
+                         reason="bad_code")
+                browser.close()
+                return
 
             settle(page, 3000)
             screen = page_text(page, 1500)
@@ -3776,9 +3824,18 @@ def _do_site_login(jid: int, account_id: int, site: str):
                 _job_set(jid, "done",
                          f"Signed in to {site} and saved the session.")
             else:
-                _job_set(jid, "failed",
-                         f"Sign-in didn't complete - {why}. "
-                         f"screen: {page_text(page, 220)}")
+                seen = page_text(page, 1500) or ""
+                if q(page, cfg["otp_sel"]) or CODE_BAD.search(seen):
+                    where = code_destination(seen)
+                    _job_set(jid, "failed",
+                             f"{site.title()} is still asking for a code"
+                             + (f" - {where}" if where else "")
+                             + ". The code we tried wasn't accepted.",
+                             reason="bad_code")
+                else:
+                    _job_set(jid, "failed",
+                             f"Sign-in didn't complete - {why}.",
+                             reason="stuck")
             browser.close()
     except Exception as e:
         detail = " url=" + page_url(page)[:100] if page else ""
@@ -6885,10 +6942,15 @@ def job_code(b: JobCode, request: Request):
         clean = "".join(ch for ch in b.code
                         if ("0" <= ch <= "9") or ("a" <= ch <= "z")
                         or ("A" <= ch <= "Z"))
-        if not clean:
+        # It has to LOOK like a code. The model once sent the words
+        # "another way" here; they survived as "anotherway" and were
+        # typed into Amazon's code box, which then said the code was
+        # wrong - and the caller was blamed for it.
+        digits = sum(ch.isdigit() for ch in clean)
+        if not clean or digits < 3 or len(clean) > 10:
             emit("job", f"job {b.job_id}",
-                 "the code came through unreadable - ask them to say the "
-                 "digits again, slowly", "warn")
+                 "that wasn't a code - ask them to say the digits again, "
+                 "slowly", "warn")
             return {"ok": False, "reason": "unreadable"}
         _JOBS[b.job_id]["code"] = clean
         return {"ok": True}

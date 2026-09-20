@@ -267,6 +267,14 @@ def login_failure_line(site: str, reason: str, msg: str, fails: int,
                 f"don't do those. Tell them plainly that the site is "
                 f"blocking us today, offer to leave a note for the office, "
                 f"and move on. Do NOT retry and do not ask for a password.")
+    if reason == "bad_code":
+        return (f"{site} would not accept the code. Say so plainly, tell "
+                f"them where the site said it sent the code, and offer to "
+                f"try once more with a fresh code or to have the office "
+                f"call them back. Do NOT ask for their password.")
+    if reason == "no_code":
+        return (f"Nobody read a code out, so {site} timed us out. Offer to "
+                f"start again when they have the code in front of them.")
     if reason == "cancelled":
         return "That was stopped because the call ended."
     if reason == "stuck":
@@ -951,6 +959,9 @@ Never pick one for them silently.
                 if d.get("reason") == "bad_password":
                     return (f"Say the site didn't accept the password: "
                             f"{msg}")
+                if d.get("reason") in ("bad_code", "no_code"):
+                    return (f"Say this plainly, in your own words: {msg} "
+                            f"Do not ask for their password.")
                 return f"Say it didn't work: {msg}."
             return None
 
@@ -2176,6 +2187,11 @@ Never pick one for them silently.
         """Give the site the one-time code the caller read out."""
         if not getattr(self, "job_id", None):
             return "No sign-in running."
+        digits = "".join(ch for ch in (code or "") if ch.isdigit())
+        if len(digits) < 3:
+            return ("That is not a code. Ask them to read out the digits "
+                    "from the message, slowly, and call this again with "
+                    "just those digits. Never send anything else here.")
         try:
             await backend_post("/jobs/code",
                                {"job_id": self.job_id, "code": code})
@@ -2680,6 +2696,14 @@ Never pick one for them silently.
         """If the caller can't tap the notification on their phone, ask
         Google to text them a code instead."""
         if not getattr(self, "onboard_sid", None):
+            if getattr(self, "job_id", None):
+                return ("This is a shop sign-in, not Google, and the shop "
+                        "chooses how it sends the code - there is no other "
+                        "way to ask for. Tell them where the site said it "
+                        "sent the code, ask them to look there, and offer "
+                        "to have the office call them back if it never "
+                        "arrives. Do NOT call submit_site_code with "
+                        "anything but digits they read out.")
             return "No sign-in running."
         try:
             async with httpx.AsyncClient(timeout=20) as c:
