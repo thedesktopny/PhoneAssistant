@@ -2797,6 +2797,10 @@ def _():
     body = src[src.index("def job_price("):]
     body = body[:body.index(chr(10) + "@app.", 10)]
     assert "tool_web_search(" in body, "the price job still browses Google"
+    # and no browse job may navigate to a search engine at all
+    run = src[src.index("def _run_browse("):]
+    run = run[:run.index(chr(10) + "def ", 10)]
+    assert "duckduckgo" in run and "kept off the search" in run,         "a job can still drive Google and be met with a puzzle"
     assert '"google." ' in body or '"google."' in body,         "search engines are not filtered out of the shop list"
     goal = main.PRICE_GOAL.format(item="shoes")
     for must in ("found", "never from a search summary", "Buy nothing"):

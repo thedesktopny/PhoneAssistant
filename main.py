@@ -5156,6 +5156,22 @@ def _run_browse(jid: int, account_id: int, site: str):
                                          "text": _as_placeholder(val, subject),
                                          "enter": bool(act.get("enter"))})
                     elif a == "goto":
+                        where = (act.get("url") or "").lower()
+                        # Search engines answer a robot with a puzzle. The
+                        # model kept navigating to Google when it wanted
+                        # more shops, and the job died there having priced
+                        # nothing. Searching happens before the browser
+                        # opens, through the search API.
+                        if _re_scrub.search(
+                                r"(?i)://(www\.)?(google|bing|duckduckgo|"
+                                r"search\.yahoo)\.", where):
+                            note = ("Search engines refuse a browser. Use "
+                                    "the pages you were given, or answer "
+                                    "with what you have.")
+                            history.append(note)
+                            _job_set(jid, "working", "kept off the search "
+                                                     "engines")
+                            continue
                         do_goto(page, act["url"])
                         recorded.append({"action": "goto", "url": act["url"]})
                     elif a == "back":
@@ -8070,8 +8086,15 @@ def job_price(request: Request, account_id: int, item: str,
     # answers a browser with a captcha, and the job died at the front door
     # having priced nothing.
     shops, seen = [], set()
+    hits = []
+    for q in (f"{item} price", f"buy {item} online"):
+        try:
+            hits += (tool_web_search(q) or {}).get("results", [])
+        except Exception as e:
+            emit("browse", "price", f"search failed: {str(e)[:120]}", "warn",
+                 account_id)
     try:
-        got = tool_web_search(f"{item} price buy")
+        got = {"results": hits}
         for r in got.get("results", []):
             link = (r.get("link") or r.get("url") or "").strip()
             low = link.lower()
@@ -8091,7 +8114,7 @@ def job_price(request: Request, account_id: int, item: str,
         raise HTTPException(503, "Couldn't find anywhere selling that.")
     jid = start_job(account_id, "browse", "", call_id=call_id or None,
                     payload={"goal": PRICE_GOAL.format(item=item[:120]),
-                             "url": shops[0], "urls": shops[1:5],
+                             "url": shops[0], "urls": shops[1:6],
                              "max_steps": 20, "query": item[:120]})
     return {"job_id": jid, "state": "queued", "shops": len(shops)}
 
