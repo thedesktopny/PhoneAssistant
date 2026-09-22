@@ -1441,24 +1441,25 @@ def _():
     assert facts["finished"][0]["reason"] == "bad_code", facts["finished"]
     assert facts["now"] and facts["name"] == "Advice Tester"
 
-    real = main._openai_chat
+    import advisor
+    real = advisor._openai_chat
     try:
         # the model tries the exact mistake from call 58
-        main._openai_chat = lambda *a, **k: {"choices": [{"message": {
+        advisor._openai_chat = lambda *a, **k: {"choices": [{"message": {
             "content": '{"say": "Understood, I am handling that now.",'
                        ' "next": "", "why": "x"}'}}]}
         out = main.advise(aid, 77001, "the caller cannot reach the code")
         assert out.get("corrected"), "a false 'handling it' went through"
         assert out["say"].startswith("Nothing is running"), out["say"]
         # an honest answer is left alone
-        main._openai_chat = lambda *a, **k: {"choices": [{"message": {
+        advisor._openai_chat = lambda *a, **k: {"choices": [{"message": {
             "content": '{"say": "Amazon would not take the code, so I have '
                        'stopped. Shall I try later?", "next": "", "why": "x"}'
         }}]}
         out = main.advise(aid, 77001, "the code was refused")
         assert not out.get("corrected") and "stopped" in out["say"], out
         # a blocked subject still gets the fixed refusal
-        main._openai_chat = lambda *a, **k: {"choices": [{"message": {
+        advisor._openai_chat = lambda *a, **k: {"choices": [{"message": {
             "content": '{"say": "Here are today\'s news headlines and sports '
                        'scores.", "next": "", "why": "x"}'}}]}
         assert main.advise(aid, 77001, "they asked for the news")["say"] \
@@ -1466,10 +1467,10 @@ def _():
         # and a model that falls over never produces a guess
         def boom(*a, **k):
             raise RuntimeError("no model")
-        main._openai_chat = boom
+        advisor._openai_chat = boom
         assert main.advise(aid, 77001, "anything")["say"] == ""
     finally:
-        main._openai_chat = real
+        advisor._openai_chat = real
     paths = {r.path for r in main.app.routes}
     for p in ("/advise", "/state", "/calls/review", "/reviews"):
         assert p in paths, f"route missing: {p}"
@@ -1491,9 +1492,10 @@ def _():
     db.commit()
     db.close()
 
-    real = main._openai_chat
+    import advisor
+    real = advisor._openai_chat
     try:
-        main._openai_chat = lambda *a, **k: {"choices": [{"message": {
+        advisor._openai_chat = lambda *a, **k: {"choices": [{"message": {
             "content": '{"problems": [{"quote": "Understood. I am handling '
                        'that.", "why": "nothing was running", "severity": '
                        '"high"}], "verdict": "claimed work that never '
@@ -1507,7 +1509,7 @@ def _():
         assert notes, "the office never hears about it"
         assert "handling" in notes[0].note
         # a clean call leaves no note
-        main._openai_chat = lambda *a, **k: {"choices": [{"message": {
+        advisor._openai_chat = lambda *a, **k: {"choices": [{"message": {
             "content": '{"problems": [], "verdict": "fine"}'}}]}
         main.review_call(77002)
         db = main.Session()
@@ -1516,7 +1518,7 @@ def _():
         db.close()
         assert len(again) == 1, "a clean call raised a note anyway"
     finally:
-        main._openai_chat = real
+        advisor._openai_chat = real
     # and it happens on its own when a call ends
     src = source()
     body = src[src.index("def call_end("):]
@@ -1629,9 +1631,10 @@ def _():
     made = ("Hard of hearing - speak up and slow down." + chr(10)
             + "- His son Moshe orders his copy paper." + chr(10)
             + "His PIN is 1234 and the password is Hunter22.")
-    real = main._openai_chat
+    import advisor
+    real = advisor._openai_chat
     try:
-        main._openai_chat = lambda *a, **k: {
+        advisor._openai_chat = lambda *a, **k: {
             "choices": [{"message": {"content": made}}]}
         notes = main.learn_about_caller(78010)["notes"]
         assert "Hard of hearing" in notes and "Moshe" in notes, notes
@@ -1656,13 +1659,13 @@ def _():
         # not a fact about the person and was being read back as one
         for junk in ("No notes available.", "None.", "Nothing to add",
                      "N/A"):
-            main._openai_chat = (lambda t: (lambda *a, **k: {"choices": [
+            advisor._openai_chat = (lambda t: (lambda *a, **k: {"choices": [
                 {"message": {"content": t}}]}))(junk)
             assert main.learn_about_caller(78010).get("skipped"), junk
         kept = c.get("/profile?account_id=" + str(aid)).json()["notes"]
         assert "No notes" not in kept, kept
     finally:
-        main._openai_chat = real
+        advisor._openai_chat = real
     src = source()
     body = src[src.index("def call_end("):]
     body = body[:body.index(chr(10) + "@app.", 10)]

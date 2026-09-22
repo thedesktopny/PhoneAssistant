@@ -114,6 +114,14 @@ SCOPES = [
 # report a missing permission on their own.
 os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 
+# Work running right now, by job id: the code a caller has just read
+# out, and whether the caller hung up. In memory on purpose - it dies
+# with the process, and anything that must outlive a call is in the
+# database. Kept here because both the runners and the advisor need to
+# know what is actually running.
+_JOBS = {}          # job_id -> {"code": str|None, "cancelled": bool}
+
+
 # Which model does which job. Change these in Railway, not here: the
 # browser and the advisor do the thinking, the other two are small
 # helpers where an older model is cheaper and good enough.
