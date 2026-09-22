@@ -1982,6 +1982,43 @@ def _():
     assert "record_block(" in body[i:i + 1200],         "a job that reports a block instead of failing records nothing"
 
 
+@check("a price is for the thing they asked for, not a lookalike")
+def _():
+    """Shopping listings match loosely. Asked for an ECCO New Jersey, the
+    listings came back with the Byway, the S Lite and the Move - and the
+    cheapest of those was the wrong shoe at the right price."""
+    made = {"shopping": [
+        {"title": "ECCO New Jersey Leather Slip-On", "source": "Zappos",
+         "price": "$126.00", "link": "https://z"},
+        {"title": "ECCO Byway Slip-On Sneakers", "source": "6pm.com",
+         "price": "$67.49", "link": "https://s"},
+        {"title": "ECCO Move Men's Slip On", "source": "Nordstrom Rack",
+         "price": "$79.97", "link": "https://n"},
+        {"title": "ECCO New Jersey Bike Toe Derby", "source": "Amazon",
+         "price": "$131.91", "link": "https://a"},
+    ]}
+    real_key, real_call = main.SERPER_API_KEY, main._serper_shopping
+    try:
+        main.SERPER_API_KEY = "x"
+        main._serper_shopping = lambda item: made
+        got = main.shopping_prices("ECCO New Jersey mens shoes")
+        shops = [o["shop"] for o in got["offers"]]
+        assert got["exact"] is True, got
+        assert "6pm.com" not in shops and "Nordstrom Rack" not in shops,             f"a different shoe was priced as theirs: {shops}"
+        assert shops == ["Zappos", "Amazon"], shops
+        assert got["offers"][0]["price"] == "$126.00", got["offers"][0]
+        # when nothing matches exactly it says so, instead of pretending
+        made["shopping"] = [made["shopping"][1], made["shopping"][2]]
+        got = main.shopping_prices("ECCO New Jersey mens shoes")
+        assert got["exact"] is False, got
+        assert not got["offers"], "a different shoe was offered as theirs"
+        assert "exact item" in got["answer"], got
+        # and with nothing to quote, the caller is told plainly, so the
+        # assistant falls back to reading the shop pages themselves
+    finally:
+        main.SERPER_API_KEY, main._serper_shopping = real_key, real_call
+
+
 @check("the public pages Google verification needs are there")
 def _():
     """Verification wants a privacy policy and terms on a domain you own,

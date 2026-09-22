@@ -2392,6 +2392,18 @@ def _search_tavily(q: str) -> dict:
     }
 
 
+def _serper_shopping(item: str) -> dict:
+    """The shopping block for one query. Its own function so a test can
+    stand in for the network without reaching into urllib."""
+    payload = json.dumps({"q": item, "num": 20}).encode()
+    req = urllib.request.Request(
+        "https://google.serper.dev/shopping", data=payload,
+        headers={"X-API-KEY": SERPER_API_KEY,
+                 "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode())
+
+
 def _money(text: str) -> float:
     """$1,299.99 -> 1299.99. Anything unreadable sorts last."""
     digits = "".join(ch for ch in (text or "")
@@ -2410,14 +2422,8 @@ def shopping_prices(item: str, limit: int = 8) -> dict:
         return {"blocked": True, "answer": BLOCKED_REPLY, "offers": []}
     if not SERPER_API_KEY:
         return {"offers": [], "error": "shopping search isn't configured"}
-    payload = json.dumps({"q": item, "num": 20}).encode()
-    req = urllib.request.Request(
-        "https://google.serper.dev/shopping", data=payload,
-        headers={"X-API-KEY": SERPER_API_KEY,
-                 "Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            d = json.loads(r.read().decode())
+        d = _serper_shopping(item)
     except Exception as e:
         return {"offers": [], "error": str(e)[:200]}
 
@@ -2435,6 +2441,29 @@ def shopping_prices(item: str, limit: int = 8) -> dict:
             "rating": x.get("rating"),
             "link": (x.get("link") or "")[:400],
         })
+    # Shopping results match loosely: asking for an ECCO New Jersey
+    # returns the Byway, the S Lite and the Move, and the cheapest of
+    # those is the wrong shoe at the right price. Only compare listings
+    # that are actually the thing they asked for.
+    GENERIC = {"the", "and", "for", "with", "mens", "men", "womens", "women",
+               "shoes", "shoe", "size", "pack", "inch", "inches", "new"}
+    words = [w for w in _re_scrub.split(r"[^a-z0-9]+", item.lower())
+             if len(w) > 2]
+    wanted = [w for w in words if w not in GENERIC] or words
+
+    def _fits(title: str) -> float:
+        low = (title or "").lower()
+        if not wanted:
+            return 1.0
+        return sum(1 for w in wanted if w in low) / len(wanted)
+
+    offers_seen = len(offers)
+    for o in offers:
+        o["match"] = round(_fits(o["title"]), 2)
+    exact = [o for o in offers if o["match"] >= 0.99]
+    close = [o for o in offers if 0.6 <= o["match"] < 0.99]
+    offers = exact or close
+    same_thing = bool(exact)
     offers.sort(key=lambda o: o["amount"])
     # one line per shop: five listings from the same shop is not a choice
     seen, kept = set(), []
@@ -2455,7 +2484,15 @@ def shopping_prices(item: str, limit: int = 8) -> dict:
         if rest:
             said += ", then " + ", ".join(rest)
         said += "."
-    return {"offers": kept, "answer": said, "checked": len(offers)}
+        if not same_thing:
+            said = ("I could not find that exact one, so these are the "
+                    "closest: " + said)
+    elif offers_seen:
+        # listings came back, but for other things entirely. Saying
+        # nothing here is how the wrong shoe gets priced as theirs.
+        said = ("Nothing in the shopping listings is that exact item.")
+    return {"offers": kept, "answer": said, "checked": len(offers),
+            "exact": same_thing}
 
 
 def tool_web_search(query: str, near: str = "") -> dict:
