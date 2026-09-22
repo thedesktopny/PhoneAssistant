@@ -23,6 +23,30 @@ os.environ.setdefault("LIVEKIT_API_SECRET", "x")
 os.environ.setdefault("OPENAI_API_KEY", "x")
 os.environ.setdefault("DATABASE_URL", "sqlite:///check_tmp.db")
 
+def everywhere(name, value):
+    """Set a name in every backend module that has one, and give back a
+    function that puts them all back.
+
+    A star-import hands each module its own reference, so patching one
+    module's copy leaves the others on the real thing - which is how a
+    test reached the live Stripe API after a function moved house. A
+    check should not have to know which file something lives in.
+    """
+    import glob
+    import sys as _sys
+    changed = []
+    for f in sorted(glob.glob("*.py")):
+        mod = _sys.modules.get(f[:-3])
+        if mod is not None and hasattr(mod, name):
+            changed.append((mod, getattr(mod, name)))
+            setattr(mod, name, value)
+
+    def restore():
+        for mod, was in changed:
+            setattr(mod, name, was)
+    return restore
+
+
 def source(which: str = "backend") -> str:
     """The backend source, whichever file it lives in.
 
@@ -734,8 +758,8 @@ def _():
                 "card": {"brand": "visa", "last4": "4242",
                          "exp_month": 12, "exp_year": 2034}}
 
-    real_key, real_post = main.STRIPE_SECRET_KEY, main._stripe
-    main.STRIPE_SECRET_KEY, main._stripe = "sk_test_probe", fake_stripe
+    undo_key = everywhere("STRIPE_SECRET_KEY", "sk_test_probe")
+    undo_post = everywhere("_stripe", fake_stripe)
     try:
         from fastapi.testclient import TestClient
         c = TestClient(main.app, raise_server_exceptions=False,
@@ -753,7 +777,8 @@ def _():
         listed = c.get("/cards?account_id=960001").json()
         assert listed and listed[0]["last4"] == "4242"
     finally:
-        main.STRIPE_SECRET_KEY, main._stripe = real_key, real_post
+        undo_key()
+        undo_post()
 
     # the digits must not be anywhere in the stored secret
     db = main.Session()
@@ -784,8 +809,8 @@ def _():
             400, "Sending credit card numbers directly to the Stripe API "
                  "is generally unsafe.")
 
-    real_key, real_post = main.STRIPE_SECRET_KEY, main._stripe
-    main.STRIPE_SECRET_KEY, main._stripe = "sk_test_probe", refuses
+    undo_key = everywhere("STRIPE_SECRET_KEY", "sk_test_probe")
+    undo_post = everywhere("_stripe", refuses)
     try:
         from fastapi.testclient import TestClient
         c = TestClient(main.app, raise_server_exceptions=False,
@@ -799,7 +824,8 @@ def _():
             f"a caller's card failed to save: {r.status_code} {r.text[:160]}"
         assert r.json().get("last4") == "4242", r.json()
     finally:
-        main.STRIPE_SECRET_KEY, main._stripe = real_key, real_post
+        undo_key()
+        undo_post()
     db = main.Session()
     for row in db.query(main.PaymentCard).filter_by(account_id=960002).all():
         db.delete(row)
@@ -1236,7 +1262,8 @@ def _():
                 raise state["charge_error"]
             return {"id": "pi_T", "status": "succeeded"}
         raise AssertionError(path)
-    main._stripe_call, main.STRIPE_SECRET_KEY = fake, "sk_test_x"
+    undo_call = everywhere("_stripe_call", fake)
+    undo_key = everywhere("STRIPE_SECRET_KEY", "sk_test_x")
     try:
         r = c.post("/card", json={"phone": "(845) 555-0177",
                                   "code": main._connect_code(aid, purpose="card")})
@@ -1294,7 +1321,8 @@ def _():
         assert main.stripe_charge(aid, card_id, 1000, "x", "k4")["reason"] \
             == "needs_authentication"
     finally:
-        main._stripe_call, main.STRIPE_SECRET_KEY = real_call, real_key
+        undo_call()
+        undo_key()
         main._CONNECT_FAILS.clear()
     # charging is never open to the public
     r = c.post("/charges", json={"account_id": aid, "card_id": card_id,

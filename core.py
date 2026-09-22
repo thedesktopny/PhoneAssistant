@@ -114,6 +114,18 @@ SCOPES = [
 # report a missing permission on their own.
 os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 
+# Which model does which job. Change these in Railway, not here: the
+# browser and the advisor do the thinking, the other two are small
+# helpers where an older model is cheaper and good enough.
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+MODEL_BROWSER = os.environ.get("MODEL_BROWSER", "gpt-4o")
+MODEL_SUMMARY = os.environ.get("MODEL_SUMMARY", "gpt-4o-mini")
+MODEL_TEXT = os.environ.get("MODEL_TEXT", "gpt-4o-mini")
+# Send the browser a picture of the page as well as its text. Set to 0 to
+# go back to text only.
+BROWSER_VISION = os.environ.get("BROWSER_VISION", "1") not in ("0", "false")
+MODEL_ADVISOR = os.environ.get("MODEL_ADVISOR", MODEL_BROWSER)
+
 fernet = Fernet(ENCRYPTION_KEY.encode())
 
 # ----------------------------------------------------------------- database
