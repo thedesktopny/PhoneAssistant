@@ -8066,10 +8066,34 @@ def job_price(request: Request, account_id: int, item: str,
         return {"blocked": True, "answer": BLOCKED_REPLY}
     if not BROWSERBASE_API_KEY:
         raise HTTPException(400, "Browserbase isn't configured.")
+    # Find the shops with the search API, not by driving Google: Google
+    # answers a browser with a captcha, and the job died at the front door
+    # having priced nothing.
+    shops, seen = [], set()
+    try:
+        got = tool_web_search(f"{item} price buy")
+        for r in got.get("results", []):
+            link = (r.get("link") or r.get("url") or "").strip()
+            low = link.lower()
+            if not low.startswith("http"):
+                continue
+            host = low.split("/")[2] if len(low.split("/")) > 2 else low
+            if host in seen or any(bad in host for bad in
+                                   ("google.", "youtube.", "facebook.",
+                                    "reddit.", "pinterest.", "wikipedia.")):
+                continue
+            seen.add(host)
+            shops.append(link)
+    except Exception as e:
+        emit("browse", "price", f"search failed: {str(e)[:120]}", "warn",
+             account_id)
+    if not shops:
+        raise HTTPException(503, "Couldn't find anywhere selling that.")
     jid = start_job(account_id, "browse", "", call_id=call_id or None,
                     payload={"goal": PRICE_GOAL.format(item=item[:120]),
-                             "url": "", "max_steps": 20, "query": item[:120]})
-    return {"job_id": jid, "state": "queued"}
+                             "url": shops[0], "urls": shops[1:5],
+                             "max_steps": 20, "query": item[:120]})
+    return {"job_id": jid, "state": "queued", "shops": len(shops)}
 
 
 @app.post("/jobs/browse")

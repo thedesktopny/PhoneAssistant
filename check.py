@@ -2791,6 +2791,13 @@ def _():
     paths = {r.path for r in main.app.routes}
     assert "/jobs/price" in paths
     # the price job must read shop pages and write each one down
+    # it must not try to drive Google: Google answers a browser with a
+    # captcha, and the first price job died at the front door
+    src = open("main.py", encoding="utf-8").read()
+    body = src[src.index("def job_price("):]
+    body = body[:body.index(chr(10) + "@app.", 10)]
+    assert "tool_web_search(" in body, "the price job still browses Google"
+    assert '"google." ' in body or '"google."' in body,         "search engines are not filtered out of the shop list"
     goal = main.PRICE_GOAL.format(item="shoes")
     for must in ("found", "never from a search summary", "Buy nothing"):
         assert must in goal, must
