@@ -8055,10 +8055,16 @@ def job_checkout(request: Request, account_id: int, site: str,
 
 PRICE_GOAL = """Find out what {item} costs, and where it is cheapest.
 
+These pages were found for you. Open them one at a time with goto, in
+this order:
+{shops}
+
+You cannot search the web from here - search engines refuse a browser,
+and you do not need to: the pages above are the ones to check.
+
 Work like a careful shopper with a phone call waiting:
-1. Search the web for the item by name, with the word price.
-2. Open the most promising shop pages one at a time - up to four. The
-   maker's own site, and the big shops that sell it.
+1. Read the page you are on.
+2. Move to the next page on the list with goto.
 3. On EACH page, before you leave it, record with "found" the shop's name,
    the exact price it shows, whether it says in stock, and any delivery
    cost or discount. If a page does not show a price for this exact item,
@@ -8135,7 +8141,11 @@ def job_price(request: Request, account_id: int, item: str,
     if not shops:
         raise HTTPException(503, "Couldn't find anywhere selling that.")
     jid = start_job(account_id, "browse", "", call_id=call_id or None,
-                    payload={"goal": PRICE_GOAL.format(item=item[:120]),
+                    payload={"goal": PRICE_GOAL.format(
+                        item=item[:120],
+                        shops=chr(10).join(f"  {i + 1}. {u}"
+                                           for i, u in enumerate(
+                                               shops[:5]))),
                              "url": shops[0], "urls": shops[1:6],
                              "max_steps": 20, "query": item[:120]})
     return {"job_id": jid, "state": "queued", "shops": len(shops)}

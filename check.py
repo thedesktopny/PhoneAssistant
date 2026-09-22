@@ -2802,7 +2802,8 @@ def _():
     run = run[:run.index(chr(10) + "def ", 10)]
     assert "duckduckgo" in run and "kept off the search" in run,         "a job can still drive Google and be met with a puzzle"
     assert '"google." ' in body or '"google."' in body,         "search engines are not filtered out of the shop list"
-    goal = main.PRICE_GOAL.format(item="shoes")
+    goal = main.PRICE_GOAL.format(item="shoes", shops="  1. https://shop.example")
+    assert "https://shop.example" in goal, "the shops found are never handed to the job"
     for must in ("found", "never from a search summary", "Buy nothing"):
         assert must in goal, must
 
