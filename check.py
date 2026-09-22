@@ -6,6 +6,7 @@ and fails loudly if anything that has broken before is broken again.
 Add a line to CHECKS every time something new breaks - that's how the
 list earns its keep.
 """
+import io
 import os
 import re
 import sys
@@ -21,6 +22,25 @@ os.environ.setdefault("LIVEKIT_API_KEY", "x")
 os.environ.setdefault("LIVEKIT_API_SECRET", "x")
 os.environ.setdefault("OPENAI_API_KEY", "x")
 os.environ.setdefault("DATABASE_URL", "sqlite:///check_tmp.db")
+
+def source(which: str = "backend") -> str:
+    """The backend source, whichever file it lives in.
+
+    Checks used to read main.py directly, so moving a function into
+    another file broke checks that had nothing to do with the move. A
+    check should care that the rule holds somewhere in the backend, not
+    which file it is typed in.
+    """
+    import glob
+    skip = {"check.py", "scenarios.py", "probe.py"}
+    if which == "agent":
+        files = ["agent.py"]
+    else:
+        files = [f for f in sorted(glob.glob("*.py"))
+                 if f not in skip and f != "agent.py"]
+    return chr(10).join(io.open(f, encoding="utf-8").read()
+                          for f in files)
+
 
 FAILS = []
 
@@ -102,7 +122,7 @@ def _():
 
 @check("no raw page calls outside the safe helpers")
 def _():
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     start = src.index("# --------------------------------------------------- assisted Gmail sign-in")
     # stop at the admin page - its JavaScript legitimately calls .click()
     body = src[start:src.index("ADMIN_HTML = ")]
@@ -124,7 +144,7 @@ def _():
     import ast
     helpers = {"q", "q_all", "page_text", "page_url", "do_click", "do_fill",
                "do_goto", "settle"}
-    tree = ast.parse(open("main.py", encoding="utf-8").read())
+    tree = ast.parse(source())
     bad = set()
     for fn in ast.walk(tree):
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -163,7 +183,7 @@ def _():
 def _():
     """An unknown site must fall through to the general agent, never to a
     dead end that someone has to go and configure."""
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     for dead in ("No setup for", "No order page known"):
         assert dead not in src, (f"'{dead}' still refuses unknown sites - "
                                  f"call _agent_fallback() instead")
@@ -175,7 +195,7 @@ def _():
 
 @check("the browser's model is configurable and nothing is hard-coded")
 def _():
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     assert '"model": "gpt' not in src, \
         "a model name is hard-coded again - use MODEL_BROWSER/SUMMARY/TEXT"
     assert main.MODEL_BROWSER, "MODEL_BROWSER is empty"
@@ -365,7 +385,7 @@ def _():
     """'Signed in and saved the session' summarised against 'what were my
     recent orders' came out as 'I couldn't find any order details'."""
 
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     i = src.index("def job_answer(")
     body = src[i:src.index("\n@app.", i + 10)]
     assert 'row.kind == "site_login"' in body, \
@@ -377,7 +397,7 @@ def _():
     """Asking the browser about each element separately took over two
     minutes for a single step on a big shop, and often returned nothing -
     so the model picked numbers for elements that weren't there."""
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     body = src[src.index("def _page_snapshot("):]
     body = body[:body.index("\ndef ", 10)]
     for slow in ("el.is_visible()", "el.get_attribute(", "el.inner_text()",
@@ -406,7 +426,7 @@ def _():
     """A Target job was still running twenty minutes after the call ended,
     spending browser time and model calls on an answer nobody would hear."""
     assert "/jobs/cancel_for_call" in {r.path for r in main.app.routes}
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     for fn in ("_run_browse", "_run_checkout"):
         body = src[src.index(f"def {fn}("):]
         body = body[:body.index("\ndef ", 10)]
@@ -421,7 +441,7 @@ def _():
     """Everything in the database is UTC. Formatting one directly shows it
     hours out - in the admin panel, the live log, and the history handed to
     the model. They all go through local_str()."""
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     import re as _re
     bad = _re.findall(r"\.(?:at|last_ok|started_at|done_at|placed_at|"
                       r"linked_at)\.strftime\(", src)
@@ -445,7 +465,7 @@ def _():
                    '"check out" in str(e)', '"not signed in" in msg'):
         assert phrase not in src, \
             f"still branching on prose: {phrase} - use the reason code"
-    main_src = open("main.py", encoding="utf-8").read()
+    main_src = source()
     for model in ("class Job(", "class Onboard("):
         body = main_src[main_src.index(model):]
         body = body[:body.index("\nclass ")]
@@ -459,7 +479,7 @@ def _():
     paths = {r.path for r in main.app.routes}
     for p in ("/jobs/cancel_for_call", "/onboard/cancel"):
         assert p in paths, f"no way to stop work at {p}"
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     for fn in ("_run_browse", "_run_checkout", "_run_signin"):
         body = src[src.index(f"def {fn}("):]
         body = body[:body.index("\ndef ", 10)]
@@ -514,7 +534,7 @@ def _():
     assert "same thing a third time" in second, second
     assert "goto" in second, "it should be told to navigate directly instead"
     assert "Stop repeating" in main._stuck_note(3)
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     body = src[src.index("def _run_browse("):]
     body = body[:body.index("\ndef ", 10)]
     assert "STUCK_LIMIT" in body, "_run_browse never gives up on a dead page"
@@ -568,7 +588,7 @@ def _():
     five = main._browser_error(Exception(
         "WebSocket error: wss://connect.browserbase.com/ 500 Internal"))
     assert "Browserbase" in five and "dashboard" in five, five
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     body = src[src.index("def _bb_session("):]
     body = body[:body.index("\ndef ", 10)]
     assert "_flag_account_limit(" in body, \
@@ -581,7 +601,7 @@ def _():
     The hand-written selector missed and the job just failed - the exact
     treadmill the fallback exists to stop. Config is an optimisation; the
     agent is the plan."""
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     inner = src[src.index("def _do_site_login("):]
     inner = inner[:inner.index("\ndef ", 10)]
     # (the Gmail sign-in has its own wording and no agent fallback - this
@@ -604,7 +624,7 @@ def _():
     """_do_site_login dropped the job from _JOBS when it handed over, so
     the caller's answer came back 'that job is no longer running' and
     every handed-over job timed out waiting for a reply that was refused."""
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     inner = src[src.index("def _do_site_login("):]
     inner = inner[:inner.index("\ndef ", 10)]
     assert "_JOBS.pop(" not in inner, \
@@ -626,7 +646,7 @@ def _():
         assert main.looks_like_bot_check(wording), f"missed: {wording!r}"
     assert not main.looks_like_bot_check("hold on, your order is loading")
     assert not main.looks_like_bot_check("")
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     body = src[src.index("def _run_browse("):]
     body = body[:body.index("\ndef ", 10)]
     i = body.index('a == "ask_user"')
@@ -646,7 +666,7 @@ def _():
     assert main._action_index({"index": None}) == -1
     assert main._action_index({"index": "abc"}) == -1
     assert main._action_index({"index": True}) == -1
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     assert 'act.get("index", -1) or -1' not in src, "the or-trap is back"
     assert src.count("_action_index(act)") >= 2, \
         "browse and checkout must both use the safe reader"
@@ -749,7 +769,7 @@ def _():
         "the full card number is still being stored"
     assert held.get("stripe_pm") == "pm_test_123", held
     assert not held.get("number"), "a number was kept alongside the token"
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     assert "NOT\n" in src or "available to type in" in src, \
         "checkout is never told the card can't be typed into a form"
 
@@ -793,7 +813,7 @@ def _():
     and manufacturers block robots. Going back to the agent to choose the
     second result cost the caller half a minute of silence, which is when
     he hung up."""
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     body = src[src.index("def _run_browse("):]
     body = body[:body.index("\ndef ", 10)]
     assert "spares" in body, "no fallback list is carried into the job"
@@ -818,7 +838,7 @@ def _():
     assert main.looks_like_pdf("https://x.com/a.PDF?v=2")
     assert not main.looks_like_pdf("https://youtube.com/watch?v=abc")
     assert not main.looks_like_pdf("")
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     body = src[src.index("def _run_browse("):]
     body = body[:body.index("\ndef ", 10)]
     assert "looks_like_pdf(start)" in body, \
@@ -849,7 +869,7 @@ def _():
             "entertainment.")
     assert len(main.blocked_terms_in(real)) >= 2, \
         "genuinely-news results must still be caught"
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     body = src[src.index("def tool_web_search("):]
     body = body[:body.index("\ndef ", 10)]
     assert "blocked_terms_in(snippets)) >= 2" in body, \
@@ -885,7 +905,7 @@ def _():
         "an expired ticket was accepted"
     assert main._check_link_token("") is None
     # and nothing hands out a raw link any more
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     assert "/link/start?account_id=" not in src, \
         "something still builds a forgeable link"
 
@@ -905,7 +925,7 @@ def _():
     r = c.get("/link/callback?state=x&error=access_denied")
     assert r.status_code == 200 and "Nothing was connected" in r.text, \
         "saying no on Google's screen should get a plain page, not a crash"
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     body = src[src.index("def link_start("):]
     body = body[:body.index("\n@app.", 10)]
     assert "state=str(" not in body and "_flow(state=t)" in body, \
@@ -976,7 +996,7 @@ def _():
     for p in ("/contacts/search", "/contacts/add", "/drive/search",
               "/drive/read", "/todo", "/todo/add", "/todo/done"):
         assert p in paths, f"route missing: {p}"
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     for bad in ("files().delete(", "files().update(", "files().emptyTrash(",
                 "permissions().create(", "people().deleteContact(",
                 "deleteContentRange", "deleteDimension", "values().clear("):
@@ -990,7 +1010,7 @@ def _():
     for every scope on the list, and Google refuses the whole refresh if
     the customer never granted one. Adding Contacts, Drive and Tasks made
     every existing connection fail - reading email included."""
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     body = src[src.index("def token_permissions("):]
     for chunk in (src[src.index("def gmail_client("):
                       src.index("def gmail_client(") + 900],
@@ -1317,7 +1337,7 @@ def _():
     assert main.code_destination("Please enter your password") == ""
     assert main.CODE_BAD.search("The code you entered is not valid.")
     assert not main.CODE_BAD.search("Enter the code we sent you.")
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     body = src[src.index("def _do_site_login("):]
     body = body[:body.index("\ndef ", 10)]
     assert "code_destination(seen)" in body, \
@@ -1361,7 +1381,7 @@ def _():
         assert main.code_from_email(1, "amazon", now - 5000) == ""
     finally:
         main.tool_search_email = real
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     body = src[src.index("def _do_site_login("):]
     body = body[:body.index(chr(10) + "def ", 10)]
     assert "code_from_email(account_id, site, code_since)" in body,         "the sign-in still asks the caller before looking in their email"
@@ -1470,7 +1490,7 @@ def _():
     finally:
         main._openai_chat = real
     # and it happens on its own when a call ends
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     body = src[src.index("def call_end("):]
     body = body[:body.index(chr(10) + "@app.", 10)]
     assert "background.add_task(review_call" in body, \
@@ -1506,7 +1526,7 @@ def _():
                 "Who they are", "Blocked by"):
         assert bit in html, f"admin panel is missing {bit}"
     # the money and email paths actually record something
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     for fn in ("def test_send(", "def email_reply(", "def email_action(",
                "def cal_create(", "def contacts_add(", "def todo_add(",
                "def logins_save(", "def _drive_did(", "def stripe_charge("):
@@ -1549,7 +1569,7 @@ def _():
     finally:
         main._summarise_page = real
         main.page_text = real_text
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     for fn in ("def _run_site_orders(", "def _run_site_search("):
         body = src[src.index(fn):]
         body = body[:body.index(chr(10) + "def ", 10)]
@@ -1615,7 +1635,7 @@ def _():
         assert "No notes" not in kept, kept
     finally:
         main._openai_chat = real
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     body = src[src.index("def call_end("):]
     body = body[:body.index(chr(10) + "@app.", 10)]
     assert "learn_about_caller" in body, "the notes are only kept by hand"
@@ -1644,7 +1664,7 @@ def _():
     assert js.index("removeAttribute('data-pa-idx')") <         js.index("setAttribute('data-pa-idx'"),         "old numbers are cleared after the new ones are set"
     assert js.index("dupes.has(key)") < js.index("cand.sort"),         "duplicates must go before the ranking, or they fill every slot"
     assert "seen > 1500" not in js, "the old budget is still there"
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     assert "_page_snapshot(page, want=goal)" in src, \
         "the browse loop doesn't tell the page reader what it is after"
     body = src[src.index("def _page_snapshot("):]
@@ -1663,7 +1683,7 @@ def _():
     """Being stuck threw the saved session away. The next call then needed
     a fresh sign-in and another code read out over the phone - for what was
     usually a button we simply hadn't seen."""
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     i = src.rindex("if stuck >= STUCK_LIMIT:")
     block = src[i:i + 900]
     assert "looks_signed_out(text)" in block, \
@@ -1705,7 +1725,7 @@ def _():
         assert act["action"] == "click", act
     finally:
         main._openai_chat = real
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     assert 'reason="model_refused"' in src,         "a refusal is still reported as an ordinary give-up"
 
 
@@ -1721,7 +1741,7 @@ def _():
     for safe in ("button: Proceed to checkout", "a: Change address",
                  "button: Add to Cart", "a: Your Orders", "button: Continue"):
         assert not main.BUY_BUTTONS.search(safe), f"blocked wrongly: {safe}"
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     body = src[src.index("def _run_browse("):]
     body = body[:body.index(chr(10) + "def ", 10)]
     i = body.index('if a == "click":')
@@ -1812,7 +1832,7 @@ def _():
     offers 9 things you can use". Amazon draws its results after the shell,
     and we were reading in between, then wandering off to the next page of
     results that didn't exist yet."""
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     body = src[src.index("def _run_browse("):]
     body = body[:body.index(chr(10) + "def ", 10)]
     i = body.index("_page_snapshot(page, want=goal)")
@@ -1841,7 +1861,7 @@ def _():
         assert a == main._body_mark(FakePage(results + "x" * 2000)),             "the same page looks different each time it is read"
     finally:
         main.page_text = real
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     body = src[src.index("def _run_browse("):]
     body = body[:body.index(chr(10) + "def ", 10)]
     assert "page_text(page, 200)" not in body,         "it still decides from the menu at the top of the page"
@@ -1872,7 +1892,7 @@ def _():
         main._openai_chat = real
     js_prompt = main.BROWSE_SYSTEM
     assert '"found"' in js_prompt and "before you leave a page" in         js_prompt.lower(), "nothing tells it to write things down"
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     body = src[src.index("def _run_browse("):]
     body = body[:body.index(chr(10) + "def ", 10)]
     assert "findings.append(noted[:300])" in body, "notes are never kept"
@@ -1904,7 +1924,7 @@ def _():
                    "The page shows two options.",
                    "The cart page says no items are selected."):
         assert not main.claims_action(honest), f"flagged wrongly: {honest}"
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     body = src[src.index("def _run_browse("):]
     body = body[:body.index(chr(10) + "def ", 10)]
     assert "DOING_GOAL.search(goal)" in body,         "a saved shortcut can still answer a goal that asks for an action"
@@ -1969,7 +1989,7 @@ def _():
         "what the page said is not kept, so nothing can be named later"
 
     # and every place a site refuses us records it
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     for fn in ("def _run_browse(", "def _run_site_search("):
         body = src[src.index(fn):]
         body = body[:body.index(chr(10) + "def ", 10)]
@@ -2516,7 +2536,7 @@ def _():
     """The first result for a model number is the page selling it, which
     tells an owner nothing. The lookup kept landing there and getting
     stuck."""
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     body = src[src.index("def _run_browse("):]
     body = body[:body.index("\ndef ", 10)]
     i = body.index("def _rank(")
@@ -2831,7 +2851,7 @@ def _():
     # the price job must read shop pages and write each one down
     # it must not try to drive Google: Google answers a browser with a
     # captcha, and the first price job died at the front door
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     body = src[src.index("def job_price("):]
     body = body[:body.index(chr(10) + "@app.", 10)]
     assert "tool_web_search(" in body, "the price job still browses Google"
@@ -2879,7 +2899,7 @@ def _():
         assert undoable in main.MESSAGE_ACTIONS, f"{undoable} is missing"
     for undo in ("unarchive", "unstar", "not_spam"):
         assert undo in main.MESSAGE_ACTIONS, f"no way to undo: {undo}"
-    src = open("main.py", encoding="utf-8").read()
+    src = source()
     assert "messages().delete(" not in src, \
         "a permanent delete has appeared - trash only, it is recoverable"
     body = src[src.index("def tool_message_action("):]
