@@ -1066,8 +1066,9 @@ def _():
     c.headers["Authorization"] = f"Bearer {main.SERVICE_TOKEN}" \
         if getattr(main, "SERVICE_TOKEN", "") else ""
     try:
-        main.google_client = refusing(
-            b'{"error":{"details":[{"reason":"ACCESS_TOKEN_SCOPE_INSUFFICIENT"}]}}')
+        everywhere("google_client", refusing(
+            b'{"error":{"details":[{"reason":'
+            b'"ACCESS_TOKEN_SCOPE_INSUFFICIENT"}]}}'))
         r = c.get("/drive/search?account_id=1&words=x")
         if r.status_code in (401, 403) and r.json().get("detail") not in (
                 "needs_reconnect",):
@@ -1088,7 +1089,7 @@ def _():
             assert r.status_code == 403, r.status_code
             assert r.json()["detail"] == "needs_reconnect", r.text
     finally:
-        main.google_client = real
+        everywhere("google_client", real)
 
 
 @check("Drive search can't be broken by a quote, and files read as words")
@@ -1107,11 +1108,11 @@ def _():
     class Svc:
         def files(self): return Files()
     real = main.google_client
-    main.google_client = lambda *a, **k: Svc()
+    everywhere("google_client", lambda *a, **k: Svc())
     try:
         main.tool_drive_search(1, "Moshe's lease")
     finally:
-        main.google_client = real
+        everywhere("google_client", real)
     assert all("Moshe\\'s lease" in q for q in seen["q"]), seen
     assert any("fullText" in q for q in seen["q"]), \
         "nothing named that should fall back to searching the contents"
@@ -1165,8 +1166,7 @@ def _():
     class Drive:
         def files(self): return Files()
     real = main.google_client
-    main.google_client = lambda a, api, *x, **k: Docs() if api == "docs" \
-        else Drive()
+    everywhere("google_client", lambda a, api, *x, **k: Docs() if api == "docs" else Drive())
     try:
         out = main.tool_doc_replace(1, "d", "monday", "Tuesday")
         assert out["found"] == 3 and not out["changed"] and not batches, \
@@ -1184,7 +1184,7 @@ def _():
         except main.HTTPException as e:
             assert e.detail == "not_editable", e.detail
     finally:
-        main.google_client = real
+        everywhere("google_client", real)
     paths = {r.path for r in main.app.routes}
     for pth in ("/drive/doc/create", "/drive/doc/add", "/drive/doc/replace",
                 "/drive/sheet/create", "/drive/sheet", "/drive/sheet/add_row",
@@ -1209,11 +1209,11 @@ def _():
     class Svc:
         def tasks(self): return Tasks()
     real = main.google_client
-    main.google_client = lambda *a, **k: Svc()
+    everywhere("google_client", lambda *a, **k: Svc())
     try:
         out = main.tool_tasks_list(1)
     finally:
-        main.google_client = real
+        everywhere("google_client", real)
     assert [t["title"] for t in out["tasks"]] == ["pay gas bill",
                                                   "call the plumber"], out
     assert out["tasks"][0]["due_spoken"] == "Friday, September 18", out
@@ -1384,31 +1384,32 @@ def _():
     screen - that is the whole reason he rings us. When the code arrives
     by email and we can already read that mailbox, we fetch it."""
     import time as _t
-    real = main.tool_search_email
+    import google_tools
+    real = google_tools.tool_search_email
     now = int(_t.time() * 1000)
     try:
-        main.tool_search_email = lambda *a, **k: {"messages": [
+        google_tools.tool_search_email = lambda *a, **k: {"messages": [
             {"from": "account-update@amazon.com", "at_ms": now,
              "subject": "Your Amazon verification code is 418302",
              "snippet": "Never share this code."}]}
         assert main.code_from_email(1, "amazon", now - 5000) == "418302"
         # an order number in an ordinary email is not a code
-        main.tool_search_email = lambda *a, **k: {"messages": [
+        google_tools.tool_search_email = lambda *a, **k: {"messages": [
             {"from": "amazon.com", "at_ms": now, "subject": "Shipped 2 items",
              "snippet": "order 112-3334445"}]}
         assert main.code_from_email(1, "amazon", now - 5000) == ""
         # and a code from before this sign-in is never reused
-        main.tool_search_email = lambda *a, **k: {"messages": [
+        google_tools.tool_search_email = lambda *a, **k: {"messages": [
             {"from": "amazon.com", "at_ms": now - 3600000,
              "subject": "Your sign-in code: 123456", "snippet": ""}]}
         assert main.code_from_email(1, "amazon", now - 5000) == ""
         # nor one from a different site
-        main.tool_search_email = lambda *a, **k: {"messages": [
+        google_tools.tool_search_email = lambda *a, **k: {"messages": [
             {"from": "security@walmart.com", "at_ms": now,
              "subject": "Your verification code is 999111", "snippet": ""}]}
         assert main.code_from_email(1, "amazon", now - 5000) == ""
     finally:
-        main.tool_search_email = real
+        google_tools.tool_search_email = real
     src = source()
     body = src[src.index("def _do_site_login("):]
     body = body[:body.index(chr(10) + "def ", 10)]
