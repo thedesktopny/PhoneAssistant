@@ -1974,6 +1974,12 @@ def _():
         body = src[src.index(fn):]
         body = body[:body.index(chr(10) + "def ", 10)]
         assert "record_block(" in body, f"{fn} refusals go unnamed"
+    # a job that FINISHES by reporting a wall - which is what probe.py
+    # does - must still record it, or the report shows nothing at all
+    body = src[src.index("def _run_browse("):]
+    body = body[:body.index(chr(10) + "def ", 10)]
+    i = body.index('if a == "done":')
+    assert "record_block(" in body[i:i + 1200],         "a job that reports a block instead of failing records nothing"
 
 
 @check("the public pages Google verification needs are there")

@@ -5013,6 +5013,15 @@ def _run_browse(jid: int, account_id: int, site: str):
 
                 if a == "done":
                     answer = act.get("answer", "")[:1500]
+                    # A job can finish by REPORTING a wall - the probe does
+                    # exactly that - and the wall still needs naming, or
+                    # the record shows nothing was ever blocked.
+                    if (looks_like_bot_check(text)
+                            or answer.strip().upper().startswith("BLOCKED")
+                            or classify_block(text)["kind"] not in
+                            ("unknown", "site_error")):
+                        record_block(account_id, site_key, text,
+                                     page_url(page), jid)
                     if is_blocked(answer):
                         _job_set(jid, "done", BLOCKED_REPLY)
                         break
@@ -5038,6 +5047,9 @@ def _run_browse(jid: int, account_id: int, site: str):
                         _save_recipe(site_key, task, goal, recorded)
                     break
                 if a == "give_up":
+                    if classify_block(text)["kind"] != "unknown":
+                        record_block(account_id, site_key, text,
+                                     page_url(page), jid)
                     _job_set(jid, "failed", act.get("answer", "")[:600],
                              reason="model_refused" if act.get("refused")
                              else "gave_up")
