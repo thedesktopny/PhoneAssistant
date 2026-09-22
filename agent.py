@@ -316,6 +316,27 @@ def login_failure_line(site: str, reason: str, msg: str, fails: int,
                 "the shop's. Say plainly that you couldn't finish it this "
                 "time, offer to have the office do it, and call "
                 "leave_note_for_office.")
+    if reason == "login_needed":
+        return (f"{site} will not go further without an account, and none is "
+                f"saved. This is NOT the site blocking us. Tell them plainly "
+                f"that {site} needs their own login to go on, and offer to "
+                f"take it now: ask for the username, then the password one "
+                f"character at a time, read both back, and use "
+                f"save_site_login. If they would rather not say it out loud, "
+                f"or don't have it to hand, offer to leave a note for the "
+                f"office instead.")
+    if reason == "rate_limited":
+        return (f"{site} is asking us to slow down - too many requests in a "
+                f"short time. Nothing is wrong with their account. Say that, "
+                f"and offer to try again in a few minutes or to have the "
+                f"office do it.")
+    if reason == "site_refused":
+        return (f"{site} refused the connection itself, not the account. Say "
+                f"you couldn't reach it, offer to try again shortly, and "
+                f"leave a note for the office.")
+    if reason == "site_error":
+        return (f"{site} showed its own error page. Nothing is wrong with "
+                f"their account. Offer to try again in a moment.")
     if reason == "no_results":
         return (f"The {site} page opened but nothing readable came back. Say "
                 f"exactly that - do NOT say they have no orders, and do NOT "
@@ -1057,6 +1078,16 @@ Never pick one for them silently.
                 if d.get("reason") == "bad_password":
                     return (f"Say the site didn't accept the password: "
                             f"{msg}")
+                if d.get("reason") == "login_needed":
+                    return (f"Say plainly that this site needs their own "
+                            f"login before you can go on - it is not "
+                            f"blocking us - and offer to take it now. If "
+                            f"they agree, ask for the username first. "
+                            f"Details: {msg}")
+                if d.get("reason") in ("rate_limited", "site_refused",
+                                       "site_error"):
+                    return (f"Say this plainly, in your own words, and make "
+                            f"clear it is not their fault: {msg}")
                 if d.get("reason") in ("bad_code", "no_code"):
                     return (f"Say this plainly, in your own words: {msg} "
                             f"Do not ask for their password.")

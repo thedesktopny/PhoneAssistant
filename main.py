@@ -1251,6 +1251,25 @@ def classify_block(text: str, url: str = "") -> dict:
             "url": (url or "")[:300], "saw": body[:400]}
 
 
+# The wall's kind decides the reason code the caller's side acts on. A
+# login wall used to come back as "this site refuses robots", so nobody
+# ever asked the customer for the login that would have opened it.
+BLOCK_REASONS = {
+    "puzzle": "bot_check",
+    "fingerprint": "bot_check",
+    "ip_block": "site_refused",
+    "geo_block": "site_refused",
+    "rate_limit": "rate_limited",
+    "login_wall": "login_needed",
+    "site_error": "site_error",
+    "unknown": "bot_check",
+}
+
+
+def block_reason(kind: str) -> str:
+    return BLOCK_REASONS.get(kind, "bot_check")
+
+
 def record_block(account_id, site: str, text: str, url: str = "",
                  job_id=None) -> dict:
     """Name it, write it down, and say it once in the live log. Knowing
@@ -4261,7 +4280,8 @@ def _run_site_search(jid: int, account_id: int, site: str):
                                     page_url(page), jid)
                 _job_set(jid, "failed",
                          f"{site} refused us: {wall['what']}. "
-                         f"{wall['advice']}", reason="bot_check")
+                         f"{wall['advice']}",
+                         reason=block_reason(wall["kind"]))
                 browser.close()
                 return
             if not answer:
@@ -4997,7 +5017,7 @@ def _run_browse(jid: int, account_id: int, site: str):
                              f"{site_key} refused us: {wall['what']}"
                              + (f" ({wall['vendor']})" if wall["vendor"]
                                 else "") + f". {wall['advice']}",
-                             reason="bot_check")
+                             reason=block_reason(wall["kind"]))
                     break
                 shot = page_shot(page) if BROWSER_VISION else ""
                 url_before, body_before = page_url(page), _body_mark(page)
@@ -5022,6 +5042,14 @@ def _run_browse(jid: int, account_id: int, site: str):
                             ("unknown", "site_error")):
                         record_block(account_id, site_key, text,
                                      page_url(page), jid)
+                    wall = classify_block(text)
+                    if wall["kind"] == "login_wall" and not creds.get(
+                            "username"):
+                        _job_set(jid, "failed",
+                                 f"{site_key} will not go further without "
+                                 f"an account, and we have no login saved "
+                                 f"for it.", reason="login_needed")
+                        break
                     if is_blocked(answer):
                         _job_set(jid, "done", BLOCKED_REPLY)
                         break

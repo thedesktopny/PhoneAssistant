@@ -1909,7 +1909,7 @@ def _():
     body = body[:body.index(chr(10) + "def ", 10)]
     assert "DOING_GOAL.search(goal)" in body,         "a saved shortcut can still answer a goal that asks for an action"
     i = body.index('if a == "done":')
-    assert "claims_action(answer)" in body[i:i + 1200],         "an answer claiming an action is still taken at its word"
+    assert "claims_action(answer)" in body[i:i + 2400],         "an answer claiming an action is still taken at its word"
 
 
 @check("a refusal is named, not just counted as 'blocked'")
