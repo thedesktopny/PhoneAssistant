@@ -2392,6 +2392,72 @@ def _search_tavily(q: str) -> dict:
     }
 
 
+def _money(text: str) -> float:
+    """$1,299.99 -> 1299.99. Anything unreadable sorts last."""
+    digits = "".join(ch for ch in (text or "")
+                     if ch.isdigit() or ch == ".")
+    try:
+        return float(digits)
+    except ValueError:
+        return 9e9
+
+
+def shopping_prices(item: str, limit: int = 8) -> dict:
+    """What the shops are asking, from the search provider's shopping
+    results - the same block Google puts at the top of the page. No
+    browser, so no shop can refuse us, and it takes about two seconds."""
+    if is_blocked(item):
+        return {"blocked": True, "answer": BLOCKED_REPLY, "offers": []}
+    if not SERPER_API_KEY:
+        return {"offers": [], "error": "shopping search isn't configured"}
+    payload = json.dumps({"q": item, "num": 20}).encode()
+    req = urllib.request.Request(
+        "https://google.serper.dev/shopping", data=payload,
+        headers={"X-API-KEY": SERPER_API_KEY,
+                 "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            d = json.loads(r.read().decode())
+    except Exception as e:
+        return {"offers": [], "error": str(e)[:200]}
+
+    offers = []
+    for x in d.get("shopping", []):
+        price = (x.get("price") or "").strip()
+        if not price:
+            continue
+        offers.append({
+            "shop": (x.get("source") or "").strip(),
+            "title": (x.get("title") or "").strip()[:120],
+            "price": price,
+            "amount": _money(price),
+            "delivery": (x.get("delivery") or "").strip()[:60],
+            "rating": x.get("rating"),
+            "link": (x.get("link") or "")[:400],
+        })
+    offers.sort(key=lambda o: o["amount"])
+    # one line per shop: five listings from the same shop is not a choice
+    seen, kept = set(), []
+    for o in offers:
+        key = (o["shop"] or o["title"]).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(o)
+        if len(kept) >= limit:
+            break
+    said = ""
+    if kept:
+        best = kept[0]
+        said = (f"Cheapest is {best['shop'] or 'one shop'} at "
+                f"{best['price']}")
+        rest = [f"{o['shop']} {o['price']}" for o in kept[1:4] if o["shop"]]
+        if rest:
+            said += ", then " + ", ".join(rest)
+        said += "."
+    return {"offers": kept, "answer": said, "checked": len(offers)}
+
+
 def tool_web_search(query: str, near: str = "") -> dict:
     """Google-backed web search with a content filter."""
     if is_blocked(query):
@@ -9325,6 +9391,19 @@ def ask_ai(request: Request, q: str, model: str = ""):
     if is_blocked(said):
         return {"blocked": True, "answer": BLOCKED_REPLY}
     return {"answer": said[:900], "model": use}
+
+
+@app.get("/price")
+def price_now(request: Request, item: str, account_id: int = 0):
+    """Prices across shops in about two seconds, the way the top of a
+    Google page shows them. No browser, so nothing can refuse us."""
+    require_auth(request)
+    out = shopping_prices(item)
+    if out.get("offers"):
+        emit("price", item[:40],
+             f"{len(out['offers'])} shops: {out.get('answer', '')[:120]}",
+             "info", account_id or None)
+    return out
 
 
 @app.get("/web/search")

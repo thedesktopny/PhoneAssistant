@@ -438,9 +438,11 @@ answer was wrong and get it right this time.
 WHEN THEY CORRECT YOU
 The moment they say you misheard, got the wrong thing, or want something
 else: call stop_that. Whatever is running was for the old question and is
-worth nothing now. NEVER say you are "still finishing the previous
-search" - they told you it was wrong, and waiting for it wastes their
-call. Say briefly that you have dropped it, then do the new thing.
+worth nothing now. Do not say you are "still finishing" something they have just told you
+was wrong - that work is worthless now. If something ELSE they asked for
+is genuinely still running, say which one: "the paper search is still
+going, I've dropped the other one". what_now can tell you exactly what is
+running if you are not sure.
 Names get misheard constantly - Ecco and Echo, Kohl's and Coles. If a
 name only half fits what they asked for, say back what you heard and ask
 before spending a minute on it.
@@ -2416,6 +2418,31 @@ Never pick one for them silently.
         not web_search, which only returns summaries."""
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
+        # The quick way first: the shopping results carry a price per shop,
+        # the same block Google puts at the top of its page. Reading four
+        # shop pages for the same answer took 45 seconds of a phone call.
+        try:
+            quick = await backend_get("/price", item=item,
+                                      account_id=self.account_id)
+        except Exception as e:
+            log.error(f"price lookup failed: {e}")
+            quick = {}
+        if quick.get("blocked"):
+            return quick.get("answer") or "BLOCKED."
+        offers = quick.get("offers") or []
+        if offers:
+            await log_turn(self.call_id, "tool", f"prices for {item}",
+                           "find_best_price")
+            lines = [f"{o['shop'] or 'unknown shop'}: {o['price']}"
+                     + (f" ({o['delivery']})" if o.get("delivery") else "")
+                     + f" - {o['title'][:70]}" for o in offers[:6]]
+            return ("Prices found, cheapest first:\n" + "\n".join(lines)
+                    + "\nRead out the cheapest two or three with the shop "
+                      "names, say these come from shopping listings, and "
+                      "ask if they want you to open one and check it "
+                      "properly before ordering. If they ask for more "
+                      "detail on one, use look_it_up or do_on_website.")
+        # nothing in the shopping results - fall back to reading pages
         try:
             async with httpx.AsyncClient(timeout=25) as c:
                 r = await c.post(f"{BACKEND}/jobs/price", headers=AUTH,

@@ -2786,7 +2786,8 @@ def _():
         assert t in names, f"missing: {t}"
     text = inst.instructions
     assert "WHEN THEY CORRECT YOU" in text and "stop_that" in text
-    assert "still finishing the previous" in text,         "nothing forbids the line the caller actually complained about"
+    assert "still finishing" in text and "is genuinely still running" in text, \
+        "it must not claim to be finishing work the caller corrected, but may say so about work that really is running"
     assert "find_best_price" in text and "Do NOT use web_search for prices"         in text, "prices can still be answered from search summaries"
     paths = {r.path for r in main.app.routes}
     assert "/jobs/price" in paths
