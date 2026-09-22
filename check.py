@@ -2846,6 +2846,30 @@ def _():
         assert must in goal, must
 
 
+@check("the standing instructions stay small enough to be followed")
+def _():
+    """Every word here is read on every turn of every call: it is the
+    slowest, most expensive and most easily forgotten place to put
+    anything. It was 5,675 words. Procedure belongs in tool results, which
+    cost nothing until the tool is used, and judgement belongs with the
+    advisor, which can see the real state.
+
+    If this fails, do not raise the number - move the new rule into the
+    result of the tool it applies to."""
+    inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                           "+1555", 1)
+    words = len(inst.instructions.split())
+    assert words <= 3200, (
+        f"the instructions are back up to {words} words. Move the newest "
+        f"section into the tool result it belongs to.")
+    import re as _re
+    tools = _re.findall(r"@function_tool.*?async def (\w+)\(",
+                        open("agent.py", encoding="utf-8").read(), _re.S)
+    assert len(tools) <= 80, (
+        f"{len(tools)} tools. Each one's name and description is sent on "
+        f"every turn too - merge the near-duplicates rather than adding.")
+
+
 @check("nothing an email tool does is permanent")
 def _():
     """A caller cannot see what just happened, so every action has to be
