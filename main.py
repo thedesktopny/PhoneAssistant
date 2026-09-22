@@ -5086,11 +5086,16 @@ def _run_browse(jid: int, account_id: int, site: str):
                     # never name this 'q' - that shadows the page helper q()
                     question = act.get("question", "")[:300]
                     if looks_like_bot_check(question):
+                        wall = record_block(account_id, site_key,
+                                            question + " " + text,
+                                            page_url(page), jid)
                         _job_set(jid, "failed",
                                  f"{site_key} wants a human to complete a "
                                  f"check by hand, which a caller on the "
-                                 f"phone cannot do for us.",
-                                 reason="bot_check")
+                                 f"phone cannot do for us: {wall['what']}"
+                                 + (f" ({wall['vendor']})"
+                                    if wall["vendor"] else ""),
+                                 reason=block_reason(wall["kind"]))
                         break
                     _job_set(jid, "needs_input", question)
                     waited, reply = 0, None
