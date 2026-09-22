@@ -435,6 +435,23 @@ someone twice. If they are asking the same thing again, assume the last
 answer was wrong and get it right this time.
 
 
+WHEN THEY CORRECT YOU
+The moment they say you misheard, got the wrong thing, or want something
+else: call stop_that. Whatever is running was for the old question and is
+worth nothing now. NEVER say you are "still finishing the previous
+search" - they told you it was wrong, and waiting for it wastes their
+call. Say briefly that you have dropped it, then do the new thing.
+Names get misheard constantly - Ecco and Echo, Kohl's and Coles. If a
+name only half fits what they asked for, say back what you heard and ask
+before spending a minute on it.
+
+WHAT SOMETHING COSTS
+"Where can I get it cheapest", "what does it cost", "who sells it" ->
+find_best_price. It opens the actual shop pages and comes back with
+prices and shop names. Do NOT use web_search for prices: it returns
+summaries, and it once answered "where is it cheapest" with the street
+address of an outlet shop.
+
 WHEN YOU ARE NOT SURE — ASK, DON'T IMPROVISE
 You are the voice, not the judge. There is a second, slower part of this
 system that can see what is actually running, what failed and why, what is
@@ -2365,6 +2382,58 @@ Never pick one for them silently.
             return "That code didn't go through."
         return ("Code sent. Say nothing more about it - I will tell you when "
                 "it changes.")
+
+    @function_tool
+    @auto_report("jobs")
+    async def stop_that(self, context: RunContext,
+                        why: str = "they changed their mind"):
+        """Stop whatever is running right now. Use this the moment the
+        caller corrects you, changes their mind, or asks for something
+        else - a search for the wrong thing is worth nothing, and waiting
+        for it wastes their call."""
+        jid = getattr(self, "job_id", None)
+        if not jid:
+            return ("Nothing is running. Do not say you are waiting for "
+                    "anything.")
+        try:
+            async with httpx.AsyncClient(timeout=20) as c:
+                await c.post(f"{BACKEND}/jobs/cancel", headers=AUTH,
+                             params={"job_id": jid, "why": why[:120]})
+        except Exception as e:
+            log.error(f"stop failed: {e}")
+        self.job_id = None
+        await log_turn(self.call_id, "tool", f"stopped: {why}", "stop_that")
+        return ("Stopped. Say briefly that you have dropped that, then do "
+                "what they actually asked. Never say you are still waiting "
+                "for it.")
+
+    @function_tool
+    @auto_report("orders")
+    async def find_best_price(self, context: RunContext, item: str):
+        """Where an item can be bought cheapest. Reads the actual shop
+        pages and comes back with prices and shop names. Use whenever they
+        ask what something costs, where to get it, or which is cheapest -
+        not web_search, which only returns summaries."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            async with httpx.AsyncClient(timeout=25) as c:
+                r = await c.post(f"{BACKEND}/jobs/price", headers=AUTH,
+                                 params={"account_id": self.account_id,
+                                         "item": item,
+                                         "call_id": self.call_id or 0})
+                d = r.json()
+        except Exception as e:
+            log.error(f"price job failed: {e}")
+            return "Couldn't start that."
+        if d.get("blocked"):
+            return d.get("answer") or "BLOCKED."
+        self.job_id = d.get("job_id")
+        self.job_question = f"the price of {item}"
+        self._watch_job(f"pricing {item}")
+        return (f"Looking up prices for {item} across a few shops. Tell them "
+                f"it takes a minute or two because it reads each shop's own "
+                f"page, then say nothing until I tell you what it found.")
 
     @function_tool
     @auto_report("logins")

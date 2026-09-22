@@ -2773,6 +2773,29 @@ def _():
     assert "more in it than they asked for" in text,         "nothing tells it to read out what was already in the cart"
 
 
+@check("a correction stops the old work, and prices come from shop pages")
+def _():
+    """Call 61: "Ecco" was heard as "Echo", and when the caller corrected
+    it the assistant said it was "still finishing the previous search" and
+    waited on work that was already worthless. Then "where is it cheapest"
+    was answered from a web search with an outlet shop's street address."""
+    inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                           "+1555", 1)
+    names = {getattr(t, "__name__", "") for t in inst.tools}
+    for t in ("stop_that", "find_best_price"):
+        assert t in names, f"missing: {t}"
+    text = inst.instructions
+    assert "WHEN THEY CORRECT YOU" in text and "stop_that" in text
+    assert "still finishing the previous" in text,         "nothing forbids the line the caller actually complained about"
+    assert "find_best_price" in text and "Do NOT use web_search for prices"         in text, "prices can still be answered from search summaries"
+    paths = {r.path for r in main.app.routes}
+    assert "/jobs/price" in paths
+    # the price job must read shop pages and write each one down
+    goal = main.PRICE_GOAL.format(item="shoes")
+    for must in ("found", "never from a search summary", "Buy nothing"):
+        assert must in goal, must
+
+
 @check("nothing an email tool does is permanent")
 def _():
     """A caller cannot see what just happened, so every action has to be

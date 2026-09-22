@@ -8037,6 +8037,41 @@ def job_checkout(request: Request, account_id: int, site: str,
     return {"job_id": jid, "state": "queued"}
 
 
+PRICE_GOAL = """Find out what {item} costs, and where it is cheapest.
+
+Work like a careful shopper with a phone call waiting:
+1. Search the web for the item by name, with the word price.
+2. Open the most promising shop pages one at a time - up to four. The
+   maker's own site, and the big shops that sell it.
+3. On EACH page, before you leave it, record with "found" the shop's name,
+   the exact price it shows, whether it says in stock, and any delivery
+   cost or discount. If a page does not show a price for this exact item,
+   note that too and move on.
+4. Never open a page you have already noted.
+
+Then reply done with: the cheapest price and which shop it is at, then the
+others you found with their shops, and say plainly if a shop had no price.
+Prices only from pages you actually read - never from a search summary,
+and never a guess. Buy nothing and sign in to nothing."""
+
+
+@app.post("/jobs/price")
+def job_price(request: Request, account_id: int, item: str,
+              call_id: int = 0):
+    """What does it cost, and where is it cheapest. A plain web search
+    answers this with an outlet shop's street address; reading the actual
+    shop pages answers it with prices."""
+    require_auth(request)
+    if is_blocked(item):
+        return {"blocked": True, "answer": BLOCKED_REPLY}
+    if not BROWSERBASE_API_KEY:
+        raise HTTPException(400, "Browserbase isn't configured.")
+    jid = start_job(account_id, "browse", "", call_id=call_id or None,
+                    payload={"goal": PRICE_GOAL.format(item=item[:120]),
+                             "url": "", "max_steps": 20, "query": item[:120]})
+    return {"job_id": jid, "state": "queued"}
+
+
 @app.post("/jobs/browse")
 def job_browse(request: Request, account_id: int, goal: str,
                site: str = "", url: str = "", call_id: int = 0,
