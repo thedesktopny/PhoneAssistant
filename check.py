@@ -1500,9 +1500,10 @@ def _():
     assert "Hunter22" not in c.get("/changes?limit=3").text
     # and the office has somewhere to look
     html = c.get("/admin").text
-    for bit in ("p-changes", "p-reviews", "p-know", "loadChanges",
-                "loadReviews", "loadKnow", "saveKnow",
-                "What it did", "Call checks", "Who they are"):
+    for bit in ("p-changes", "p-reviews", "p-know", "p-blocks",
+                "loadChanges", "loadReviews", "loadKnow", "saveKnow",
+                "loadBlocks", "What it did", "Call checks",
+                "Who they are", "Blocked by"):
         assert bit in html, f"admin panel is missing {bit}"
     # the money and email paths actually record something
     src = open("main.py", encoding="utf-8").read()
@@ -1909,6 +1910,70 @@ def _():
     assert "DOING_GOAL.search(goal)" in body,         "a saved shortcut can still answer a goal that asks for an action"
     i = body.index('if a == "done":')
     assert "claims_action(answer)" in body[i:i + 1200],         "an answer claiming an action is still taken at its word"
+
+
+@check("a refusal is named, not just counted as 'blocked'")
+def _():
+    """"Walmart blocked us" is not actionable. A puzzle no one may solve
+    for a phone caller, a fingerprint wall, an address refusal, a rate
+    limit and a plain login wall are five different problems, and only
+    three of them are worth another try."""
+    cases = {
+        "Robot or human? Activate and hold the button to confirm that you "
+        "are human.": ("puzzle", False),
+        "Access Denied You don't have permission to access this server.":
+            ("ip_block", True),
+        "Oops!! Something went wrong. Please refresh page":
+            ("site_error", True),
+        "Attention Required! Cloudflare. Checking your browser before "
+        "accessing.": ("fingerprint", False),
+        # Amazon's silent refusal says BOTH "something went wrong" and
+        # "automated access" - it is a wall, not an outage
+        "Sorry! Something went wrong. To discuss automated access to "
+        "Amazon data please contact api-services-support":
+            ("fingerprint", False),
+        "Too many requests. Please slow down.": ("rate_limit", True),
+        "Please sign in to continue to checkout.": ("login_wall", True),
+        "This item is not available in your country.": ("geo_block", True),
+    }
+    for text, (kind, retry) in cases.items():
+        got = main.classify_block(text)
+        assert got["kind"] == kind, f"{text[:40]!r} -> {got['kind']}"
+        assert got["worth_retrying"] is retry, text[:40]
+        assert got["advice"], "no advice on what would change it"
+    # who is doing the blocking, where the page says so
+    assert main.classify_block("Attention Required! Cloudflare")["vendor"] \
+        == "cloudflare"
+    assert main.classify_block(
+        "Access Denied. Reference #18.2f3b1c")["vendor"] == "akamai"
+    assert main.classify_block(
+        "px-captcha please press and hold")["vendor"] == "perimeterx"
+
+    # it is written down, with what the page said, scrubbed
+    from fastapi.testclient import TestClient
+    c = TestClient(main.app, raise_server_exceptions=False, base_url="https://t")
+    c.post("/admin/login", json={"password": os.environ.get(
+        "ADMIN_PASSWORD", "changeme")})
+    main.record_block(1, "walmart", "Activate and hold the button to "
+                                    "confirm that you are human.",
+                      "https://www.walmart.com", 4242)
+    main.record_block(1, "lowes", "Access Denied You don't have permission",
+                      "https://www.lowes.com/search")
+    got = c.get("/blocks?days=1").json()
+    kinds = {b["site"]: b["kind"] for b in got["by_site"]}
+    assert kinds.get("walmart") == "puzzle", got["by_site"]
+    assert kinds.get("lowes") == "ip_block", got["by_site"]
+    assert any(b["site"] == "walmart" and b["worth_retrying"] is False
+               for b in got["by_site"])
+    assert got["recent"] and got["recent"][0]["saw"], \
+        "what the page said is not kept, so nothing can be named later"
+
+    # and every place a site refuses us records it
+    src = open("main.py", encoding="utf-8").read()
+    for fn in ("def _run_browse(", "def _run_site_search("):
+        body = src[src.index(fn):]
+        body = body[:body.index(chr(10) + "def ", 10)]
+        assert "record_block(" in body, f"{fn} refusals go unnamed"
 
 
 @check("the public pages Google verification needs are there")

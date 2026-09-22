@@ -392,6 +392,20 @@ class Profile(Base):
     #                                           overwritten by the system
 
 
+class Block(Base):
+    """Every time a site refused us, and which kind of refusal it was."""
+    __tablename__ = "blocks"
+    id = Column(Integer, primary_key=True)
+    at = Column(DateTime, default=datetime.utcnow)
+    account_id = Column(Integer, nullable=True)
+    job_id = Column(Integer, nullable=True)
+    site = Column(String(80), default="")
+    kind = Column(String(20), default="")      # puzzle/fingerprint/ip_block
+    vendor = Column(String(30), default="")    # perimeterx/cloudflare/...
+    url = Column(String(300), default="")
+    saw = Column(Text, default="")             # what the page said
+
+
 class Change(Base):
     """Everything done on a customer's behalf: an email sent, a file
     changed, a card charged. The live log carries every step of every job
@@ -1133,6 +1147,131 @@ def looks_signed_out(text: str) -> bool:
     if SIGNED_OUT_MARKS.search(text):
         return True
     return False
+
+
+# ---------------------------------------------------------------- blocks
+# Which wall is it? "Walmart blocked us" is not actionable. A different
+# address, a slower pace, a saved login and "this door does not open"
+# are four different answers, and only the measurement tells them apart.
+
+BLOCK_VENDORS = (
+    ("perimeterx", r"(?i)(perimeterx|px-captcha|human security|"
+                   r"press (and|&) hold)"),
+    ("cloudflare", r"(?i)(cloudflare|cf-ray|checking your browser|"
+                   r"attention required|error 10\d\d|"
+                   r"enable javascript and cookies to continue)"),
+    ("akamai", r"(?i)(akamai|reference #\d|access denied.{0,40}"
+               r"reference)"),
+    ("datadome", r"(?i)(datadome|geo\.captcha-delivery\.com)"),
+    ("imperva", r"(?i)(incapsula|imperva|request unsuccessful|"
+                r"pardon our interruption)"),
+    ("recaptcha", r"(?i)(recaptcha|g-recaptcha|i.m not a robot)"),
+    ("hcaptcha", r"(?i)hcaptcha"),
+    ("arkose", r"(?i)(arkose|funcaptcha)"),
+    ("aws_waf", r"(?i)(aws waf|awswaf)"),
+    ("queue_it", r"(?i)queue-?it"),
+)
+
+# kind -> (what it is, can anything legitimate change it, what to do)
+BLOCK_KINDS = {
+    "puzzle": ("a puzzle for a human: press and hold, tick a box, pick "
+               "pictures", False,
+               "Nobody can do this for a caller with no screen. Use a "
+               "sanctioned route (partner API, ACP) or have staff place "
+               "the order."),
+    "fingerprint": ("the site decided we are a robot from the browser "
+                    "itself, with no puzzle offered", False,
+                    "A different address will not help. This needs a "
+                    "sanctioned route, or a person."),
+    "ip_block": ("the address we came from is refused", True,
+                 "Worth retrying from the caller's own region, or a "
+                 "residential address. Check /browser/proxy_status."),
+    "rate_limit": ("too many requests too quickly", True,
+                   "Wait and try again more slowly. Nothing is wrong "
+                   "with the account."),
+    "geo_block": ("the site does not serve this country", True,
+                  "Try the caller's own country."),
+    "login_wall": ("it will not go further without an account", True,
+                   "Save the customer's login for this site, then try "
+                   "again."),
+    "site_error": ("the site's own error page, not a block", True,
+                   "Worth trying again shortly."),
+    "unknown": ("refused, and it does not say why", False,
+                "Look at the stored page text and name it properly."),
+}
+
+BLOCK_MARKS = (
+    # order matters: a page can say several of these at once, and the
+    # strongest signal must win. Amazon's silent refusal says "something
+    # went wrong" AND "to discuss automated access" - it is not an outage.
+    ("fingerprint", r"(?i)(to discuss automated access|automated queries|"
+                    r"unusual activity from your|suspicious activity|"
+                    r"bot detected|request looks automated|"
+                    r"enable javascript and cookies|"
+                    r"checking your browser)"),
+    ("rate_limit", r"(?i)(too many requests|rate limit|"
+                   r"slow down|try again in a (few|moment)|"
+                   r"you have exceeded)"),
+    ("geo_block", r"(?i)(not available in your (country|region)|"
+                  r"geo.?restricted|unavailable in your country)"),
+    ("login_wall", r"(?i)(sign in to (your account|continue|see)|"
+                   r"please sign in|create an account to|"
+                   r"log in to continue|members only)"),
+    ("ip_block", r"(?i)(access denied|you don.t have permission to access|"
+                 r"your ip address|blocked your ip|403 forbidden)"),
+    ("site_error", r"(?i)(something went wrong|oops|please refresh|"
+                   r"temporarily unavailable|internal server error|"
+                   r"service unavailable)"),
+)
+
+
+def classify_block(text: str, url: str = "") -> dict:
+    """What kind of wall this is, in a word, plus what would change it."""
+    body = " ".join((text or "").split())[:4000]
+    vendor = ""
+    for name, pattern in BLOCK_VENDORS:
+        if _re_scrub.search(pattern, body):
+            vendor = name
+            break
+    kind = ""
+    if looks_like_bot_check(body):
+        kind = "puzzle"
+    if not kind:
+        for name, pattern in BLOCK_MARKS:
+            if _re_scrub.search(pattern, body):
+                kind = name
+                break
+    if not kind and looks_signed_out(body):
+        kind = "login_wall"
+    if not kind:
+        kind = "fingerprint" if vendor else "unknown"
+    what, retry, advice = BLOCK_KINDS[kind]
+    return {"kind": kind, "vendor": vendor, "what": what,
+            "worth_retrying": retry, "advice": advice,
+            "url": (url or "")[:300], "saw": body[:400]}
+
+
+def record_block(account_id, site: str, text: str, url: str = "",
+                 job_id=None) -> dict:
+    """Name it, write it down, and say it once in the live log. Knowing
+    Walmart is a fingerprint wall and Lowe's an address refusal is what
+    decides where the ordering work goes."""
+    got = classify_block(text, url)
+    try:
+        db = Session()
+        db.add(Block(account_id=account_id or None, site=(site or "?")[:80],
+                     job_id=job_id, kind=got["kind"],
+                     vendor=got["vendor"], url=got["url"],
+                     saw=scrub(got["saw"])))
+        db.commit()
+        db.close()
+    except Exception:
+        pass
+    emit("block", site or "?",
+         f"{got['kind']}"
+         + (f" ({got['vendor']})" if got["vendor"] else "")
+         + f": {got['what']}", "warn", account_id)
+    return got
 
 
 def _category(labels) -> str:
@@ -4118,9 +4257,11 @@ def _run_site_search(jid: int, account_id: int, site: str):
                 browser.close()
                 return
             if looks_like_bot_check(raw or ""):
+                wall = record_block(account_id, site, raw or "",
+                                    page_url(page), jid)
                 _job_set(jid, "failed",
-                         f"{site} is asking for a human check.",
-                         reason="bot_check")
+                         f"{site} refused us: {wall['what']}. "
+                         f"{wall['advice']}", reason="bot_check")
                 browser.close()
                 return
             if not answer:
@@ -4843,6 +4984,8 @@ def _run_browse(jid: int, account_id: int, site: str):
                     settle(page, 1500)
                     items, text = _page_snapshot(page, want=goal)
                 if looks_like_bot_check(text):
+                    wall = record_block(account_id, site_key, text,
+                                        page_url(page), jid)
                     if spares:
                         nxt = spares.pop(0)
                         _job_set(jid, "working",
@@ -4851,8 +4994,9 @@ def _run_browse(jid: int, account_id: int, site: str):
                         do_goto(page, nxt, 4000)
                         continue
                     _job_set(jid, "failed",
-                             f"{site_key} is asking for a human check that "
-                             f"we can't and shouldn't do for them.",
+                             f"{site_key} refused us: {wall['what']}"
+                             + (f" ({wall['vendor']})" if wall["vendor"]
+                                else "") + f". {wall['advice']}",
                              reason="bot_check")
                     break
                 shot = page_shot(page) if BROWSER_VISION else ""
@@ -5020,6 +5164,8 @@ def _run_browse(jid: int, account_id: int, site: str):
                         # says they are signed out.
                         fresh = (_forget_context(account_id, site_key)
                                  if looks_signed_out(text) else False)
+                        record_block(account_id, site_key, text,
+                                     page_url(page), jid)
                         _job_set(jid, "failed",
                                  f"The page stopped responding to anything "
                                  f"it tried"
@@ -7545,6 +7691,40 @@ def profile_learn(request: Request, call_id: int):
     return learn_about_caller(call_id)
 
 
+@app.get("/blocks")
+def blocks_list(request: Request, days: int = 30, site: str = ""):
+    """Which sites refused us, and which kind of wall each one is. This is
+    what decides where ordering work goes: a puzzle or a fingerprint wall
+    will not open, an address refusal or a login wall might."""
+    require_auth(request)
+    since = datetime.utcnow() - timedelta(days=max(1, min(days, 365)))
+    db = Session()
+    q = db.query(Block).filter(Block.at >= since)
+    if site:
+        q = q.filter(Block.site == site.lower())
+    rows = q.order_by(Block.id.desc()).limit(400).all()
+    out, summary = [], {}
+    for r in rows:
+        out.append({"at": local_str(r.at), "site": r.site, "kind": r.kind,
+                    "vendor": r.vendor, "url": r.url, "job_id": r.job_id,
+                    "saw": (r.saw or "")[:200]})
+        key = f"{r.site}/{r.kind}" + (f"/{r.vendor}" if r.vendor else "")
+        summary[key] = summary.get(key, 0) + 1
+    db.close()
+    worst = []
+    for key, n in sorted(summary.items(), key=lambda kv: -kv[1]):
+        bits = key.split("/")
+        kind = bits[1] if len(bits) > 1 else ""
+        what, retry, advice = BLOCK_KINDS.get(
+            kind, BLOCK_KINDS["unknown"])
+        worst.append({"site": bits[0], "kind": kind,
+                      "vendor": bits[2] if len(bits) > 2 else "",
+                      "times": n, "what": what,
+                      "worth_retrying": retry, "advice": advice})
+    return {"days": days, "by_site": worst, "recent": out[:100],
+            "kinds": {k: v[0] for k, v in BLOCK_KINDS.items()}}
+
+
 @app.get("/changes")
 def changes_list(request: Request, account_id: int = 0, limit: int = 100,
                  area: str = ""):
@@ -9129,6 +9309,7 @@ ADMIN_HTML = """<!doctype html>
     <a data-p="changes">What it did</a>
     <a data-p="reviews">Call checks</a>
     <a data-p="know">Who they are</a>
+    <a data-p="blocks">Blocked by</a>
     <a data-p="costs">Costs</a>
     <a data-p="overview" class="on">Overview</a>
     <a data-p="calls">Calls</a>
@@ -9181,6 +9362,25 @@ ADMIN_HTML = """<!doctype html>
       overwrites it, and it is read first.</div>
     <button class="sec" onclick="loadKnow()">Refresh</button>
     <div id="knowrows" class="hint">Loading&hellip;</div>
+  </div>
+</section>
+
+<section class="page" id="p-blocks">
+  <div class="card"><h2>Which sites refuse us, and why</h2>
+    <div class="hint">Every refusal, named. A puzzle or a fingerprint wall
+      will not open for anyone - those shops need a sanctioned route or a
+      person. An address refusal, a rate limit or a login wall might open,
+      and the advice column says what would change it.</div>
+    <button class="sec" onclick="loadBlocks()">Refresh</button>
+    <table><thead><tr><th>Site</th><th>Kind</th><th>Who blocks</th>
+    <th>Times</th><th>Worth retrying?</th><th>What would change it</th>
+    </tr></thead>
+    <tbody id="blkrows"><tr><td colspan="6" class="hint">Loading&hellip;</td></tr>
+    </tbody></table>
+    <h2 style="font-size:16px;margin-top:22px">Most recent</h2>
+    <table><thead><tr><th>When</th><th>Site</th><th>Kind</th>
+    <th>What the page said</th></tr></thead>
+    <tbody id="blkrecent"></tbody></table>
   </div>
 </section>
 
@@ -9398,6 +9598,7 @@ document.querySelectorAll('nav a').forEach(function(a){
     if(a.dataset.p === 'changes') loadChanges();
     if(a.dataset.p === 'reviews') loadReviews();
     if(a.dataset.p === 'know') loadKnow();
+    if(a.dataset.p === 'blocks') loadBlocks();
   };
 });
 
@@ -9616,6 +9817,29 @@ function saveKnow(id){
     body: JSON.stringify({account_id:id, by_hand:box.value})})
     .then(function(r){ msg.textContent = r.ok ? ' Saved.' : ' Did not save.';
                        setTimeout(function(){ msg.textContent=''; }, 2500); });
+}
+function loadBlocks(){
+  fetch('/blocks?days=60').then(function(r){ return r.json(); })
+    .then(function(d){
+      var b = document.getElementById('blkrows');
+      var rows = d.by_site || [];
+      b.innerHTML = rows.length ? rows.map(function(x){
+        return '<tr><td>' + esc(x.site) + '</td>' +
+          '<td><span class="tag">' + esc(x.kind) + '</span></td>' +
+          '<td>' + esc(x.vendor || '') + '</td>' +
+          '<td>' + esc(x.times) + '</td>' +
+          '<td class="' + (x.worth_retrying ? 'ok' : 'no') + '">' +
+            (x.worth_retrying ? 'maybe' : 'no') + '</td>' +
+          '<td class="hint">' + esc(x.advice) + '</td></tr>';
+      }).join('') :
+        '<tr><td colspan="6" class="hint">No refusals recorded.</td></tr>';
+      var r2 = document.getElementById('blkrecent');
+      r2.innerHTML = (d.recent || []).slice(0, 25).map(function(x){
+        return '<tr><td>' + esc(x.at) + '</td><td>' + esc(x.site) +
+          '</td><td>' + esc(x.kind) + '</td><td class="hint">' +
+          esc(x.saw) + '</td></tr>';
+      }).join('');
+    });
 }
 function loadReviews(){
   fetch('/reviews?limit=50').then(function(r){ return r.json(); })
