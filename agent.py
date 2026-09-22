@@ -617,8 +617,8 @@ CONTACTS, FILES AND THE TO-DO LIST
 SHOPPING AND ORDERS
 1. What they want: item, how many, which site. Vague -> search_site or
    do_on_website, read the name and price, get a yes on the exact item.
-2. Address: list_addresses, read it back; none -> save_address.
-3. Payment: list_cards. None saved? If the site has one, use that.
+2. Address: what_is_saved, read it back; none -> save_address.
+3. Payment: what_is_saved shows their cards. None saved? If the site has one, use that.
    Otherwise the best way is card_setup_code - someone with internet adds
    it on our secure page and the number is never said aloud. Only if
    nobody can help, take it by voice and save_card.
@@ -643,16 +643,16 @@ OTHER SITES
   for "do they have X". If it says signed out, offer sign_in_to_site.
 - Saving a login: site, username, password spelled slowly, read back, then
   save_site_login. It stays saved - never tell them to give it again
-  unless the site itself rejected it. list_site_logins shows which sites;
+  unless the site itself rejected it. what_is_saved shows which sites;
   forget_site_login removes one. Tell them it is stored encrypted.
 
 WHEN A SITE ASKS FOR A ONE-TIME CODE
 Say where it went, in the words you were given ("to the phone ending 96").
 If it was emailed and we can read that mailbox, it is fetched and typed in
-for them - say nothing and wait. submit_site_code takes DIGITS ONLY that
+for them - say nothing and wait. submit_code takes DIGITS ONLY that
 they read out: never words, never "resend", never invented. If they cannot
 get it - phone in another room, nothing arrived - do not sit waiting and
-do not say "I'm handling it". Call stop_waiting_for_code, say you have
+do not say "I'm handling it". Call stop_that, say you have
 stopped, and offer to try later or have the office ring them.
 
 CONNECTING THEIR EMAIL (only if they have none linked)
@@ -661,7 +661,7 @@ neighbour. If yes, email_connect_code and read out what it gives you: no
 password is ever said aloud. Only if nobody can help, take it on the call:
 address spelled out and read back, then the password one character at a
 time with "capital" said where it applies, read back in full, then
-connect_email. Follow whatever check_connect tells you; if they cannot do
+connect_email. Follow whatever how_is_it_going tells you; if they cannot do
 the method Google chose, try_another_way. If Google rejects the password,
 two more attempts at most - say you may have misheard, never blame them -
 then stop and leave it with the office. Never repeat a password afterwards
@@ -1041,18 +1041,11 @@ they go quiet, ask once whether they are still there, then wait.
     @auto_report("email")
     async def tidy_email(self, context: RunContext, which_ones: str,
                          action: str):
-        """Do something with messages from the list you read out.
-
-        which_ones is the numbers, like "1,3". action is one of:
-          archive     take it out of the inbox but keep it
-          star        flag it to come back to
-          important   mark it important
-          spam        move it to spam
-          trash       put it in the bin, recoverable for 30 days
-          unarchive, unstar, not_spam, untrash - undo any of those
-
-        Nothing here deletes anything for good. For trash and spam, say
-        what you are about to do and get a yes first."""
+        """File messages from the list you read out. which_ones is the
+        numbers, like "1,3". action: archive, star, important, spam,
+        trash, or unarchive / unstar / not_spam / untrash to undo.
+        Nothing is deleted for good. For trash and spam, say what you are
+        about to do and get a yes first."""
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
         ids = []
@@ -1693,19 +1686,6 @@ they go quiet, ask once whether they are still there, then wait.
     # ------------------------------------------------------ ordering
     @function_tool
     @auto_report("orders")
-    async def list_addresses(self, context: RunContext):
-        """The caller's saved shipping addresses."""
-        if not self.verified:
-            return "Not verified yet. Ask for the PIN first."
-        rows = await backend_get("/addresses", account_id=self.account_id)
-        if not rows:
-            return "No address saved. Take one down and save_address."
-        return "; ".join(f"[{r['id']}] {r['label']}: {r['address']}"
-                         + (" (main)" if r.get("default") else "")
-                         for r in rows)
-
-    @function_tool
-    @auto_report("orders")
     async def save_address(self, context: RunContext, line1: str, city: str,
                            state: str, zip: str, line2: str = "",
                            label: str = "home"):
@@ -1716,21 +1696,6 @@ they go quiet, ask once whether they are still there, then wait.
             "account_id": self.account_id, "label": label, "line1": line1,
             "line2": line2, "city": city, "state": state, "zip": zip})
         return f"Saved: {d.get('address')} (id {d.get('id')})."
-
-    @function_tool
-    @auto_report("orders")
-    async def list_cards(self, context: RunContext):
-        """The caller's saved cards — brand and last four only."""
-        if not self.verified:
-            return "Not verified yet. Ask for the PIN first."
-        rows = await backend_get("/cards", account_id=self.account_id)
-        if not rows:
-            return ("No card saved. Ask whether the site already has one, "
-                    "or take one down and save_card.")
-        return "; ".join(f"[{r['id']}] {r['brand']} ending {r['last4']}, "
-                         f"expires {r['exp']}"
-                         + (" (main)" if r.get("default") else "")
-                         for r in rows)
 
     @function_tool
     @auto_report("orders")
@@ -1751,6 +1716,89 @@ they go quiet, ask once whether they are still there, then wait.
             raise
         return (f"Saved a {d.get('brand')} ending {d.get('last4')}. "
                 f"Never say the full number again.")
+
+    async def _saved_cards(self, context=None):
+
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        rows = await backend_get("/cards", account_id=self.account_id)
+        if not rows:
+            return ("No card saved. Ask whether the site already has one, "
+                    "or take one down and save_card.")
+        return "; ".join(f"[{r['id']}] {r['brand']} ending {r['last4']}, "
+                         f"expires {r['exp']}"
+                         + (" (main)" if r.get("default") else "")
+                         for r in rows)
+
+    async def _saved_addresses(self, context=None):
+
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        rows = await backend_get("/addresses", account_id=self.account_id)
+        if not rows:
+            return "No address saved. Take one down and save_address."
+        return "; ".join(f"[{r['id']}] {r['label']}: {r['address']}"
+                         + (" (main)" if r.get("default") else "")
+                         for r in rows)
+
+    async def _saved_logins(self, context=None):
+
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            rows = await backend_get("/logins", account_id=self.account_id)
+        except Exception:
+            return "Couldn't check."
+        if not rows:
+            return "No site logins saved."
+        return "; ".join(f"{r['site']} as {r['username']}" for r in rows)
+
+    async def _saved_mailboxes(self, context=None):
+
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            rows = await backend_get("/mailboxes",
+                                     account_id=self.account_id)
+        except Exception:
+            return "Couldn't check their mailboxes."
+        if not rows:
+            return "No email connected yet. Offer to connect one."
+        if len(rows) == 1:
+            self.mailbox = rows[0]["email"]
+            return f"One mailbox: {rows[0]['email']}. Just use it."
+        parts = []
+        for r in rows:
+            name = r.get("label") or r.get("email")
+            tags = []
+            if r.get("default"):
+                tags.append("main")
+            tags.append(f"{r.get('used', 0)} uses")
+            parts.append(f"{name} ({', '.join(tags)})")
+        return ("They have several: " + "; ".join(parts) +
+                ". Ask which one if it isn't obvious.")
+
+    @function_tool
+    @auto_report("account")
+    async def what_is_saved(self, context: RunContext, kind: str = "all"):
+        """What this caller already has on file. kind is "cards",
+        "addresses", "logins", "mailboxes", or "all". Use it before asking
+        them for a card, an address or a password they may have given
+        already. Card numbers and passwords are never shown."""
+        want = (kind or "all").strip().lower()
+        out = []
+        if want in ("all", "cards", "card"):
+            out.append("CARDS: " + str(await self._saved_cards(context)))
+        if want in ("all", "addresses", "address"):
+            out.append("ADDRESSES: "
+                       + str(await self._saved_addresses(context)))
+        if want in ("all", "logins", "login", "sites"):
+            out.append("SITE LOGINS: "
+                       + str(await self._saved_logins(context)))
+        if want in ("all", "mailboxes", "mailbox", "email"):
+            out.append("MAILBOXES: "
+                       + str(await self._saved_mailboxes(context)))
+        return "\n".join(out) or "Nothing saved."
 
     @function_tool
     @auto_report("orders")
@@ -1851,29 +1899,7 @@ they go quiet, ask once whether they are still there, then wait.
 
         self._start_watch("order", fetch, describe)
         return ("Placing it now. Tell them it takes a minute or two, stay "
-                "with them, and call check_order.")
-
-    @function_tool
-    @auto_report("orders")
-    async def check_order(self, context: RunContext):
-        """How the order is going. Call this at most ONCE. You will be told
-        automatically when it changes."""
-        if not getattr(self, "order_id", None):
-            return "No order in progress."
-        d = await backend_get("/orders/status", order_id=self.order_id)
-        st, msg = d.get("state", ""), d.get("message", "")
-        if st == "placed":
-            conf = d.get("confirmation") or "not shown"
-            total = d.get("final_total") or "not shown"
-            return f"PLACED. Confirmation {conf}, total {total}. Tell them."
-        if st == "failed":
-            return f"It didn't go through: {msg}. Nothing should be charged."
-        if st == "cancelled":
-            return "That order was cancelled."
-        if "Needs the customer" in msg:
-            return (msg + " Ask them, then call answer_website_question.")
-        return (f"Still working: {msg}. Say nothing more about it - "
-                f"I will tell you the moment it changes.")
+                "with them, and call how_is_it_going.")
 
     @function_tool
     @auto_report("orders")
@@ -2039,65 +2065,16 @@ they go quiet, ask once whether they are still there, then wait.
             self.job_username = ""
         self._watch_job(f"signing in to {site}")
         return (f"Signing in to {site}. Tell them it takes about a minute, "
-                f"then call check_site_login.")
-
-    @function_tool
-    @auto_report("site_login")
-    async def check_site_login(self, context: RunContext):
-        """How the site sign-in is going. Call this at most ONCE. You will
-        be told automatically when it changes."""
-        if not getattr(self, "job_id", None):
-            return "No sign-in running."
-        try:
-            d = await backend_get("/jobs/status", job_id=self.job_id)
-        except Exception:
-            return "Couldn't check just now."
-        state, msg = d.get("state", ""), d.get("message", "")
-        reason = d.get("reason", "")
-        if state == "needs_code":
-            return msg + " Ask for it, then call submit_site_code."
-        if state == "done":
-            return f"Done. {msg}"
-        if state == "failed":
-            site = getattr(self, "job_site", "") or "the site"
-            if reason == "bad_password":
-                self.site_fails[site] = self.site_fails.get(site, 0) + 1
-            return login_failure_line(site, reason, msg,
-                                      self.site_fails.get(site, 0),
-                                      getattr(self, "job_username", ""))
-        if state == "waiting":
-            return (msg + " Tell them it's queued and will start in a moment.")
-        return ("Still running. Say nothing more about it - I will tell you "
-                "when it changes.")
-
-    @function_tool
-    @auto_report("site_login")
-    async def submit_site_code(self, context: RunContext, code: str):
-        """Give the site the one-time code the caller read out."""
-        if not getattr(self, "job_id", None):
-            return "No sign-in running."
-        digits = "".join(ch for ch in (code or "") if ch.isdigit())
-        if len(digits) < 3:
-            return ("That is not a code. Ask them to read out the digits "
-                    "from the message, slowly, and call this again with "
-                    "just those digits. Never send anything else here.")
-        try:
-            await backend_post("/jobs/code",
-                               {"job_id": self.job_id, "code": code})
-        except Exception as e:
-            log.error(f"job code failed: {e}")
-            return "That code didn't go through."
-        return ("Code sent. Say nothing more about it - I will tell you when "
-                "it changes.")
+                f"then call how_is_it_going.")
 
     @function_tool
     @auto_report("jobs")
     async def stop_that(self, context: RunContext,
                         why: str = "they changed their mind"):
-        """Stop whatever is running right now. Use this the moment the
-        caller corrects you, changes their mind, or asks for something
-        else - a search for the wrong thing is worth nothing, and waiting
-        for it wastes their call."""
+        """Stop whatever is running. Use it the moment the caller corrects
+        you, changes their mind, or cannot do what a site is asking for -
+        a code they can't reach, a check they can't do. Work for the old
+        question is worth nothing, and waiting for it wastes their call."""
         jid = getattr(self, "job_id", None)
         if not jid:
             return ("Nothing is running. Do not say you are waiting for "
@@ -2108,11 +2085,13 @@ they go quiet, ask once whether they are still there, then wait.
                              params={"job_id": jid, "why": why[:120]})
         except Exception as e:
             log.error(f"stop failed: {e}")
+        site = getattr(self, "job_site", "") or "that"
         self.job_id = None
         await log_turn(self.call_id, "tool", f"stopped: {why}", "stop_that")
-        return ("Stopped. Say briefly that you have dropped that, then do "
-                "what they actually asked. Never say you are still waiting "
-                "for it.")
+        return (f"Stopped. Say plainly that you have stopped trying {site}, "
+                f"and why, in one sentence. Anything already saved stays "
+                f"saved. Offer to try again later or to have the office "
+                f"call them. Never say you are still waiting for it.")
 
     @function_tool
     @auto_report("orders")
@@ -2169,34 +2148,6 @@ they go quiet, ask once whether they are still there, then wait.
 
     @function_tool
     @auto_report("logins")
-    async def stop_waiting_for_code(self, context: RunContext,
-                                    why: str = "they can't get the code"):
-        """Stop a sign-in that is waiting for a one-time code the caller
-        cannot get - their phone is elsewhere, the message never came, they
-        can't reach their email. Use this INSTEAD of saying you'll handle
-        it. Nothing carries on afterwards."""
-        jid = getattr(self, "job_id", None)
-        if not jid:
-            return ("Nothing is waiting. Do not say you are working on "
-                    "anything.")
-        try:
-            async with httpx.AsyncClient(timeout=20) as c:
-                await c.post(f"{BACKEND}/jobs/cancel", headers=AUTH,
-                             params={"job_id": jid, "why": why[:120]})
-        except Exception as e:
-            log.error(f"cancel job failed: {e}")
-        site = getattr(self, "job_site", "") or "the site"
-        self.job_id = None
-        await log_turn(self.call_id, "tool", f"stopped sign-in: {why}",
-                       "stop_waiting_for_code")
-        return (f"Stopped. Tell them plainly that you have stopped trying to "
-                f"sign in to {site}, because the code can't be reached right "
-                f"now. Their login is still saved. Offer: try again later "
-                f"when they have the code in front of them, or have the "
-                f"office call them back. Then ask what else they need.")
-
-    @function_tool
-    @auto_report("logins")
     async def save_site_login(self, context: RunContext, site: str,
                               username: str, password: str = ""):
         """Save a login for a site with no API, e.g. Amazon. Only after
@@ -2249,20 +2200,6 @@ they go quiet, ask once whether they are still there, then wait.
         return (f"Saved their {site} login. Do not say the password again. "
                 f"Tell them it's stored encrypted and they can have it "
                 f"deleted whenever they want.")
-
-    @function_tool
-    @auto_report("logins")
-    async def list_site_logins(self, context: RunContext):
-        """Which sites they've saved a login for. Never shows passwords."""
-        if not self.verified:
-            return "Not verified yet. Ask for the PIN first."
-        try:
-            rows = await backend_get("/logins", account_id=self.account_id)
-        except Exception:
-            return "Couldn't check."
-        if not rows:
-            return "No site logins saved."
-        return "; ".join(f"{r['site']} as {r['username']}" for r in rows)
 
     @function_tool
     @auto_report("logins")
@@ -2334,33 +2271,6 @@ they go quiet, ask once whether they are still there, then wait.
             return ("Everything is deleted. Tell them it's done, that their "
                     "email access has been revoked, and say goodbye warmly.")
         return "Nothing was deleted."
-
-    @function_tool
-    @auto_report("account")
-    async def list_mailboxes(self, context: RunContext):
-        """Which email addresses this caller has connected, most-used first."""
-        if not self.verified:
-            return "Not verified yet. Ask for the PIN first."
-        try:
-            rows = await backend_get("/mailboxes",
-                                     account_id=self.account_id)
-        except Exception:
-            return "Couldn't check their mailboxes."
-        if not rows:
-            return "No email connected yet. Offer to connect one."
-        if len(rows) == 1:
-            self.mailbox = rows[0]["email"]
-            return f"One mailbox: {rows[0]['email']}. Just use it."
-        parts = []
-        for r in rows:
-            name = r.get("label") or r.get("email")
-            tags = []
-            if r.get("default"):
-                tags.append("main")
-            tags.append(f"{r.get('used', 0)} uses")
-            parts.append(f"{name} ({', '.join(tags)})")
-        return ("They have several: " + "; ".join(parts) +
-                ". Ask which one if it isn't obvious.")
 
     @function_tool
     @auto_report("account")
@@ -2540,7 +2450,7 @@ they go quiet, ask once whether they are still there, then wait.
                 f"number they're calling from and this code: {digits}. Say "
                 f"the code twice and ask them to read it back. It works for "
                 f"about an hour. They'll type the card on Stripe's secure "
-                f"page, and nothing is charged. Once it's done, list_cards "
+                f"page, and nothing is charged. Once it's done, what_is_saved "
                 f"will show it.")
 
     @function_tool
@@ -2650,13 +2560,10 @@ they go quiet, ask once whether they are still there, then wait.
 
         self._start_watch("signin", fetch, describe)
         return ("Sign-in started. Tell them it takes about a minute, then "
-                "call check_connect.")
+                "call how_is_it_going.")
 
-    @function_tool
-    @auto_report("signin")
-    async def check_connect(self, context: RunContext):
-        """How the email sign-in is going. Call this at most ONCE. You will
-        be told automatically when it changes."""
+    async def _connect_state(self, context=None):
+
         if not getattr(self, "onboard_sid", None):
             return "No sign-in running."
         try:
@@ -2702,6 +2609,66 @@ they go quiet, ask once whether they are still there, then wait.
         return (f"Still working ({state}). Stay with them, but say nothing "
                 f"more about it - I will tell you when it changes.")
 
+    async def _order_state(self, context=None):
+
+        if not getattr(self, "order_id", None):
+            return "No order in progress."
+        d = await backend_get("/orders/status", order_id=self.order_id)
+        st, msg = d.get("state", ""), d.get("message", "")
+        if st == "placed":
+            conf = d.get("confirmation") or "not shown"
+            total = d.get("final_total") or "not shown"
+            return f"PLACED. Confirmation {conf}, total {total}. Tell them."
+        if st == "failed":
+            return f"It didn't go through: {msg}. Nothing should be charged."
+        if st == "cancelled":
+            return "That order was cancelled."
+        if "Needs the customer" in msg:
+            return (msg + " Ask them, then call answer_website_question.")
+        return (f"Still working: {msg}. Say nothing more about it - "
+                f"I will tell you the moment it changes.")
+
+    async def _job_state(self, context=None):
+
+        if not getattr(self, "job_id", None):
+            return "No sign-in running."
+        try:
+            d = await backend_get("/jobs/status", job_id=self.job_id)
+        except Exception:
+            return "Couldn't check just now."
+        state, msg = d.get("state", ""), d.get("message", "")
+        reason = d.get("reason", "")
+        if state == "needs_code":
+            return msg + " Ask for it, then call submit_code."
+        if state == "done":
+            return f"Done. {msg}"
+        if state == "failed":
+            site = getattr(self, "job_site", "") or "the site"
+            if reason == "bad_password":
+                self.site_fails[site] = self.site_fails.get(site, 0) + 1
+            return login_failure_line(site, reason, msg,
+                                      self.site_fails.get(site, 0),
+                                      getattr(self, "job_username", ""))
+        if state == "waiting":
+            return (msg + " Tell them it's queued and will start in a moment.")
+        return ("Still running. Say nothing more about it - I will tell you "
+                "when it changes.")
+
+    @function_tool
+    @auto_report("jobs")
+    async def how_is_it_going(self, context: RunContext):
+        """How the thing that is running is getting on - a sign-in, an
+        order, a search. Call it at most ONCE: you are told automatically
+        when anything changes."""
+        if getattr(self, "onboard_sid", None):
+            return await self._connect_state(context)
+        if getattr(self, "order_id", None):
+            return await self._order_state(context)
+        if getattr(self, "job_id", None):
+            return await self._job_state(context)
+        return ("Nothing is running. Do not say you are waiting for "
+                "anything - answer them, or ask what they need.")
+
     @function_tool
     @auto_report("signin")
     async def try_another_way(self, context: RunContext):
@@ -2714,7 +2681,7 @@ they go quiet, ask once whether they are still there, then wait.
                         "way to ask for. Tell them where the site said it "
                         "sent the code, ask them to look there, and offer "
                         "to have the office call them back if it never "
-                        "arrives. Do NOT call submit_site_code with "
+                        "arrives. Do NOT call submit_code with "
                         "anything but digits they read out.")
             return "No sign-in running."
         try:
@@ -2725,12 +2692,10 @@ they go quiet, ask once whether they are still there, then wait.
             log.error(f"another way failed: {e}")
             return "Couldn't switch methods."
         return ("Asked Google to text a code instead. Wait about ten seconds, "
-                "then check_connect again.")
+                "then how_is_it_going again.")
 
-    @function_tool
-    @auto_report("signin")
-    async def submit_code(self, context: RunContext, code: str):
-        """Give Google the verification code the caller just read out."""
+    async def _code_to_google(self, context, code: str):
+
         if not getattr(self, "onboard_sid", None):
             return "No sign-in running."
         try:
@@ -2741,7 +2706,36 @@ they go quiet, ask once whether they are still there, then wait.
         except Exception as e:
             log.error(f"code submit failed: {e}")
             return "That code didn't go through. Ask them to read it again."
-        return "Code sent. Wait a few seconds and call check_connect."
+        return "Code sent. Wait a few seconds and call how_is_it_going."
+
+    async def _code_to_site(self, context, code: str):
+
+        if not getattr(self, "job_id", None):
+            return "No sign-in running."
+        digits = "".join(ch for ch in (code or "") if ch.isdigit())
+        if len(digits) < 3:
+            return ("That is not a code. Ask them to read out the digits "
+                    "from the message, slowly, and call this again with "
+                    "just those digits. Never send anything else here.")
+        try:
+            await backend_post("/jobs/code",
+                               {"job_id": self.job_id, "code": code})
+        except Exception as e:
+            log.error(f"job code failed: {e}")
+            return "That code didn't go through."
+        return ("Code sent. Say nothing more about it - I will tell you when "
+                "it changes.")
+
+    @function_tool
+    @auto_report("signin")
+    async def submit_code(self, context: RunContext, code: str):
+        """Give the one-time code the caller just read out, to whichever
+        sign-in is waiting for it. DIGITS ONLY, as they said them."""
+        if getattr(self, "onboard_sid", None):
+            return await self._code_to_google(context, code)
+        if getattr(self, "job_id", None):
+            return await self._code_to_site(context, code)
+        return "No sign-in is waiting for a code."
 
     @function_tool
     @auto_report("sms")
@@ -2784,13 +2778,9 @@ they go quiet, ask once whether they are still there, then wait.
     @auto_report("search")
     async def web_search(self, context: RunContext, query: str,
                          near: str = ""):
-        """Look something up ONLY when you don't already know it, or when
-        it changes: today's prices, opening hours now, a phone number, an
-        address, whether something is in stock, how far somewhere is, a
-        specific model's exact steps.
-
-        Do NOT use this for ordinary knowledge you already have - it costs
-        the caller a wait for nothing. Answer those yourself, straight away.
+        """A quick fact, ONLY when you don't already know it: a phone
+        number, an address, opening hours. Not for ordinary knowledge you
+        have, and not for a model's exact steps - look_it_up does those.
         Set near to a place name for local questions."""
         try:
             data = await backend_get("/web/search", q=query, near=near)
@@ -2896,24 +2886,14 @@ they go quiet, ask once whether they are still there, then wait.
     @function_tool
     @auto_report("search")
     async def ask_ai(self, context: RunContext, question: str):
-        """Ask a bigger, better-informed model a general-knowledge question
-        and get an answer back almost at once.
+        """Ask a bigger model a general-knowledge question. Use it the
+        moment you are unsure of anything general.
 
-        Use this the moment you are not certain of something general - how
-        a particular appliance works, what something means, how a thing is
-        normally done. It knows far more than you do and it will say when
-        it isn't sure instead of inventing.
+        IT CANNOT SEE THIS CONVERSATION: write the whole question out -
+        make, model, what they actually want. "How do I turn on the ice
+        maker" gets a useless answer.
 
-        IT CANNOT SEE THIS CONVERSATION. Write the whole question out,
-        every time: the make and model, the brand, what they actually want.
-        "How do I turn on the ice maker" gets a useless generic answer;
-        "how do I turn on the ice maker on a Frigidaire PRDF1922AF" gets a
-        real one. Never send a question with "the" or "it" standing in for
-        something they told you earlier.
-
-        This is FAST. Do not announce it, do not say "one moment", just
-        call it and answer. Only use look_it_up if this says it needs
-        checking, or if they ask you to check properly."""
+        Fast: do not announce it, just call it and answer."""
         try:
             data = await backend_get("/ask", q=question)
         except Exception as e:
@@ -2936,22 +2916,13 @@ they go quiet, ask once whether they are still there, then wait.
     @function_tool
     @auto_report("search")
     async def look_it_up(self, context: RunContext, question: str):
-        """Find something out PROPERLY: this searches and then reads the
-        real pages itself, and tells you the answer when it has one.
+        """Find something out PROPERLY: searches, then reads the real
+        pages itself. For exact detail you don't know - one model's steps,
+        today's price, this week's hours. Takes about a minute in the
+        background: one short sentence, then stay quiet.
 
-        Use this whenever they need exact detail you do not already know -
-        a particular model's steps, today's price, this week's opening
-        hours. It takes about a minute and runs in the background, so say
-        one short sentence and then stay quiet until I tell you the answer.
-
-        IT CANNOT SEE THIS CONVERSATION. Write the whole question out,
-        every time - the make, the model number, exactly what they want.
-        A question like "how do I turn on the ice maker for the" searches
-        for nothing and comes back with nothing.
-
-        Do NOT use web_search for these. A search on its own only gives you
-        headlines, and answering from those is how people get told wrong
-        instructions."""
+        IT CANNOT SEE THIS CONVERSATION: write the whole question out,
+        make and model included."""
         key = " ".join(question.lower().split())[:120]
         if self._lookups.get(key) == "failed":
             # Running the same failed search again gets the same nothing,

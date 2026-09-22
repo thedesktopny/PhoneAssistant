@@ -2697,10 +2697,10 @@ def _():
 @check("the assistant can't put words in a code box or invent a way out")
 def _():
     src = open("agent.py", encoding="utf-8").read()
-    body = src[src.index("async def submit_site_code("):]
+    body = src[src.index("async def _code_to_site("):]
     body = body[:body.index("\n    @function_tool")]
     assert "len(digits) < 3" in body, \
-        "submit_site_code still forwards whatever it is given"
+        "the code path still forwards whatever it is given"
     body = src[src.index("async def try_another_way("):]
     body = body[:body.index("\n    @function_tool")]
     assert "shop sign-in" in body, \
@@ -2745,9 +2745,9 @@ def _():
     inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
                            "+1555", 1)
     names = {getattr(t, "__name__", "") for t in inst.tools}
-    assert "stop_waiting_for_code" in names, "no way to give up on a code"
+    assert "stop_that" in names, "no way to give up on a code"
     text = inst.instructions
-    assert "stop_waiting_for_code" in text and "I'm handling it" in text,         "the instructions don't cover a caller who can't get the code"
+    assert "stop_that" in text and "I'm handling it" in text,         "the instructions don't cover a caller who can't get the code"
     assert "DIGITS ONLY" in text, "nothing says only digits go in a code box"
     paths = {r.path for r in main.app.routes}
     assert "/jobs/cancel" in paths, "a single job still can't be stopped"
