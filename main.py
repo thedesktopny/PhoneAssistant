@@ -8086,6 +8086,30 @@ def job_price(request: Request, account_id: int, item: str,
     # answers a browser with a captcha, and the job died at the front door
     # having priced nothing.
     shops, seen = [], set()
+    def _hosts(results):
+        """Best page per shop. A category page is not a price: prefer the
+        one that looks like the product itself."""
+        best = {}
+        for r in results or []:
+            link = (r.get("url") or r.get("link") or "").strip()
+            low = link.lower()
+            if not low.startswith("http") or len(low.split("/")) < 3:
+                continue
+            host = low.split("/")[2]
+            if any(bad in host for bad in
+                   ("google.", "youtube.", "facebook.", "reddit.",
+                    "pinterest.", "wikipedia.", "instagram.", "tiktok.")):
+                continue
+            looks_product = any(m in low for m in
+                                ("/product", "/dp/", "/p/", "/item",
+                                 "/prod", "/shop/"))
+            score = (2 if looks_product else 0) + (
+                1 if any(w in (r.get("title") or "").lower()
+                         for w in item.lower().split()[:3]) else 0)
+            if host not in best or score > best[host][0]:
+                best[host] = (score, link)
+        return best
+
     hits = []
     for q in (f"{item} price", f"buy {item} online"):
         try:
@@ -8093,23 +8117,21 @@ def job_price(request: Request, account_id: int, item: str,
         except Exception as e:
             emit("browse", "price", f"search failed: {str(e)[:120]}", "warn",
                  account_id)
-    try:
-        got = {"results": hits}
-        for r in got.get("results", []):
-            link = (r.get("link") or r.get("url") or "").strip()
-            low = link.lower()
-            if not low.startswith("http"):
-                continue
-            host = low.split("/")[2] if len(low.split("/")) > 2 else low
-            if host in seen or any(bad in host for bad in
-                                   ("google.", "youtube.", "facebook.",
-                                    "reddit.", "pinterest.", "wikipedia.")):
-                continue
-            seen.add(host)
-            shops.append(link)
-    except Exception as e:
-        emit("browse", "price", f"search failed: {str(e)[:120]}", "warn",
-             account_id)
+    found = _hosts(hits)
+    # A maker's own site answers all three searches and crowds out every
+    # shop that might be cheaper, which is the whole question. Ask again
+    # without it.
+    if len(found) < 3 and found:
+        top = max(found.items(), key=lambda kv: kv[1][0])[0]
+        try:
+            more = (tool_web_search(f"{item} price -site:{top}")
+                    or {}).get("results", [])
+            for host, pair in _hosts(more).items():
+                found.setdefault(host, pair)
+        except Exception:
+            pass
+    shops = [link for _score, link in
+             sorted(found.values(), key=lambda pair: -pair[0])]
     if not shops:
         raise HTTPException(503, "Couldn't find anywhere selling that.")
     jid = start_job(account_id, "browse", "", call_id=call_id or None,
