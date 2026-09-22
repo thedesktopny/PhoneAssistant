@@ -362,7 +362,7 @@ def _():
         ok, why = main.signed_in(Page("ההזמנות שלי - שלום דוד"))
         assert ok is True, f"blocked a customer it could not read: {why}"
     finally:
-        main.OPENAI_API_KEY = key
+        everywhere("OPENAI_API_KEY", key)
 
 
 @check("losing the proxy doesn't also lose the signed-in session")
@@ -390,14 +390,14 @@ def _():
             return False
 
     real_open, real_key = main.urllib.request.urlopen, main.BROWSERBASE_API_KEY
-    main.BROWSERBASE_API_KEY = "test"
+    everywhere("BROWSERBASE_API_KEY", "test")
     main.PROXY_STATUS["proxies_enabled"] = None
     main.urllib.request.urlopen = lambda req, timeout=0: Fake(req.data)
     try:
         sid = main._bb_session("ctx_abc", "US", "NY", "")
     finally:
         main.urllib.request.urlopen = real_open
-        main.BROWSERBASE_API_KEY = real_key
+        everywhere("BROWSERBASE_API_KEY", real_key)
     assert sid == "sess_kept", "gave up on the session when the proxy failed"
     assert seen == [True, False], f"expected a retry without proxies: {seen}"
     assert main.PROXY_STATUS["proxies_enabled"] is False, \
@@ -1582,24 +1582,24 @@ def _():
         def __init__(self, text): self.text = text
     real_text = main.page_text
     try:
-        main.page_text = lambda page, limit=0: page.text
+        everywhere("page_text", lambda page, limit=0: page.text)
         # the summariser honestly finds nothing in a page of menus
-        main._summarise_page = lambda text, q: "NOTHING_RELEVANT"
+        everywhere("_summarise_page", lambda text, q: "NOTHING_RELEVANT")
         answer, raw = main.page_answer(FakePage(nav), "their recent orders")
         assert answer == "", f"menu text came back as an answer: {answer!r}"
         assert raw, "the raw page should still be available"
         # a summariser that parrots the menus is caught too
-        main._summarise_page = lambda text, q: nav[:120]
+        everywhere("_summarise_page", lambda text, q: nav[:120])
         assert main.page_answer(FakePage(nav), "orders")[0] == "",             "a summary made of menu items was accepted"
         # a real answer gets through
-        main._summarise_page = lambda text, q: (
+        everywhere("_summarise_page", lambda text, q: (
             "Two orders: a printer cable delivered Tuesday, and copy paper "
-            "arriving Friday for $41.99.")
+            "arriving Friday for $41.99."))
         got, _ = main.page_answer(FakePage("...orders..."), "orders")
         assert "copy paper" in got, got
     finally:
-        main._summarise_page = real
-        main.page_text = real_text
+        everywhere("_summarise_page", real)
+        everywhere("page_text", real_text)
     src = source()
     for fn in ("def _run_site_orders(", "def _run_site_search("):
         body = src[src.index(fn):]
@@ -1737,7 +1737,7 @@ def _():
         return {"choices": [{"message": {
             "content": "I'm unable to perform the checkout for you."}}]}
     try:
-        main._openai_chat = prose
+        everywhere("_openai_chat", prose)
         act = main._decide("add to cart", "https://x", "text", [], [])
         assert act["action"] == "give_up" and act.get("refused"), act
         assert "wouldn't carry on" in act["answer"], act
@@ -1752,11 +1752,11 @@ def _():
             body = ('{"action": "click", "index": 3}' if state["n"] > 1
                     else "I can't do that.")
             return {"choices": [{"message": {"content": body}}]}
-        main._openai_chat = second_time
+        everywhere("_openai_chat", second_time)
         act = main._decide("add to cart", "https://x", "text", [], [])
         assert act["action"] == "click", act
     finally:
-        main._openai_chat = real
+        everywhere("_openai_chat", real)
     src = source()
     assert 'reason="model_refused"' in src,         "a refusal is still reported as an ordinary give-up"
 
@@ -1837,7 +1837,7 @@ def _():
         hit["n"] += 1
         return "NOTHING_RELEVANT"
     try:
-        main._summarise_page = counted
+        everywhere("_summarise_page", counted)
         got = c.get("/jobs/answer?job_id=%d&question=the search" % jid).json()
         assert got["answer"] == found, got
         assert hit["n"] == 0, "it summarised an answer that was already one"
@@ -1855,7 +1855,7 @@ def _():
         assert "nothing readable" in got["answer"], got
         assert "doesn't exist" in got["answer"], got
     finally:
-        main._summarise_page = real
+        everywhere("_summarise_page", real)
 
 
 @check("a page is given time to draw before it is read")
@@ -1884,7 +1884,7 @@ def _():
     real = main.page_text
     menu = "Skip to main content Deliver to All Departments Alexa Skills " * 12
     try:
-        main.page_text = lambda page, limit=0: page.text
+        everywhere("page_text", lambda page, limit=0: page.text)
         results = menu + "ISUNMEA 9 Inch Solar Lighted House Numbers $22.99 "
         product = menu + "DIBMS 9 inch Solar House Numbers, 4.3 stars, $22.99 "
         a = main._body_mark(FakePage(results + "x" * 2000))
@@ -1892,7 +1892,7 @@ def _():
         assert a != b, "two different pages look identical to the detector"
         assert a == main._body_mark(FakePage(results + "x" * 2000)),             "the same page looks different each time it is read"
     finally:
-        main.page_text = real
+        everywhere("page_text", real)
     src = source()
     body = src[src.index("def _run_browse("):]
     body = body[:body.index(chr(10) + "def ", 10)]
@@ -1914,14 +1914,14 @@ def _():
                 '{"action":"click","index":1,"found":"ISUNMEA is 9 inches, '
                 '$22.99","why":"read it"}'}}]}
     try:
-        main._openai_chat = capture
+        everywhere("_openai_chat", capture)
         act = main._decide("compare two", "https://x", "text", [], [],
                            findings=["DIBMS is 9 inches, $22.99"])
         assert "WHAT YOU HAVE WRITTEN DOWN SO FAR" in seen["msg"],             "notes are not given back to it"
         assert "DIBMS is 9 inches" in seen["msg"]
         assert act.get("found", "").startswith("ISUNMEA"), act
     finally:
-        main._openai_chat = real
+        everywhere("_openai_chat", real)
     js_prompt = main.BROWSE_SYSTEM
     assert '"found"' in js_prompt and "before you leave a page" in         js_prompt.lower(), "nothing tells it to write things down"
     src = source()
@@ -2051,8 +2051,8 @@ def _():
     ]}
     real_key, real_call = main.SERPER_API_KEY, main._serper_shopping
     try:
-        main.SERPER_API_KEY = "x"
-        main._serper_shopping = lambda item: made
+        everywhere("SERPER_API_KEY", "x")
+        everywhere("_serper_shopping", lambda item: made)
         got = main.shopping_prices("ECCO New Jersey mens shoes")
         shops = [o["shop"] for o in got["offers"]]
         assert got["exact"] is True, got
@@ -2920,6 +2920,75 @@ def _():
     assert len(tools) <= 80, (
         f"{len(tools)} tools. Each one's name and description is sent on "
         f"every turn too - merge the near-duplicates rather than adding.")
+
+
+@check("every file has every name it uses")
+def _():
+    """Moving code between files breaks quietly: the function still
+    parses, the app still starts, and the NameError arrives on a call, in
+    front of a customer. Splitting main.py did it twice - _CONNECT_FAILS
+    and LINK_LIFE_MIN were left behind - and both were found here rather
+    than by a caller.
+
+    Only names that another backend file defines are reported, so an
+    ordinary local variable is never mistaken for a missing import."""
+    import ast
+    import builtins
+    import glob
+    import importlib
+
+    files = [f for f in sorted(glob.glob("*.py"))
+             if f not in ("check.py", "scenarios.py", "probe.py", "agent.py")]
+    elsewhere = set()
+    for f in files:
+        tree = ast.parse(io.open(f, encoding="utf-8").read())
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.ClassDef)):
+                elsewhere.add(node.name)
+            elif isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name):
+                        elsewhere.add(t.id)
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target,
+                                                                ast.Name):
+                elsewhere.add(node.target.id)
+
+    problems = []
+    for f in files:
+        mod = importlib.import_module(f[:-3])
+        have = set(dir(mod)) | set(dir(builtins))
+        tree = ast.parse(io.open(f, encoding="utf-8").read())
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            local = {a.arg for a in node.args.args + node.args.kwonlyargs}
+            if node.args.vararg:
+                local.add(node.args.vararg.arg)
+            if node.args.kwarg:
+                local.add(node.args.kwarg.arg)
+            reads = set()
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Name):
+                    if isinstance(sub.ctx, ast.Store):
+                        local.add(sub.id)
+                    else:
+                        reads.add(sub.id)
+                elif isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                      ast.ClassDef)):
+                    local.add(sub.name)
+                elif isinstance(sub, (ast.Import, ast.ImportFrom)):
+                    for a in sub.names:
+                        local.add((a.asname or a.name).split(".")[0])
+                elif isinstance(sub, ast.ExceptHandler) and sub.name:
+                    local.add(sub.name)
+            for name in reads - local - have:
+                if name in elsewhere:
+                    problems.append("%s: %s() uses %s, which lives in "
+                                    "another file and is never imported"
+                                    % (f, node.name, name))
+    assert not problems, (chr(10) + "         ").join(
+        sorted(set(problems))[:8])
 
 
 @check("nothing an email tool does is permanent")

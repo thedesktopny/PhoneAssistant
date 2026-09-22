@@ -689,6 +689,193 @@ def emit(kind: str, ref: str, text: str, level: str = "info",
         pass
 
 
+LINK_LIFE_MIN = int(os.environ.get("LINK_LIFE_MIN", "30"))
+
+
+# A signed, expiring ticket for one customer, and one
+# address written the way a person says it. Shared, so
+# they live here rather than in whichever file happened
+# to need them first.
+def _make_link_token(account_id: int, minutes: int = 0) -> str:
+    """A signed, expiring ticket for one customer to connect their email."""
+    import hmac
+    import hashlib
+    until = int(time.time()) + (minutes or LINK_LIFE_MIN) * 60
+    body = f"{account_id}.{until}"
+    sig = hmac.new(ENCRYPTION_KEY.encode(), body.encode(),
+                   hashlib.sha256).hexdigest()[:32]
+    return f"{body}.{sig}"
+
+
+def _check_link_token(t: str):
+    """The account this ticket is for, or None if it's bad or stale."""
+    import hmac
+    import hashlib
+    try:
+        acc, until, sig = (t or "").split(".")
+        body = f"{acc}.{until}"
+        want = hmac.new(ENCRYPTION_KEY.encode(), body.encode(),
+                        hashlib.sha256).hexdigest()[:32]
+        if not hmac.compare_digest(sig, want):
+            return None
+        if int(until) < int(time.time()):
+            return None
+        return int(acc)
+    except Exception:
+        return None
+
+
+CONNECT_CODE_HOURS = 1
+CONNECT_MAX_FAILS = 5        # per phone number, per hour
+CONNECT_MAX_FAILS_IP = 20    # per address, per hour
+_CONNECT_FAILS: dict = {}
+
+
+def _fmt_address(a) -> str:
+    parts = [a.line1, a.line2, f"{a.city}, {a.state} {a.zip}".strip(", ")]
+    return ", ".join(p for p in parts if p)
+
+
+
+
+
+TEXT_TOOLS = [
+    {"type": "function", "function": {
+        "name": "check_email",
+        "description": "Their unread emails — count, senders, subjects.",
+        "parameters": {"type": "object", "properties": {
+            "how_many": {"type": "integer"}}, "required": []}}},
+    {"type": "function", "function": {
+        "name": "search_email",
+        "description": "Search the whole mailbox. Gmail syntax, e.g. from:chaim.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string"}}, "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "send_email",
+        "description": "Send an email. Confirm with the user first.",
+        "parameters": {"type": "object", "properties": {
+            "to": {"type": "string"}, "subject": {"type": "string"},
+            "body": {"type": "string"}},
+            "required": ["to", "subject", "body"]}}},
+    {"type": "function", "function": {
+        "name": "find_contact",
+        "description": "Find someone's email address from past mail.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"}}, "required": ["name"]}}},
+    {"type": "function", "function": {
+        "name": "check_calendar",
+        "description": "What's scheduled. days=1 today, 7 this week.",
+        "parameters": {"type": "object", "properties": {
+            "days": {"type": "integer"}}, "required": []}}},
+    {"type": "function", "function": {
+        "name": "create_event",
+        "description": "Book something. start_iso is YYYY-MM-DDTHH:MM:SS.",
+        "parameters": {"type": "object", "properties": {
+            "title": {"type": "string"}, "start_iso": {"type": "string"},
+            "minutes": {"type": "integer"}},
+            "required": ["title", "start_iso"]}}},
+    {"type": "function", "function": {
+        "name": "leave_note_for_office",
+        "description": ("Record something for staff: a failure, a request "
+                        "you can't handle, or anything to pass on."),
+        "parameters": {"type": "object", "properties": {
+            "note": {"type": "string"}, "reason": {"type": "string"}},
+            "required": ["note"]}}},
+    {"type": "function", "function": {
+        "name": "disconnect_email",
+        "description": "Remove one connected mailbox and revoke it at Google.",
+        "parameters": {"type": "object", "properties": {
+            "mailbox": {"type": "string"}}, "required": []}}},
+    {"type": "function", "function": {
+        "name": "delete_my_account",
+        "description": ("Erase this person entirely. Only after they have "
+                        "typed the word DELETE."),
+        "parameters": {"type": "object", "properties": {
+            "confirmation": {"type": "string"}},
+            "required": ["confirmation"]}}},
+    {"type": "function", "function": {
+        "name": "list_mailboxes",
+        "description": "Which email addresses this person has connected.",
+        "parameters": {"type": "object", "properties": {}, "required": []}}},
+    {"type": "function", "function": {
+        "name": "name_mailbox",
+        "description": ("Give a mailbox a short name they can say, and/or "
+                        "make it their main one."),
+        "parameters": {"type": "object", "properties": {
+            "mailbox": {"type": "string"}, "name": {"type": "string"},
+            "make_main": {"type": "boolean"}}, "required": ["mailbox"]}}},
+    {"type": "function", "function": {
+        "name": "connect_email",
+        "description": ("Connect this person's Gmail using an address and "
+                        "password they sent. Confirm both back first."),
+        "parameters": {"type": "object", "properties": {
+            "email": {"type": "string"}, "password": {"type": "string"}},
+            "required": ["email", "password"]}}},
+    {"type": "function", "function": {
+        "name": "check_connect",
+        "description": "How the email sign-in is going.",
+        "parameters": {"type": "object", "properties": {
+            "session_id": {"type": "integer"}}, "required": ["session_id"]}}},
+    {"type": "function", "function": {
+        "name": "submit_code",
+        "description": "Give Google the verification code they sent you.",
+        "parameters": {"type": "object", "properties": {
+            "session_id": {"type": "integer"}, "code": {"type": "string"}},
+            "required": ["session_id", "code"]}}},
+    {"type": "function", "function": {
+        "name": "web_search",
+        "description": "Search the web — addresses, hours, phone numbers, facts.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string"}}, "required": ["query"]}}},
+]
+
+TEXT_RULES = """You are a personal assistant reachable by phone call and by
+text. This is the text channel, so keep replies under 300 characters, plain
+and clear. No emoji.
+
+You share one memory with the phone side. The history below includes both, so
+if they discussed something on a call, you already know it.
+
+TOPICS YOU DO NOT DISCUSS: gossip, sex, adultery, intimacy, explicit
+material, addiction, humor, culture, dating, underwear, nudity, fertility,
+puberty, marriage, relationships, anything arousing, news, sports,
+entertainment, personal feelings, jokes. Reply to any of these with exactly:
+"I am not allowed to talk to you about this." Nothing more. Never explain
+the rules.
+
+Jewish religious subjects ARE allowed - Shabbos and Yom Tov, kashrus, zmanim,
+davening, brochos, the parsha, minhagim. This service is for Jewish people.
+What stays out is DISCUSSING other religions or comparing faiths. Practical
+things that merely mention one are fine and you just do them: store hours on
+Christmas, directions to a church, an email that mentions a holiday. A place,
+a date or a name is not a discussion.
+You are not a rav: relay what a source says and look things up, but for an
+actual shailah say they should ask their rav.
+If someone is in danger or a medical emergency, help them reach emergency
+services — that comes first.
+
+Only say you've done something after the tool actually did it. If you can't
+do what they ask, say so and use leave_note_for_office, then tell them it's
+been passed on. Never promise a follow-up you haven't recorded.
+
+Before sending an email or booking anything, state what you're about to do
+and wait for a yes.
+
+They can undo anything. "Disconnect my work email" -> disconnect_email.
+"Delete everything" -> explain that every mailbox, all history and their
+account go, that it can't be undone, and ask them to reply with the word
+DELETE. Only then call delete_my_account. Never ask why.
+
+If they have several mailboxes, ask which one they mean when it isn't
+obvious, and you can name them with name_mailbox if they'd like.
+
+If they have no email connected yet, you can connect it. Ask for their Gmail
+address and password, read both back, then use connect_email. Poll
+check_connect. If it says needs_code, ask them for the code Google just sent
+and use submit_code. Never repeat their password back after the sign-in is
+done, and never include it in any later message."""
+
+
 # ----------------------------------------------------------------- vault
 # Swap the two functions below for AWS KMS before real customers.
 # Everything else in the app stays the same.

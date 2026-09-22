@@ -10,47 +10,11 @@ One mailbox is picked per call by pick_connection; everything takes
 a "which" so a caller with two addresses is never guessed at.
 """
 from core import *                                   # noqa: F401,F403
-from core import _re_scrub, _tz, _clock, _when
+from core import _re_scrub, _tz, _clock, _when, _CONNECT_FAILS
 
 
 # ----------------------------------------------------------------- google
 
-LINK_LIFE_MIN = int(os.environ.get("LINK_LIFE_MIN", "30"))
-
-
-def _make_link_token(account_id: int, minutes: int = 0) -> str:
-    """A signed, expiring ticket for one customer to connect their email."""
-    import hmac
-    import hashlib
-    until = int(time.time()) + (minutes or LINK_LIFE_MIN) * 60
-    body = f"{account_id}.{until}"
-    sig = hmac.new(ENCRYPTION_KEY.encode(), body.encode(),
-                   hashlib.sha256).hexdigest()[:32]
-    return f"{body}.{sig}"
-
-
-def _check_link_token(t: str):
-    """The account this ticket is for, or None if it's bad or stale."""
-    import hmac
-    import hashlib
-    try:
-        acc, until, sig = (t or "").split(".")
-        body = f"{acc}.{until}"
-        want = hmac.new(ENCRYPTION_KEY.encode(), body.encode(),
-                        hashlib.sha256).hexdigest()[:32]
-        if not hmac.compare_digest(sig, want):
-            return None
-        if int(until) < int(time.time()):
-            return None
-        return int(acc)
-    except Exception:
-        return None
-
-
-CONNECT_CODE_HOURS = 1
-CONNECT_MAX_FAILS = 5        # per phone number, per hour
-CONNECT_MAX_FAILS_IP = 20    # per address, per hour
-_CONNECT_FAILS: dict = {}
 
 
 def _connect_code(account_id: int, hour: int | None = None,
@@ -199,38 +163,6 @@ def tool_unread_summary(account_id: int, limit: int = 5, which: str = "",
 
     total = res.get("resultSizeEstimate", len(items))
     return {"unread_count": total, "messages": items}
-
-
-
-
-def _browser_error(e) -> str:
-    """Say what a failure during a browser job actually means. Not every
-    HTTP error comes from Browserbase - the thinking is OpenAI's."""
-    t = str(e)
-    if "openai" in t.lower() or getattr(e, "_from_openai", False):
-        if "401" in t:
-            return ("OpenAI rejected the API key (401). OPENAI_API_KEY is "
-                    "missing or wrong on the BACKEND service in Railway - "
-                    "the voice agent having one is not enough.")
-        if "429" in t:
-            return "OpenAI is rate limiting or the account is out of credit."
-        return f"The thinking step failed: {t[:160]}"
-    if "401" in t:
-        return ("Browserbase rejected the API key (401). Check "
-                "BROWSERBASE_API_KEY and BROWSERBASE_PROJECT_ID in Railway.")
-    if "402" in t:
-        return ("Browserbase says payment required (402) - the account is "
-                "out of sessions or minutes. Check the Browserbase "
-                "dashboard; no code change will fix it.")
-    if "500" in t and "connect.browserbase" in t:
-        return ("Browserbase could not start a browser (500). This normally "
-                "follows the account running out of sessions or minutes - "
-                "check the Browserbase dashboard.")
-    if "429" in t:
-        return "Too many browser sessions at once. Try again in a minute."
-    if "timeout" in t.lower():
-        return "The site took too long to respond."
-    return f"Browser error: {t[:200]}"
 
 
 
