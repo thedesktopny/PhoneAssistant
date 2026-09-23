@@ -47,6 +47,11 @@ def keep_or_blank(state: dict, role: str, text: str) -> str:
             if state["turns"] > 40:          # never stuck on for a whole call
                 state["on"] = False
             return BLANKED
+        # Given before anyone asked - call 57: "...and the password is"
+        # straight after the username, spelled out.
+        if SECRET_WORD.search(text) and SPELLING.search(text):
+            state["on"], state["turns"] = True, 0
+            return BLANKED
         return text
     asks = bool(SECRET_WORD.search(text))
     spelled = bool(SPELLING.search(text))

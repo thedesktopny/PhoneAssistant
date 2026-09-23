@@ -3272,6 +3272,13 @@ def _():
         ("user", "Yes.", False),
         ("assistant", "Your login is saved and stored encrypted.", False),
         ("user", "Great, now order it.", False),
+        # call 57: given before it was asked for
+        ("user", "The username is c@example.com.", False),
+        ("user", "And the password is capital T lowercase v", True),
+        ("user", "then 3 8", True),
+        ("assistant", "Thanks. Let me read that back: capital T, "
+                      "lowercase v, 38.", True),
+        ("assistant", "Your login is saved.", False),
     ]
     for role, text, hide in convo:
         stored = agent.keep_or_blank(state, role, text)
