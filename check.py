@@ -2524,8 +2524,9 @@ def _():
     body = body[:body.index("\n    @function_tool")]
     assert "LOOKUP_WAIT" in body, \
         "look_it_up returns immediately again, leaving a gap to fill"
-    assert "sess.say(" in body, \
-        "the one announcement must be fixed words, not left to the model"
+    assert "speak_exactly(" in body and "mid_tool=True" in body, \
+        "the announcement must go through speak_exactly, which knows this " \
+        "voice cannot speak from inside a tool"
     assert 'state == "done"' in body and "Tell them that now" in body, \
         "the answer should come back from the tool, not a later update"
     # and it must still hand over if it runs long, not hold the call for ever
@@ -3272,6 +3273,12 @@ def _():
         ("user", "Yes.", False),
         ("assistant", "Your login is saved and stored encrypted.", False),
         ("user", "Great, now order it.", False),
+        # call 68: "Got it." in the middle of a PIN is not the end of it
+        ("assistant", "Please say your PIN.", False),
+        ("user", "Six, two, nine, four.", True),
+        ("assistant", "Got it.", False),
+        ("user", "Six, two, nine, four.", True),
+        ("assistant", "Thanks, your PIN is verified.", False),
         # call 57: given before it was asked for
         ("user", "The username is c@example.com.", False),
         ("user", "And the password is capital T lowercase v", True),
@@ -3357,6 +3364,87 @@ def _():
     assert done["dry_run"] is False
 
 
+@check("fixed words are spoken the one way this voice can")
+def _():
+    """Call 68: say() needs a text-to-speech voice, OpenAI's realtime model
+    reports supports_say=False, and every say() raised - the failed B&H
+    sign-in was never announced and "Are you still there?" was heard once
+    in 68 calls."""
+    import asyncio
+    from livekit.plugins import openai as _oa
+    rt = _oa.realtime.RealtimeModel(model="gpt-realtime")
+    assert not rt.capabilities.supports_say, \
+        "this voice can say() now - speak_exactly will use it, which is fine"
+
+    class Caps:
+        supports_say = False
+
+    class Model:
+        capabilities = Caps()
+
+    class Fake:
+        llm, tts = Model(), None
+
+        def __init__(self):
+            self.said, self.asked = [], []
+
+        def say(self, words, **k):
+            self.said.append(words)
+
+        def generate_reply(self, **k):
+            self.asked.append(k.get("instructions", ""))
+
+    s = Fake()
+    assert asyncio.run(agent.speak_exactly(s, "Are you still there?"))
+    assert not s.said and 'nothing else: "Are you still there?"' in s.asked[0]
+    s2 = Fake()
+    assert not asyncio.run(agent.speak_exactly(s2, "Hold on.", mid_tool=True))
+    assert not s2.said and not s2.asked, "it tried to speak from inside a tool"
+    s3 = Fake()
+    s3.tts = object()
+    asyncio.run(agent.speak_exactly(s3, "Hello."))
+    assert s3.said == ["Hello."], "with a real TTS voice, say() is the way"
+    src = io.open("agent.py", encoding="utf-8").read()
+    assert src.count("session.say(words") == 1 and "sess.say(" not in src, \
+        "say() is called somewhere it will raise"
+    wd = src[src.index("async def watchdog("):]
+    assert 'speak_exactly(session, "Are you still there?")' in wd[:3000]
+
+
+@check("how a job ended is written into the conversation, word for word")
+def _():
+    """Call 67 said "still in progress", call 68 "finished successfully",
+    both about a sign-in that had failed; and call 68 read "$699.99, down
+    from $849.99" out as $849.99. The outcome now goes into the model's own
+    record as a fact, with the exact answer."""
+    import asyncio
+    a = agent.Assistant({"account_id": 1, "name": "T"}, "+1555", 1)
+    a.job_site = "B&H"
+    kept = []
+
+    async def fake_update(ctx, **k):
+        kept.append(ctx)
+
+    a.update_chat_ctx = fake_update
+    asyncio.run(a._record_outcome({
+        "state": "failed", "kind": "site_login", "reason": "bot_check",
+        "message": "b&h wants a human to complete a check by hand"}))
+    asyncio.run(a._record_outcome({
+        "state": "done", "kind": "browse", "message": "The top match is the "
+        "Epson EcoTank Pro ET-5850 for $699.99, down from $849.99."}))
+    assert len(kept) == 2, "nothing was written into the conversation"
+
+    def last_text(ctx):
+        item = ctx.items[-1]
+        return item.text_content if hasattr(item, "text_content") else str(item)
+    failed, done = last_text(kept[0]), last_text(kept[1])
+    assert "FAILED" in failed and "B&H" in failed and \
+        "Never say it succeeded" in failed, failed
+    assert "$699.99, down from $849.99" in done, "the exact answer was lost"
+    assert "the first is today's price" in done, done
+    assert kept[0].items[-1].role == "system"
+
+
 @check("a failed job is said in words the model can't turn around")
 def _():
     """Call 67: told to say B&H's sign-in had failed, the voice model said
@@ -3371,8 +3459,12 @@ def _():
     src = io.open("agent.py", encoding="utf-8").read()
     w = src[src.index("    async def _watch(self, kind, fetch, describe):"):]
     w = w[:w.index("    def _start_watch(")]
-    assert "sess.say(said" in w, "a failure is still left to the model to phrase"
-    assert "never say it is still going" in w
+    assert "await self._record_outcome(d)" in w, \
+        "how the job ended is not written into the conversation as a fact"
+    assert "Say exactly this first, word for word" in w, \
+        "a failure is still left to the model to phrase"
+    assert "sess.say(" not in w, \
+        "say() raises with this voice - call 68's failure was never heard"
     assert "self.job_live = False" in w, "a finished job still counts as busy"
     assert 'getattr(agent_obj, "job_live", False)' in src, \
         "the silence watchdog still treats a failed job as running"

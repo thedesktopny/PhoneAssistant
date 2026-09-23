@@ -66,5 +66,9 @@ def keep_or_blank(state: dict, role: str, text: str) -> str:
         return text                          # the question itself is safe
     if state["on"] and STILL_GIVING.search(text):
         return text                          # "take your time" - still on
+    # "Got it." - a short acknowledgement is not the end. Call 68: the
+    # caller said the PIN a third time after it and it was written down.
+    if state["on"] and len(text.split()) <= 4 and not SECRET_DONE.search(text):
+        return text
     state["on"] = False
     return text

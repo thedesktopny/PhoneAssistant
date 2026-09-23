@@ -671,6 +671,10 @@ OTHER SITES
   it out (submit_code). I set and keep the new password. Never ask them to
   invent one, never read one out, and never ask for the old one.
 
+SAY MODEL NUMBERS ONE CHARACTER AT A TIME
+"E T, five eight five zero" - never "fifty-eight fifty". A caller heard
+"fifty-fifty" and thought it was the wrong printer.
+
 A WEB ADDRESS IS SPELLED BACK BEFORE ANYTHING OPENS IT
 A domain heard on the phone is half-heard: "kioskhut" came back to a
 caller as "kvihot", and three minutes went on a site that was never the
@@ -751,6 +755,36 @@ they go quiet, ask once whether they are still there, then wait.
                       "Do not guess and do not read anything yet.")
         return ""
 
+    async def _record_outcome(self, d: dict):
+        """Write how a job ended into the conversation itself, as a fact.
+
+        An instruction to say something is a suggestion the model can talk
+        over - call 67 said "still in progress" about a failure, call 68
+        said "finished successfully". A line in its own record it cannot
+        contradict, and when it is asked again later the answer is there.
+        The exact answer goes in too: call 68 read "$699.99, down from
+        $849.99" out as $849.99."""
+        try:
+            site = getattr(self, "job_site", "") or "the site"
+            what = (d.get("kind") or "job").replace("_", " ")
+            msg = (d.get("message") or "")[:1500]
+            if d.get("state") == "failed":
+                fact = (f"SYSTEM RECORD: the {what} on {site} FAILED "
+                        f"({d.get('reason') or 'no reason given'}). {msg} "
+                        f"Nothing from it worked. Never say it succeeded or "
+                        f"is still going.")
+            else:
+                fact = (f"SYSTEM RECORD: the {what} on {site} finished. "
+                        f"Exactly what it found: {msg} Read prices exactly "
+                        f"as written - when two are given, the first is "
+                        f"today's price. Say model numbers one character at "
+                        f"a time.")
+            ctx = self.chat_ctx.copy()
+            ctx.add_message(role="system", content=fact)
+            await self.update_chat_ctx(ctx)
+        except Exception as e:
+            log.warning(f"could not record how the job ended: {e}")
+
     def _failure_words(self, d: dict) -> str:
         """The exact words for a job that has failed, decided by its reason
         code. Spoken with say(), not handed to the model to phrase: call 67
@@ -791,19 +825,22 @@ they go quiet, ask once whether they are still there, then wait.
             last = key
             line = describe(d)
             said = ""
+            if state in ("done", "failed") and kind == "job":
+                await self._record_outcome(d)
             if state == "failed" and kind == "job":
                 said = self._failure_words(d)
             if line or said:
                 try:
                     sess = getattr(self, "session", None)
                     if sess and said:
-                        handle = sess.say(said, allow_interruptions=True)
-                        if inspect.isawaitable(handle):
-                            await handle
-                        line = (f"You have just told them it didn't work - "
-                                f"never say it is still going. Next: {line}"
-                                if line else "")
-                    if sess and line:
+                        # One reply: the failure in fixed words first, then
+                        # what to do next. The fact is already in its record.
+                        await sess.generate_reply(instructions=(
+                            f'Say exactly this first, word for word, in '
+                            f'English: "{said}" Then, in one more short '
+                            f'sentence, offer what can still be done. Never '
+                            f'say it worked or is still going.'))
+                    elif sess and line:
                         await sess.generate_reply(
                             instructions=(f"Update the caller now, in one "
                                           f"short sentence, in English: "
@@ -860,9 +897,13 @@ they go quiet, ask once whether they are still there, then wait.
                             "get_site_result about the sign-in itself.")
                 if kind == "browse":
                     # the message IS the answer - don't make them wait
-                    # through another round trip to hear it
-                    return (f"Tell them this now, in your own words, and "
-                            f"say where it came from if it names a model: "
+                    # through another round trip to hear it. Prices are
+                    # read as written: call 68 said $849.99 for "$699.99,
+                    # down from $849.99".
+                    return (f"Tell them this now. Read every price exactly "
+                            f"as written - when two are given, the first is "
+                            f"today's price. Say model numbers one character "
+                            f"at a time, like 'E T, five eight five zero'. "
                             f"{msg}")
                 return ("Say it's done, then get the details with "
                         "get_site_result.")
@@ -3224,15 +3265,8 @@ they go quiet, ask once whether they are still there, then wait.
         self.job_question = looking_for
         await log_turn(self.call_id, "tool", f"reading document: {link[:90]}",
                        "read_document")
-        sess = getattr(self, "session", None)
-        if sess:
-            try:
-                handle = sess.say("Let me open that and read it.",
-                                  allow_interruptions=True)
-                if inspect.isawaitable(handle):
-                    await handle
-            except Exception as e:
-                log.warning(f"could not announce the document: {e}")
+        await speak_exactly(getattr(self, "session", None),
+                            "Let me open that and read it.", mid_tool=True)
         waited = 0
         while waited < LOOKUP_WAIT:
             await asyncio.sleep(3)
@@ -3328,16 +3362,9 @@ they go quiet, ask once whether they are still there, then wait.
         # wordings of "say it once then be quiet" all failed - it told one
         # caller it was checking three times in ten seconds. It cannot talk
         # while it is waiting inside a tool.
-        sess = getattr(self, "session", None)
-        if sess:
-            try:
-                handle = sess.say("Let me look that up for you. "
-                                  "It takes about a minute.",
-                                  allow_interruptions=True)
-                if inspect.isawaitable(handle):
-                    await handle
-            except Exception as e:
-                log.warning(f"could not announce the lookup: {e}")
+        await speak_exactly(getattr(self, "session", None),
+                            "Let me look that up for you. It takes about a "
+                            "minute.", mid_tool=True)
 
         waited = 0
         while waited < LOOKUP_WAIT:
@@ -3502,6 +3529,41 @@ they go quiet, ask once whether they are still there, then wait.
         await log_turn(self.call_id, "tool", f"emailed {to}: {subject}",
                        "send_email")
         return "Sent."
+
+
+# ------------------------------------------------------------------ speaking
+
+async def speak_exactly(session, words: str, mid_tool: bool = False) -> bool:
+    """Have fixed words spoken, in the one way this voice can do it.
+
+    session.say() needs a text-to-speech voice or a realtime model that
+    supports it, and OpenAI's realtime model reports supports_say=False:
+    say() raised every time. Call 68's failed sign-in was never announced
+    because of it, and "Are you still there?" was heard once in 68 calls.
+    Without a TTS voice the model itself must speak, so it is asked for
+    these words, word for word, and nothing else. Inside a tool call it
+    cannot speak until the tool returns, so nothing is attempted there -
+    the tool's own reply is the first thing heard."""
+    if not session:
+        return False
+    try:
+        model = getattr(session, "llm", None)
+        can_say = bool(getattr(session, "tts", None)) or bool(getattr(
+            getattr(model, "capabilities", None), "supports_say", False))
+        if can_say:
+            handle = session.say(words, allow_interruptions=True)
+        elif mid_tool:
+            return False
+        else:
+            handle = session.generate_reply(
+                instructions=(f'Say exactly this, word for word, in English, '
+                              f'and nothing else: "{words}"'))
+        if inspect.isawaitable(handle):
+            await handle
+        return True
+    except Exception as e:
+        log.warning(f"could not speak: {e}")
+        return False
 
 
 # ------------------------------------------------------------------ secrets
@@ -3876,17 +3938,11 @@ async def entrypoint(ctx: JobContext):
             # warn once per silence, and not again until they speak
             if quiet > warn_at and warned_at < last_heard["at"]:
                 warned_at = now
-                try:
-                    # say() speaks these exact words. Asking the model to
-                    # "check if they are still there" made it repeat its
-                    # previous answer in full instead - a caller heard the
-                    # same paragraph about building a sukkah twice.
-                    handle = session.say("Are you still there?",
-                                         allow_interruptions=True)
-                    if inspect.isawaitable(handle):
-                        await handle
-                except Exception as e:
-                    log.warning(f"could not ask if they're there: {e}")
+                # These exact words, and nothing else. Asking the model to
+                # "check if they are still there" made it repeat its
+                # previous answer in full - a caller heard the same
+                # paragraph about building a sukkah twice.
+                await speak_exactly(session, "Are you still there?")
 
     async def hangup_when_asked():
         await hangup.wait()
