@@ -3494,6 +3494,21 @@ def _():
         "after a failure it can still offer things nobody has tried"
 
 
+@check("a human check inside a frame is named, and what it said is kept")
+def _():
+    """B&H: the check was in a frame, whose words come after 4,000
+    characters of menu. The runner saw it; the classifier only read the
+    menu and filed it as "unknown", keeping the menu as the evidence."""
+    import signals
+    menu = "Press Enter for Accessibility for blind people " * 120
+    text = (menu + "\n[inside a frame] Before we continue... Press & Hold "
+            "to confirm you are a human (and not a bot). Reference ID a0c0")
+    assert len(menu) > 4000
+    got = signals.classify_block(text, "https://www.bhphotovideo.com/a/cart")
+    assert got["kind"] == "puzzle", got["kind"]
+    assert "Press & Hold" in got["saw"], f"kept the menu instead: {got['saw'][:80]}"
+
+
 @check("a failed job is said in words the model can't turn around")
 def _():
     """Call 67: told to say B&H's sign-in had failed, the voice model said

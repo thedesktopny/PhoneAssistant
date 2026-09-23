@@ -156,16 +156,27 @@ BLOCK_MARKS = (
 
 
 def classify_block(text: str, url: str = "") -> dict:
-    """What kind of wall this is, in a word, plus what would change it."""
-    body = " ".join((text or "").split())[:4000]
+    """What kind of wall this is, in a word, plus what would change it.
+
+    The whole text is searched for a human check. A check inside a frame
+    is added after the main page's words, and on B&H the menu alone fills
+    the first 4,000 characters: the runner saw the check, this looked only
+    at the menu, and the wall was filed as "unknown". What is kept is the
+    part around the check, not the first lines of the page."""
+    full = " ".join((text or "").split())
+    body = full[:4000]
+    check = BOT_CHECK_MARKS.search(full)
+    near = full[max(0, check.start() - 200):check.end() + 300] if check \
+        else body
     vendor = ""
     for name, pattern in BLOCK_VENDORS:
-        if _re_scrub.search(pattern, body):
+        if _re_scrub.search(pattern, near) or _re_scrub.search(pattern, body):
             vendor = name
             break
     kind = ""
-    if looks_like_bot_check(body):
+    if check:
         kind = "puzzle"
+        body = near
     if not kind:
         for name, pattern in BLOCK_MARKS:
             if _re_scrub.search(pattern, body):
