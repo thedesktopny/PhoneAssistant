@@ -3445,6 +3445,55 @@ def _():
     assert kept[0].items[-1].role == "system"
 
 
+@check("'did it ever work before?' is answered by the record, not the history")
+def _():
+    """Call 69: "It worked before because the site let me in then" - B&H
+    never had. Call 68's false "sign-in finished successfully" was in the
+    call history and was believed. And retrying a site that blocks every
+    time was offered as if it might help; guest checkout was invented."""
+    import asyncio
+    from fastapi.testclient import TestClient
+    cl = TestClient(main.app, raise_server_exceptions=False,
+                    base_url="https://t")
+    cl.post("/admin/login", json={"password": os.environ.get(
+        "ADMIN_PASSWORD", "changeme")})
+    db = main.Session()
+    job = main.Job(account_id=1, kind="site_login", site="b&h-check",
+                   state="failed", reason="bot_check",
+                   message="b&h wants a human to complete a check")
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    jid = job.id
+    for n in range(3):
+        db.add(main.Block(site="b&h-check", kind="puzzle",
+                          job_id=jid if n == 2 else None))
+    db.commit()
+    db.close()
+    d = cl.get("/jobs/status", params={"job_id": jid}).json()
+    assert d.get("ever_signed_in") is False, d
+    assert d.get("blocks_today") == 3 and d.get("worth_retrying") is False, d
+
+    a = agent.Assistant({"account_id": 1, "name": "T"}, "+1555", 1)
+    a.job_site = "B&H"
+    kept = []
+
+    async def fake_update(ctx, **k):
+        kept.append(ctx)
+
+    a.update_chat_ctx = fake_update
+    asyncio.run(a._record_outcome(d))
+    fact = kept[-1].items[-1].text_content
+    assert "NEVER let us sign in" in fact, fact
+    assert "Trying again will not help" in fact, fact
+    words = a._failure_words(d)
+    assert "trying again won't help" in words, words
+    src = io.open("agent.py", encoding="utf-8").read()
+    w = src[src.index("    async def _watch(self, kind, fetch, describe):"):]
+    assert "guest checkout or anything else that has not" in w[:4000], \
+        "after a failure it can still offer things nobody has tried"
+
+
 @check("a failed job is said in words the model can't turn around")
 def _():
     """Call 67: told to say B&H's sign-in had failed, the voice model said

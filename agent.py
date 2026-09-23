@@ -773,6 +773,20 @@ they go quiet, ask once whether they are still there, then wait.
                         f"({d.get('reason') or 'no reason given'}). {msg} "
                         f"Nothing from it worked. Never say it succeeded or "
                         f"is still going.")
+                # The database's answer to "did it ever work?" - the call
+                # history once said it had, and was wrong.
+                if d.get("kind") == "site_login" and "ever_signed_in" in d:
+                    fact += (" The record shows a sign-in on this site HAS "
+                             "worked for them before." if d["ever_signed_in"]
+                             else f" The record shows {site} has NEVER let "
+                                  f"us sign in for them. If anything said "
+                                  f"earlier suggests otherwise, it was wrong.")
+                if d.get("worth_retrying") is False or \
+                        (d.get("blocks_today") or 0) >= 2:
+                    fact += (f" {site} has blocked us "
+                             f"{d.get('blocks_today') or 'every'} time(s) in "
+                             f"the last day. Trying again will not help - "
+                             f"say so if they ask to retry.")
             else:
                 fact = (f"SYSTEM RECORD: the {what} on {site} finished. "
                         f"Exactly what it found: {msg} Read prices exactly "
@@ -798,9 +812,12 @@ they go quiet, ask once whether they are still there, then wait.
         where = "its sign-in page" if d.get("kind") == "site_login" \
             else "the page"
         if reason == "bot_check":
+            again = (" It does this every time, so trying again won't help."
+                     if d.get("worth_retrying") is False
+                     or (d.get("blocks_today") or 0) >= 2 else "")
             return (f"I'm sorry - {site} put a human check on {where}, the "
                     f"press-and-hold kind, so I can't get through it for you "
-                    f"by phone.")
+                    f"by phone.{again}")
         if reason == "rate_limited":
             return (f"I'm sorry - {site} is turning us away for now. We can "
                     f"try again a little later.")
@@ -835,11 +852,16 @@ they go quiet, ask once whether they are still there, then wait.
                     if sess and said:
                         # One reply: the failure in fixed words first, then
                         # what to do next. The fact is already in its record.
+                        site = getattr(self, "job_site", "") or "the site"
                         await sess.generate_reply(instructions=(
                             f'Say exactly this first, word for word, in '
                             f'English: "{said}" Then, in one more short '
-                            f'sentence, offer what can still be done. Never '
-                            f'say it worked or is still going.'))
+                            f'sentence, offer only what is true: that you '
+                            f'can still look things up on {site} for them, '
+                            f'or have the office follow up. Never offer '
+                            f'guest checkout or anything else that has not '
+                            f'been done before. Never say it worked or is '
+                            f'still going.'))
                     elif sess and line:
                         await sess.generate_reply(
                             instructions=(f"Update the caller now, in one "

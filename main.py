@@ -2441,12 +2441,34 @@ def job_status(request: Request, job_id: int):
     require_auth(request)
     db = Session()
     row = db.query(Job).filter_by(id=job_id).first()
-    db.close()
     if not row:
+        db.close()
         raise HTTPException(404, "Unknown job.")
-    return {"job_id": row.id, "kind": row.kind, "site": row.site,
-            "state": row.state, "message": row.message,
-            "reason": row.reason or "", "history": row.history or ""}
+    out = {"job_id": row.id, "kind": row.kind, "site": row.site,
+           "state": row.state, "message": row.message,
+           "reason": row.reason or "", "history": row.history or ""}
+    if row.state == "failed" and row.site:
+        # What the record says about this site - so "it worked before"
+        # is decided by the database, not by a sentence in the call
+        # history that may have been wrong (call 68 said a B&H sign-in
+        # "finished successfully"; it never has).
+        since = datetime.utcnow() - timedelta(days=1)
+        out["ever_signed_in"] = bool(
+            db.query(Job).filter(Job.account_id == row.account_id,
+                                 Job.site == row.site,
+                                 Job.kind == "site_login",
+                                 Job.state == "done").first())
+        out["blocks_today"] = (db.query(Block)
+                               .filter(Block.site == row.site,
+                                       Block.at >= since).count())
+        wall = (db.query(Block).filter_by(job_id=row.id)
+                .order_by(Block.id.desc()).first())
+        if wall:
+            out["block_kind"] = wall.kind
+            out["worth_retrying"] = bool(
+                BLOCK_KINDS.get(wall.kind, ("", False, ""))[1])
+    db.close()
+    return out
 
 
 @app.get("/jobs/health")
