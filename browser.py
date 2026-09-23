@@ -1990,9 +1990,16 @@ Rules:
 _SNAPSHOT_JS = r"""
 (args) => {
   const limit = args.limit, want = (args.want || '').toLowerCase();
+  // numbers carry on from the frames read before this one, so every
+  // marker on the page is unique
+  const base = args.base || 0;
   const words = want.split(/[^a-z0-9]+/).filter(w => w.length > 3);
+  // Buttons drawn as styled boxes count too: B&H's "Begin Checkout" was
+  // in the picture and not in this list.
   const sel = 'a, button, input, textarea, select, [role=button], ' +
-              '[role=link], [role=combobox], [contenteditable="true"]';
+              '[role=link], [role=combobox], [contenteditable="true"], ' +
+              '[onclick], [tabindex]:not([tabindex="-1"]), ' +
+              '[class*="button" i], [class*="btn" i]';
   const typed = ['input', 'textarea', 'select'];
   // Clear the markers left by the last look at this page. A page that
   // only partly redraws - or a page we came BACK to - kept its old
@@ -2050,7 +2057,7 @@ _SNAPSHOT_JS = r"""
   const keep = cand.slice(0, limit).sort((a, b) => a.order - b.order);
   const out = [];
   for (const c of keep) {
-    c.el.setAttribute('data-pa-idx', String(out.length));
+    c.el.setAttribute('data-pa-idx', String(base + out.length));
     out.push({tag: c.tag, type: c.type, label: c.label});
   }
   return out;
@@ -2069,6 +2076,40 @@ def _body_mark(page) -> str:
                                              "ignore")).hexdigest()
 
 
+# Frames that are adverts, trackers or chat widgets - never where the
+# sign-in form or the checkout is.
+AD_FRAMES = _re_scrub.compile(
+    r"(?i)(criteo|doubleclick|googlesyndication|googletagmanager|adservice|"
+    r"facebook\.com/tr|bing\.com|pinterest|tiktok|snapchat|taboola|outbrain|"
+    r"adnxs|rubicon|pubmatic|casalemedia|demdex|everesttech|livechat|"
+    r"liveperson|zendesk|intercom|hotjar|clarity\.ms|youtube\.com/embed)")
+
+
+def _frames_to_read(page) -> list:
+    """The frames worth reading: the ones with real addresses that aren't
+    adverts. A sign-in form, a card box or a human check can be in one."""
+    out = []
+    try:
+        frames = list(page.frames)[1:]
+    except Exception:
+        return out
+    for fr in frames:
+        url = getattr(fr, "url", "") or ""
+        if not url.startswith("http") or AD_FRAMES.search(url):
+            continue
+        out.append(fr)
+    return out[:6]
+
+
+def _frame_for(page, url: str):
+    """The live frame with this address, found again at click time -
+    frames come and go, so a stored object can't be trusted."""
+    for fr in _frames_to_read(page):
+        if (getattr(fr, "url", "") or "") == url:
+            return fr
+    return None
+
+
 def _page_snapshot(page, limit: int = 80, want: str = ""):
     """Page text plus a numbered list of things you can interact with.
 
@@ -2084,17 +2125,35 @@ def _page_snapshot(page, limit: int = 80, want: str = ""):
     so "Add to Cart" never appeared and the model pressed things at random
     until it was declared stuck. The page is ranked now: buttons and boxes
     first, words from the goal next, menus and footers last."""
-    raw = page_eval(page, _SNAPSHOT_JS, {"limit": limit, "want": want}) or []
+    raw = page_eval(page, _SNAPSHOT_JS, {"limit": limit, "want": want,
+                                         "base": 0}) or []
+    found = [(it, "") for it in raw]
+    text = page_text(page, 4000) or ""
+    # Inside the frames too - B&H's sign-in form, and its "Press & Hold",
+    # were in one. Their words go into the page text, so a human check in
+    # a frame is caught by the code, not only by the model's eyes.
+    for fr in _frames_to_read(page):
+        got = page_eval(fr, _SNAPSHOT_JS, {"limit": 25, "want": want,
+                                           "base": len(found)}) or []
+        url = getattr(fr, "url", "") or ""
+        found += [(it, url) for it in got]
+        words = page_eval(fr, "() => (document.body ? "
+                              "document.body.innerText : '').slice(0, 800)")
+        if words and words.strip():
+            text += "\n[inside a frame] " + " ".join(words.split())
     items, seen = [], set()
-    for i, it in enumerate(raw):
+    for i, (it, url) in enumerate(found):
         tag = it.get("tag", "")
         typ = it.get("type", "")
         desc = f"{tag}{'/' + typ if typ else ''}: {it.get('label', '')}"
         if desc in seen:
             continue
         seen.add(desc)
-        items.append({"idx": i, "desc": desc})
-    return items, page_text(page, 4000)
+        item = {"idx": i, "desc": desc}
+        if url:
+            item["frame"] = url
+        items.append(item)
+    return items, text
 
 
 def _handle(page, item):
@@ -2102,7 +2161,10 @@ def _handle(page, item):
     snapshot left on it."""
     if not item:
         return None
-    return q(page, f'[data-pa-idx="{item["idx"]}"]')
+    where = _frame_for(page, item["frame"]) if item.get("frame") else page
+    if where is None:
+        return None
+    return q(where, f'[data-pa-idx="{item["idx"]}"]')
 
 
 def _first_json(raw: str) -> dict:
