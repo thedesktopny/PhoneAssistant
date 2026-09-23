@@ -3263,6 +3263,8 @@ def _():
                       "character at a time.", False),
         ("user", "capital K", True),
         ("assistant", "Got it, the first character is a capital K.", True),
+        ("assistant", "No problem, take your time and let me know the next "
+                      "characters whenever you're ready.", False),
         ("user", "lowercase q, then 4 7", True),
         ("assistant", "So far: capital K, lowercase q, then 47.", True),
         ("user", "then z z. That's it.", True),

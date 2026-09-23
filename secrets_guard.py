@@ -22,6 +22,14 @@ SPELLING = re.compile(r"(?i)\b(capital|lowercase|lower case|uppercase|"
                       r"upper case|symbol|underscore|exclamation|hashtag|"
                       r"at sign)\b|\b\w\b(?:[\s,.-]+\b\w\b){2,}|\d{2,}")
 BLANKED = "[a password or PIN was being given here - not recorded]"
+# Said while they are still giving it. Call 67: "take your time and let
+# me know the next characters" has no "password" in it, the old rule
+# took it as the end, and the next spelled piece was written down.
+STILL_GIVING = re.compile(
+    r"(?i)(take your time|no rush|go ahead|when(ever)? you'?re ready|"
+    r"ready when|next (part|characters?|letters?|digits?|bit|one)|so far|"
+    r"keep going|continue|carry on|still here|i'?m here|one (moment|second)|"
+    r"what comes next|the rest)")
 
 
 def keep_or_blank(state: dict, role: str, text: str) -> str:
@@ -51,5 +59,7 @@ def keep_or_blank(state: dict, role: str, text: str) -> str:
     if asks:
         state["on"], state["turns"] = True, 0
         return text                          # the question itself is safe
+    if state["on"] and STILL_GIVING.search(text):
+        return text                          # "take your time" - still on
     state["on"] = False
     return text
