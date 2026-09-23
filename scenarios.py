@@ -349,6 +349,107 @@ def _():
         f"that looks like a timezone problem")
 
 
+# -------------------------------------------------------------- everyday
+
+@scenario("everyday: candle lighting is a real time for a real place",
+          "built with the feature - candle lighting used to come from a web "
+          "search, for whatever town the search picked")
+def _():
+    d = call("/everyday/jewish", what="shabbos", place="11211")
+    assert d.get("place", "").startswith("Brooklyn"), d
+    times = [i for i in d.get("items", [])
+             if i.get("what") == "Candle lighting" and i.get("time")]
+    assert times, f"no candle lighting time came back: {d}"
+    assert times[0]["time"].endswith("PM"), times[0]
+
+
+@scenario("everyday: Williamsburg means Brooklyn, not Virginia",
+          "found while building it - the geocoder's Williamsburg is in "
+          "Virginia, and so was its Yerushalayim")
+def _():
+    w = call("/everyday/weather", place="Williamsburg")
+    assert "Brooklyn" in w.get("place", ""), w
+    j = call("/everyday/jewish", what="zmanim", place="Yerushalayim")
+    assert "Israel" in j.get("place", ""), j
+
+
+@scenario("everyday: a yahrzeit says the evening before",
+          "built with the feature - a date read on its own sends people a "
+          "day late")
+def _():
+    y = call("/everyday/yahrzeit", hebrew="9 Adar", years=2)
+    coming = y.get("coming") or []
+    assert coming and coming[0].get("candle_evening"), y
+    assert "evening before" in y.get("note", ""), y
+
+
+@scenario("everyday: what a customer keeps can be read back",
+          "David asked whether a caller who keeps Rabbeinu Tam would be "
+          "remembered - it wasn't, anywhere")
+def _():
+    """Read-only: this never changes the test account's minhag."""
+    d = call("/everyday/minhag", account_id=ACCOUNT)
+    assert isinstance(d, dict), d
+    for key in d:
+        assert key in ("candle_minutes", "havdalah", "shema"), d
+
+
+@scenario("browser: an address given in full is opened as it was said",
+          "call 64 - he asked for khconnect.kioskhut.com, the live system "
+          "opened www.khconnect.kioskhut.com.com, and he was told his own "
+          "site had a security problem")
+def _():
+    """The whole failure was in one step: turning what the caller said
+    into an address. com.com is a wildcard domain that answers anything,
+    so the old bug did not fail cleanly - it produced a certificate error
+    that read like the customer's site was broken."""
+    for said, want in (("khconnect.kioskhut.com",
+                        "https://khconnect.kioskhut.com"),
+                       ("amazon", "https://www.amazon.com"),
+                       ("www.lowes.com", "https://www.lowes.com")):
+        got = call("/browser/address", site=said).get("url")
+        assert got == want, f"for {said!r} the live system opens {got!r}"
+
+
+@scenario("reset: a password is never reset on a mailbox we cannot read",
+          "built with the feature - a reset on an address we cannot read "
+          "would be changing the password on somebody else's account")
+def _():
+    """Nothing here actually resets a password: that would change a real
+    account on a real shop. What it proves is that the live door is shut
+    to any address the customer has not connected, and that the route is
+    deployed at all."""
+    try:
+        call("/jobs/password-reset", method="POST", account_id=ACCOUNT,
+             site="lowes", email="not-their-address@example.com")
+        raise AssertionError(
+            "the live backend agreed to reset a password using an address "
+            "this customer has never connected")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise AssertionError(
+                "/jobs/password-reset is not deployed - the voice agent's "
+                "reset_site_password tool would fail on a real call")
+        assert e.code == 400, f"expected a plain refusal, got {e.code}"
+        said = e.read().decode("utf-8", "ignore")
+        assert "connected" in said.lower(), said[:200]
+
+
+@scenario("reset: a blocked subject is refused before a browser opens",
+          "rule 10 - blocked subjects get one answer everywhere, and a "
+          "browser is never opened to find out")
+def _():
+    try:
+        call("/jobs/password-reset", method="POST", account_id=ACCOUNT,
+             site="netflix", email="not-their-address@example.com")
+        raise AssertionError("a blocked subject started a browser job")
+    except urllib.error.HTTPError as e:
+        assert e.code == 400, e.code
+        said = e.read().decode("utf-8", "ignore")
+        wrong = f"refused, but for the wrong reason: {said[:200]}"
+        assert "not allowed to talk to you about this" in said, wrong
+
+
 # --------------------------------------------------------------- result
 
 print()

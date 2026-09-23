@@ -25,6 +25,7 @@ from signals import (looks_like_bot_check, looks_signed_in,
                      SIGNED_IN_MARKS, CODE_DEST, BLOCK_KINDS)
 from search import tool_web_search
 from google_tools import (code_from_email, gmail_client,
+                          reset_from_email,
                           google_client, pick_connection,
                           list_mailboxes)
 
@@ -1488,6 +1489,30 @@ def _run_site_login(jid: int, account_id: int, site: str):
         _JOBS.pop(jid, None)
 
 
+def site_url(site: str, path: str = "") -> str:
+    """A web address from whatever the caller called the site.
+
+    "amazon" becomes https://www.amazon.com. But a caller who gives the
+    whole address gets it used exactly as it is: call 64 asked for
+    khconnect.kioskhut.com, we opened www.khconnect.kioskhut.com.com, and
+    because com.com answers everything with a wildcard the browser
+    reported a certificate error - so a wrong address of ours was read out
+    as a security problem with his site. A name with a dot in it is
+    already an address; nothing is added to the front or the back of it.
+    """
+    s = (site or "").strip().strip("/")
+    if not s:
+        return ""
+    if "://" in s:
+        return s + path
+    bits = s.split("/", 1)
+    host = bits[0].lower()
+    rest = ("/" + bits[1] if len(bits) > 1 else "") + path
+    if "." in host:
+        return "https://" + host + rest
+    return "https://www." + host + ".com" + rest
+
+
 def _do_site_login(jid: int, account_id: int, site: str):
     """Returns (goal, url) if the agent should take over, else None."""
     from playwright.sync_api import sync_playwright
@@ -1503,7 +1528,7 @@ def _do_site_login(jid: int, account_id: int, site: str):
         return (f"sign in to {site} with the saved username and password, "
                 f"then confirm you are signed in by naming what you can see "
                 f"on the account page",
-                f"https://www.{site}.com")
+                site_url(site))
 
     ctx_id = _get_context(account_id, site.lower()) or \
         _new_browserbase_context()
@@ -1752,7 +1777,7 @@ def _run_site_orders(jid: int, account_id: int, site: str):
             jid, account_id, site,
             "find my recent orders and read back what was ordered, the "
             "status of each, and the date",
-            f"https://www.{site}.com")
+            site_url(site))
         return
 
     browser = page = None
@@ -1814,7 +1839,7 @@ def _run_site_search(jid: int, account_id: int, site: str):
             jid, account_id, site,
             f"search this site for {query} and read back the best few "
             f"matches with their prices",
-            f"https://www.{site}.com")
+            site_url(site))
         return
 
     browser = page = None
@@ -2456,8 +2481,7 @@ def _run_browse(jid: int, account_id: int, site: str):
         except Exception as e:
             emit("browse", f"job {jid}", f"search first failed: {e}", "warn")
     if not start:
-        start = (f"https://www.{site}.com" if site
-                 else "https://www.google.com")
+        start = site_url(site) or "https://www.google.com"
     # Other pages to try if this one turns out to refuse robots. A
     # manufacturer's own support page is usually the first search result
     # and usually the one that blocks, so going back to the agent to pick
@@ -2983,7 +3007,7 @@ def _run_checkout(jid: int, account_id: int, site: str):
             browser, page, ctx_id = _open_with_session(p, account_id, site)
             _job_set(jid, "opening", f"Opening {site}.")
             _order_set(oid, "placing", f"Opening {site}.")
-            do_goto(page, f"https://www.{site}.com", 4000)
+            do_goto(page, site_url(site), 4000)
 
             for step in range(30):
                 if (_JOBS.get(jid) or {}).get("cancelled"):
@@ -3096,4 +3120,474 @@ def _run_checkout(jid: int, account_id: int, site: str):
             pass
     finally:
         values.clear()
+        _JOBS.pop(jid, None)
+
+
+# A reset page is not a place to be adventurous. These are the buttons
+# that end an account rather than recover it, and no reset job may press
+# one - the same rule as BUY_BUTTONS, for the same reason: a prompt
+# saying "don't" is a wish.
+DANGER_BUTTONS = _re_scrub.compile(
+    r"(?i)(delete (my )?account|close (my )?account|deactivate|"
+    r"cancel (my )?(account|membership|subscription)|remove account|"
+    r"unsubscribe|opt out|delete profile)")
+
+# Characters a site is unlikely to argue with, and that cannot be
+# confused when they are written down: no l, I, 1, O, 0.
+_PW_LOW = "abcdefghjkmnpqrstuvwxyz"
+_PW_UP = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+_PW_NUM = "23456789"
+_PW_SYM = "!#$%&*+=?@"
+
+
+def _new_password(length: int = 16, symbols: bool = True) -> str:
+    """A password for a site, made here and never spoken.
+
+    The caller is on a phone with no screen. Asking an eighty-year-old to
+    invent a password and spell it back gets a weak one, twice, and the
+    second one wrong. This makes a strong one, stores it encrypted, and
+    signs them in with it from then on - they never need to know it.
+    Shorter and symbol-free variants exist because some sites cap the
+    length or refuse punctuation, and the runner retries with those."""
+    import secrets
+    pools = [_PW_LOW, _PW_UP, _PW_NUM] + ([_PW_SYM] if symbols else [])
+    length = max(10, min(length, 24))
+    # one from each pool first, so every published rule is satisfied
+    chars = [secrets.choice(p) for p in pools]
+    everything = "".join(pools)
+    chars += [secrets.choice(everything) for _ in range(length - len(chars))]
+    secrets.SystemRandom().shuffle(chars)
+    return "".join(chars)
+
+
+# Wording that means the site did not like the password we chose, as
+# opposed to the reset failing. Read as "try a different shape", not
+# "give up".
+PW_REJECTED = _re_scrub.compile(
+    r"(?i)(password (must|should|needs|has to|does not meet|doesn't meet)|"
+    r"must (be|contain|include|have) at least|at least \d+ characters|"
+    r"not (strong|long) enough|too (short|weak|long)|"
+    r"cannot (contain|include|use)|not allowed|invalid password|"
+    r"requirements|special character|passwords do not match)")
+
+# Wording that means it worked. Sites rarely navigate anywhere obvious.
+PW_CHANGED = _re_scrub.compile(
+    r"(?i)(password (has been |was |successfully )?(changed|updated|reset|"
+    r"created|saved)|successfully (changed|updated|reset)|"
+    r"your new password|password change (complete|successful)|"
+    r"you can now sign in|sign in with your new password)")
+
+# Wording that means the site is only willing to text them. The caller
+# may well have no texts at all, and we cannot read them if they do.
+PW_SAYS_MAIL = _re_scrub.compile(r"(?i)(e.?mail|inbox)")
+
+PW_BY_PHONE = _re_scrub.compile(
+    r"(?i)((text|sms|message) (message )?(sent|to your|has been sent)|"
+    r"we (sent|texted|will text)[^.]{0,40}(phone|mobile|number)|"
+    r"enter the code sent to [^.]{0,30}\d{2}|verify (your )?phone)")
+
+RESET_SYSTEM = """You are recovering a forgotten password on a website for
+a customer who is on the phone with us and has asked for this. You get the
+page text and numbered interactive elements. Reply with ONE JSON action and
+nothing else.
+
+Actions:
+{"action":"click","index":N,"why":"..."}
+{"action":"type","index":N,"text":"...","enter":false,"why":"..."}
+{"action":"goto","url":"https://...","why":"..."}
+{"action":"scroll","why":"..."}
+{"action":"wait","why":"..."}
+{"action":"sent","how":"email|phone|unclear","why":"..."}
+{"action":"changed","answer":"...","why":"..."}
+{"action":"give_up","answer":"...","why":"..."}
+
+THE ACCOUNT: {who}
+
+Placeholders you may type. They are swapped for the real values, and you
+never see them:
+  ACCOUNT_EMAIL   - the email address on the account
+  NEW_PASSWORD    - the new password. Type it into the new-password box AND
+                    into any confirm-password box.
+  MAIL_CODE       - a code the site emailed, once we have read it
+  SAVED_USERNAME  - their username, if one is saved
+
+What happens in what order:
+1. Find the way to recover a password: a "Forgot password" or "Forgot your
+   password" link, usually on the sign-in page. If you cannot see one, use
+   goto on the site's own sign-in page first.
+2. Type ACCOUNT_EMAIL into the box that asks who the account belongs to,
+   and submit it. If it insists on a phone number instead, give_up and say
+   so.
+3. When the page says it has sent something, reply with "sent" and say how
+   it was sent - email, phone, or unclear. Then stop. We read their email
+   ourselves and will bring you back to the page that the link opens.
+4. On the page that sets a new password, type NEW_PASSWORD into the new
+   password box and into the confirm box, then submit.
+5. When the site confirms the password is changed, reply "changed" with
+   what the page said. Only say "changed" if the page actually confirms it.
+   Never say it if you are guessing.
+
+Rules:
+- Never click anything that deletes, closes, deactivates or cancels the
+  account, and never change their email address, phone number or address.
+  You are here for the password and nothing else.
+- Do not create a new account. If the site says there is no account for
+  this address, give_up and say exactly that.
+- If the site asks a security question, or anything only the customer
+  knows, give_up and say what it asked. We will ask them and start again.
+- If the page is a human check - a puzzle, a press-and-hold, "verify you
+  are human" - give_up and say so. Never attempt it.
+- Never ask for, guess, or type their old password."""
+
+
+def _run_reset(jid: int, account_id: int, site: str):
+    """Recover a forgotten password on any site, start to finish.
+
+    The whole point is that the customer does nothing: we ask the site to
+    send the reset, read the mail in their own inbox, follow the link,
+    choose a password they never have to remember, and save it encrypted
+    so every sign-in from now on is silent. It works wherever the site
+    will email a link or a code. Where a site insists on a text message,
+    or puts a human check in the way, the job stops and says which -
+    those are not puzzles to solve.
+    """
+    from playwright.sync_api import sync_playwright
+
+    db = Session()
+    row = db.query(Job).filter_by(id=jid).first()
+    payload = json.loads(row.payload or "{}") if row else {}
+    call_id = row.call_id if row else None
+    db.close()
+
+    email = (payload.get("email") or "").strip()
+    if not email:
+        _job_set(jid, "failed", "No email address for the account.",
+                 reason="email_needed")
+        return
+
+    # The one hard rule. We can only reset a password if we can read the
+    # mail the site sends, and the only mailbox we may read is one this
+    # customer has connected themselves. Anything else would be resetting
+    # a password on somebody else's account.
+    boxes = []
+    try:
+        boxes = list_mailboxes(account_id)
+    except Exception as e:
+        emit("reset", f"job {jid}", f"could not list mailboxes: {e}", "warn",
+             account_id)
+    match = next((b for b in boxes
+                  if (b.get("email") or "").lower() == email.lower()), None)
+    if not match:
+        _job_set(jid, "failed",
+                 f"{email} is not one of the mailboxes they have connected, "
+                 f"so the reset mail could not be read. Connect that "
+                 f"address first, or use one that is already connected.",
+                 reason="email_needed")
+        return
+    # pick_connection matches an address exactly, so the mailbox we read
+    # is the one the site is mailing and never a sibling account.
+    which = email
+
+    # Only the username, and only from the list that never opens the
+    # vault: replacing a password is no reason to decrypt the old one.
+    saved = next((r for r in list_site_logins(account_id)
+                  if r.get("site") == site.lower()), {})
+    new_pw = _new_password()
+    tries = 0                 # password shapes tried
+    values = {"ACCOUNT_EMAIL": email, "NEW_PASSWORD": new_pw,
+              "SAVED_USERNAME": saved.get("username") or email,
+              "MAIL_CODE": ""}
+    cfg = SITES.get(site.lower()) or {}
+    start = cfg.get("reset_url") or cfg.get("login_url") \
+        or site_url(site)
+    system = RESET_SYSTEM.replace(
+        "{who}", f"{site} — the email address on the account is {email}")
+
+    def decide(url, text, items, history, shot=""):
+        listing = "\n".join(f"[{i}] {it['desc']}"
+                            for i, it in enumerate(items))
+        msg = (f"URL: {url}\nSTEPS SO FAR:\n" +
+               ("\n".join(history[-10:]) or "(none)") +
+               f"\n\nELEMENTS:\n{listing}\n\nPAGE TEXT:\n{text}")
+        d = _openai_chat([{"role": "system", "content": system},
+                          _user_turn(msg, shot)],
+                         model=MODEL_BROWSER, account_id=account_id,
+                         call_id=call_id, cheap=False)
+        raw = (d["choices"][0]["message"].get("content") or "").strip()
+        act = _first_json(raw)
+        if act.get("action"):
+            return act
+        emit("reset", f"job {jid}",
+             f"{MODEL_BROWSER} gave no usable action: {raw[:200]}", "warn",
+             account_id)
+        return {"action": "give_up", "answer": "Lost track of the page."}
+
+    def save_it(note: str):
+        """Store the new password. Once the site has accepted it the old
+        one is dead, so this happens before anything else - losing it here
+        would lock them out of their own account."""
+        save_site_login(account_id, site, values["SAVED_USERNAME"], new_pw)
+        record_change(account_id, "login", "password reset",
+                      f"reset the {site} password at their request and saved "
+                      f"the new one encrypted - they never hear it and never "
+                      f"need to remember it", call_id=call_id)
+        emit("reset", site, f"password reset for account {account_id}: {note}",
+             "info", account_id)
+
+    browser = page = None
+    history = []
+    mailed_at = 0             # when we asked the site to send
+    typed_pw = False          # has a new password actually been typed?
+    stage = "asking"          # asking -> waiting_mail -> setting -> done
+    try:
+        with sync_playwright() as p:
+            browser, page, ctx_id = _open_with_session(p, account_id,
+                                                      site.lower())
+            _job_set(jid, "opening", f"Opening {site}.")
+            do_goto(page, start, 4000)
+
+            for step in range(30):
+                if (_JOBS.get(jid) or {}).get("cancelled"):
+                    _job_set(jid, "failed", "The caller hung up.",
+                             reason="cancelled")
+                    break
+                items, text = _page_snapshot(
+                    page, want="forgot password reset email continue")
+                for _ in range(3):
+                    if len(items) >= 4 and len(text) >= 200:
+                        break
+                    settle(page, 1500)
+                    items, text = _page_snapshot(
+                        page, want="forgot password reset email continue")
+
+                # A human check is a stop, not a puzzle. Never ask a
+                # caller with no screen to press and hold anything.
+                if looks_like_bot_check(text):
+                    wall = record_block(account_id, site.lower(), text,
+                                        page_url(page), jid)
+                    _job_set(jid, "failed",
+                             f"{site.title()} put a human check in the way "
+                             f"of resetting the password: {wall['what']}"
+                             + (f" ({wall['vendor']})" if wall["vendor"]
+                                else "") + ". It cannot be done by phone.",
+                             reason=block_reason(wall["kind"]))
+                    break
+
+                # The site only wants to text them. We cannot read texts,
+                # and many callers have none.
+                if stage == "asking" and PW_BY_PHONE.search(text or "") \
+                        and not PW_SAYS_MAIL.search(text or ""):
+                    _job_set(jid, "failed",
+                             f"{site.title()} will only send the reset by "
+                             f"text message, which we cannot read. They "
+                             f"would need someone with the phone in front "
+                             f"of them to finish it.",
+                             reason="code_to_phone")
+                    break
+
+                shot = page_shot(page) if BROWSER_VISION else ""
+                act = decide(page_url(page), text, items, history, shot)
+                a = act.get("action")
+                why = act.get("why", "")[:120]
+
+                if a == "give_up":
+                    said = act.get("answer", "")[:400]
+                    reason = "no_account" if _re_scrub.search(
+                        r"(?i)(no account|not found|don't have an account|"
+                        r"isn't registered|no user)", said) else "stuck"
+                    _job_set(jid, "failed", said or "Could not do it.",
+                             reason=reason)
+                    break
+
+                if a == "sent":
+                    how = (act.get("how") or "unclear").lower()
+                    if how == "phone":
+                        _job_set(jid, "failed",
+                                 f"{site.title()} sent the reset to their "
+                                 f"phone as a text, which we cannot read.",
+                                 reason="code_to_phone")
+                        break
+                    stage = "waiting_mail"
+                    _job_set(jid, "working",
+                             f"{site.title()} has sent the reset. Looking in "
+                             f"their email for it.")
+                    got = {}
+                    for _ in range(10):            # up to ~90 seconds
+                        time.sleep(9)
+                        if (_JOBS.get(jid) or {}).get("cancelled"):
+                            break
+                        got = reset_from_email(account_id, site, mailed_at
+                                               or int(time.time() * 1000)
+                                               - 300000, which) or {}
+                        if got.get("link") or got.get("code"):
+                            break
+                    if not (got.get("link") or got.get("code")):
+                        _job_set(jid, "failed",
+                                 f"Nothing arrived in their {email} inbox "
+                                 f"from {site} within a minute and a half. "
+                                 f"It may still turn up - we can try again.",
+                                 reason="no_reset_mail")
+                        break
+                    emit("reset", site,
+                         "read the reset mail from their own inbox "
+                         + ("(link)" if got.get("link") else "(code)"),
+                         "info", account_id)
+                    stage = "setting"
+                    if got.get("code"):
+                        values["MAIL_CODE"] = got["code"]
+                        history.append("we read the code from their email — "
+                                       "type MAIL_CODE where it is asked for")
+                    if got.get("link"):
+                        # The link is a one-time secret: followed, never
+                        # written down.
+                        _job_set(jid, "working",
+                                 "Opening the reset page from their email.")
+                        do_goto(page, got["link"], 5000)
+                        history.append("opened the reset link from their "
+                                       "email — now set the new password")
+                    continue
+
+                if a == "changed":
+                    settle(page, 2500)
+                    seen = page_text(page, 2000) or ""
+                    if not typed_pw or not (PW_CHANGED.search(seen)
+                                            or PW_CHANGED.search(text or "")):
+                        # Saying it is done does not make it done. Same
+                        # rule as the browse runner: nothing was typed,
+                        # so nothing was changed.
+                        history.append("You said the password was changed, "
+                                       "but nothing on these pages has had "
+                                       "a new password typed into it. Carry "
+                                       "on, or give_up.")
+                        continue
+                    save_it(act.get("answer", "")[:200])
+                    # Prove it. A saved password that does not work is
+                    # worse than none: the old one is already dead.
+                    ok = False
+                    try:
+                        _job_set(jid, "working",
+                                 "Password changed. Checking it works by "
+                                 "signing in.")
+                        do_goto(page, cfg.get("login_url")
+                                or site_url(site), 4000)
+                        ok = signed_in(page, f"{site} after reset")[0]
+                    except Exception:
+                        ok = False
+                    record_change(account_id, "login",
+                                  "new password checked" if ok
+                                  else "new password not checked",
+                                  f"signed in to {site} with the new "
+                                  f"password and it worked" if ok else
+                                  f"the {site} password was changed and "
+                                  f"saved, but signing in with it could "
+                                  f"not be confirmed on this visit",
+                                  call_id=call_id)
+                    if ok:
+                        _job_set(jid, "done",
+                                 f"Their {site} password has been reset and "
+                                 f"they are signed in. The new password is "
+                                 f"saved, so they never need to know it or "
+                                 f"say it out loud.")
+                    else:
+                        _job_set(jid, "done",
+                                 f"Their {site} password has been reset and "
+                                 f"the new one is saved. Signing in with it "
+                                 f"still needs checking - say the reset "
+                                 f"worked, and that you will use the new "
+                                 f"password next time they need the site.")
+                    if ctx_id:
+                        _save_context(account_id, site.lower(), ctx_id)
+                    break
+
+                if a in ("click", "type"):
+                    idx = _action_index(act)
+                    if idx < 0 or idx >= len(items):
+                        note = (f"There is no [{idx}] - the page offers "
+                                f"{len(items)} things you can use.")
+                        history.append(note)
+                        _job_set(jid, "working", note)
+                        settle(page, 2500)
+                        continue
+                    if a == "click" and DANGER_BUTTONS.search(
+                            items[idx].get("desc", "")):
+                        note = ("Refused: that ends or changes the account "
+                                "rather than recovering the password. Find "
+                                "the reset route instead.")
+                        history.append(note)
+                        emit("reset", site,
+                             f"refused a dangerous control: "
+                             f"{items[idx].get('desc', '')[:80]}", "warn",
+                             account_id)
+                        continue
+
+                try:
+                    if a == "click":
+                        if stage == "asking":
+                            mailed_at = int(time.time() * 1000)
+                        do_click(page, _handle(page, items[idx]))
+                    elif a == "type":
+                        val = act.get("text", "")
+                        real = values.get(val, val)
+                        if val == "NEW_PASSWORD":
+                            real = new_pw
+                            typed_pw = True
+                        if stage == "asking" and act.get("enter"):
+                            mailed_at = int(time.time() * 1000)
+                        do_fill(page, _handle(page, items[idx]), real,
+                                bool(act.get("enter")))
+                    elif a == "goto":
+                        do_goto(page, act["url"])
+                    elif a == "scroll":
+                        page.mouse.wheel(0, 1400)
+                        settle(page, 2000)
+                    else:
+                        settle(page, 3000)
+                except Exception as e:
+                    history.append(f"{a} failed: {str(e)[:90]}")
+                    continue
+
+                # Did the site refuse the password we chose? Try a shape
+                # it is more likely to accept rather than losing the job:
+                # some cap the length, some refuse punctuation.
+                if stage == "setting" and tries < 2:
+                    settle(page, 1500)
+                    after = page_text(page, 1500) or ""
+                    if PW_REJECTED.search(after) and \
+                            not PW_CHANGED.search(after):
+                        tries += 1
+                        new_pw = _new_password(12 if tries == 1 else 10,
+                                               symbols=tries < 2)
+                        values["NEW_PASSWORD"] = new_pw
+                        history.append(
+                            "the site would not accept that password — "
+                            "a different one is ready, type NEW_PASSWORD "
+                            "again in both boxes. What it said: "
+                            + after[:200])
+                        continue
+
+                shown = act.get("text", "")
+                if shown in values and shown in ("NEW_PASSWORD", "MAIL_CODE"):
+                    shown = f"({shown.lower().replace('_', ' ')})"
+                history.append(f"{a} {act.get('index', act.get('url', ''))}"
+                               f" {shown} — {why}")
+                _job_set(jid, "working", f"Step {step + 1}: {why}")
+            else:
+                _job_set(jid, "failed",
+                         "Ran out of steps before the password was changed.",
+                         reason="stuck")
+
+            browser.close()
+    except Exception as e:
+        detail = " url=" + page_url(page)[:100] if page else ""
+        _job_set(jid, "failed", f"Browser error: {str(e)[:150]}{detail}",
+                 reason="site_error")
+        try:
+            if browser:
+                browser.close()
+        except Exception:
+            pass
+    finally:
+        # The password lives on in the vault, not in this process.
+        values.clear()
+        new_pw = ""
         _JOBS.pop(jid, None)

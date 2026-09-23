@@ -51,7 +51,8 @@ from advisor import (ADVISOR_SYSTEM, PROFILE_SYSTEM, REVIEW_SYSTEM, WORKING_CLAI
 from google_tools import (CODE_DIGITS, CODE_MAIL, CONNECT_CODE_HOURS, CONNECT_MAX_FAILS, CONNECT_MAX_FAILS_IP, CONVERTIBLE, DOC, DRIVE_KINDS, DRIVE_MAX_BYTES, MESSAGE_ACTIONS, PERSON_FIELDS, SEND_MAX_BYTES, SHEET, SLIDES, code_from_email, document_text, gmail_client, google_client, list_mailboxes, pick_connection, tool_attachment_text, tool_attachments, tool_cancel_event, tool_contact_add, tool_contacts_search, tool_create_event, tool_doc_add, tool_doc_create, tool_doc_replace, tool_draft_email, tool_drive_editable_copy, tool_drive_read, tool_drive_save_pdf, tool_drive_search, tool_email_drive_file, tool_find_contact, tool_find_free, tool_forward_email, tool_list_events, tool_mark_all_read, tool_mark_read, tool_message_action, tool_read_email, tool_reply_email, tool_search_email, tool_send_email, tool_sheet_add_row, tool_sheet_create, tool_sheet_read, tool_sheet_update, tool_task_add, tool_task_done, tool_tasks_list, tool_unread_summary)
 from google_tools import (_as_pdf, _cal, _category, _col_letters, _column_number, _connect_code, _connect_code_ok, _connect_too_many, _drive_kind, _drive_meta, _extract_body, _flow, _google_time, _headers_of, _made, _must_be, _person, _sheet_values, _spoken_date, _tab_range, _upload, _walk_parts)
 from browser import (_order_set, BROWSE_SYSTEM, BUY_BUTTONS, CHECKOUT_SYSTEM, DIAL_MAP, DOING_GOAL, MAX_BROWSERS, NAV_NOISE, ORDER_PAGES, PROXY_STATUS, REFUSAL_HINT, SEARCH_PAGES, SITES, STUCK_LIMIT, US_AREA_STATE, claims_action, delete_everything, disconnect_mailbox, do_back, do_click, do_fill, do_goto, forget_site_login, list_site_logins, looks_like_pdf, page_answer, page_eval, page_shot, page_text, page_url, q, q_all, read_pdf, revoke_google, save_site_login, settle, signed_in, use_site_login, _browser_error)
-from browser import (_JOB_STARTED, _LAST_LIMIT_FLAG, _LAST_PROXY_FLAG, _PENDING, _SNAPSHOT_JS, _TASK_CACHE, _action_index, _action_sig, _agent_fallback, _as_placeholder, _bb_connect_url, _bb_session, _body_mark, _decide, _do_site_login, _find_recipe, _first_json, _flag_account_limit, _flag_proxy_fallback, _flag_proxy_unavailable, _forget_context, _get_context, _going_in_circles, _handle, _is_nav_error, _job_set, _match_element, _new_browserbase_context, _ob_set, _open_with_session, _page_snapshot, _queue_lock, _recipe_result, _recipe_value, _record_request, _replay_recipe, _run_browse, _run_checkout, _run_signin, _run_site_login, _run_site_orders, _run_site_search, _save_context, _save_recipe, _shape, _slots, _stuck_note, _task_label, _task_shape, _user_turn, _waiting, _where_for_account, _where_for_phone)
+import everyday
+from browser import (site_url, _JOB_STARTED, _LAST_LIMIT_FLAG, _LAST_PROXY_FLAG, _PENDING, _SNAPSHOT_JS, _TASK_CACHE, _action_index, _action_sig, _agent_fallback, _as_placeholder, _bb_connect_url, _bb_session, _body_mark, _decide, _do_site_login, _find_recipe, _first_json, _flag_account_limit, _flag_proxy_fallback, _flag_proxy_unavailable, _forget_context, _get_context, _going_in_circles, _handle, _is_nav_error, _job_set, _match_element, _new_browserbase_context, _ob_set, _open_with_session, _page_snapshot, _queue_lock, _recipe_result, _recipe_value, _record_request, _replay_recipe, _run_browse, _run_checkout, _run_reset, _run_signin, _run_site_login, _run_site_orders, _run_site_search, _save_context, _save_recipe, _shape, _slots, _stuck_note, _task_label, _task_shape, _user_turn, _waiting, _where_for_account, _where_for_phone)
 from search import (shopping_prices, tool_web_search)
 from search import (_money, _search_serper, _search_tavily, _serper_shopping)
 # The foundations: configuration, the database and its tables, the
@@ -200,6 +201,7 @@ def account_for_number(number: str):
 RUNNERS = {"site_login": _run_site_login,
            "browse": _run_browse,
            "checkout": _run_checkout,
+           "password_reset": _run_reset,
            "site_orders": _run_site_orders,
            "site_search": _run_site_search}
 
@@ -1194,6 +1196,67 @@ def drive_email(b: FileBody, request: Request):
     return out
 
 
+# ------------------------------------------------------------- everyday
+# Weather, the Jewish calendar, yahrzeits and "what's my day" - see
+# everyday.py. account_id is optional where it only supplies a place:
+# the voice side sends it once the caller is verified.
+
+@app.get("/everyday/weather")
+def everyday_weather(request: Request, account_id: int = 0, place: str = "",
+                     days: int = 1):
+    require_auth(request)
+    return everyday.weather(account_id or None, place, days)
+
+
+@app.get("/everyday/jewish")
+def everyday_jewish(request: Request, account_id: int = 0, what: str = "",
+                    place: str = "", on: str = ""):
+    require_auth(request)
+    return everyday.jewish_calendar(account_id or None, what, place, on)
+
+
+@app.get("/everyday/yahrzeit")
+def everyday_yahrzeit(request: Request, died_on: str = "",
+                      after_sunset: int = 0, hebrew: str = "",
+                      years: int = 2):
+    require_auth(request)
+    try:
+        return everyday.yahrzeit(died_on, bool(after_sunset), hebrew, years)
+    except Exception as e:
+        return {"reason": "unavailable",
+                "message": f"The Jewish calendar service did not answer: "
+                           f"{str(e)[:100]}"}
+
+
+class MinhagBody(BaseModel):
+    account_id: int
+    candle_minutes: int = 0
+    havdalah: str = ""
+    shema: str = ""
+    call_id: int = 0
+
+
+@app.get("/everyday/minhag")
+def everyday_minhag_get(request: Request, account_id: int):
+    require_auth(request)
+    return everyday.minhag_of(account_id)
+
+
+@app.post("/everyday/minhag")
+def everyday_minhag_set(b: MinhagBody, request: Request):
+    """What they keep. Recorded under "What it did" like every other
+    change, so the office can see it was the customer who said it."""
+    require_auth(request)
+    return everyday.set_minhag(b.account_id, b.candle_minutes, b.havdalah,
+                               b.shema, call_id=b.call_id or None)
+
+
+@app.get("/everyday/my_day")
+def everyday_my_day(request: Request, account_id: int, which: str = ""):
+    require_auth(request)
+    return everyday.my_day(account_id, which)
+
+
 @app.get("/todo")
 def todo_list(request: Request, account_id: int, which: str = ""):
     require_auth(request)
@@ -1803,6 +1866,36 @@ def job_site_login(request: Request, account_id: int, site: str,
     return {"job_id": jid, "state": "queued"}
 
 
+@app.post("/jobs/password-reset")
+def job_password_reset(request: Request, account_id: int, site: str,
+                       email: str = "", call_id: int = 0):
+    """Recover a forgotten password on a site.
+
+    The email address must be one the customer has connected, because the
+    whole thing rests on reading the mail the site sends. Checked here as
+    well as in the runner: a route is the door, and the door should not
+    open onto somebody else's mailbox."""
+    require_auth(request)
+    if not BROWSERBASE_API_KEY:
+        raise HTTPException(400, "Browserbase isn't configured.")
+    if is_blocked(site):
+        raise HTTPException(400, BLOCKED_REPLY)
+    boxes = list_mailboxes(account_id)
+    if not boxes:
+        raise HTTPException(
+            400, "They have no mailbox connected, so the reset mail could "
+                 "not be read. Connect their email first.")
+    want = (email or "").strip().lower()
+    if not want:
+        want = (boxes[0].get("email") or "").lower()
+    if want not in [(b.get("email") or "").lower() for b in boxes]:
+        raise HTTPException(
+            400, f"{want} is not one of their connected mailboxes.")
+    jid = start_job(account_id, "password_reset", site,
+                    call_id=call_id or None, payload={"email": want})
+    return {"job_id": jid, "state": "queued", "email": want}
+
+
 @app.post("/jobs/site-orders")
 def job_site_orders(request: Request, account_id: int, site: str,
                     call_id: int = 0):
@@ -2253,6 +2346,19 @@ def events_list(request: Request, after_id: int = 0, limit: int = 200,
             "text": r.text} for r in reversed(rows)]
     db.close()
     return out
+
+
+@app.get("/browser/address")
+def browser_address(request: Request, site: str):
+    """The address a job would open for this site, without opening it.
+
+    Call 64: "khconnect.kioskhut.com" became
+    "https://www.khconnect.kioskhut.com.com". Nothing showed that but the
+    job's own log line, after the browser had already gone there, and
+    com.com answers everything - so it came back as a certificate error
+    and the caller was told his site was insecure."""
+    require_auth(request)
+    return {"site": site, "url": site_url(site)}
 
 
 @app.get("/browser/peek")

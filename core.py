@@ -459,6 +459,23 @@ class SecretAccess(Base):
     purpose = Column(String(120), default="")
 
 
+class Minhag(Base):
+    """What this customer keeps, so their times come out their way.
+
+    A setting the code applies, not a note a model might notice: someone
+    who keeps Rabbeinu Tam hears havdalah at 72 minutes on every call
+    without having to say so again. Empty means "not told" - both
+    opinions are read out."""
+    __tablename__ = "minhagim"
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"), unique=True)
+    candle_minutes = Column(Integer, default=0)   # 0 = the usual 18
+    havdalah = Column(String(20), default="")     # "", rabbeinu_tam,
+    #                                               tzeis, or minutes
+    shema = Column(String(10), default="")        # "", mga, gra
+    updated = Column(DateTime, default=datetime.utcnow)
+
+
 Base.metadata.create_all(engine)
 
 

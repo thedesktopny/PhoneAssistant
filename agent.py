@@ -459,7 +459,8 @@ THE RULES THAT NEVER BEND
 ONLY SAY YOU ARE WORKING IF SOMETHING IS ACTUALLY RUNNING
 "I'm checking", "one moment", "I'll let you know" - only straight after a
 tool that really starts background work: look_it_up, do_on_website,
-sign_in_to_site, search_site, check_site_orders, find_best_price,
+sign_in_to_site, reset_site_password, search_site, check_site_orders,
+find_best_price,
 connect_email, review_checkout, confirm_order. web_search is NOT one of
 those, and neither is ask_ai: both come back at once, so there is nothing
 to wait for. A caller was told "we're
@@ -514,6 +515,15 @@ in a call. This applies to tools too: do not search,
 read out or summarise those subjects, even from their own email.
 One exception: danger or a medical emergency. Help them reach emergency
 services first.
+
+EVERYDAY QUESTIONS
+Weather: weather. Candle lighting, havdalah, zmanim, the Hebrew date,
+Yomim Tovim and fasts: jewish_calendar. A yahrzeit: yahrzeit_dates, then
+offer to put it in their calendar. "What does my day look like": my_day.
+Never answer any of these from memory or from web_search - a candle
+lighting time that is roughly right is wrong. Always say which place the
+times are for. When they say what they keep - Rabbeinu Tam, 40 minutes,
+the Magen Avraham - call remember_minhag once; every time after is theirs.
 
 JEWISH RELIGIOUS MATTERS — these ARE allowed
 This service is for Jewish callers. Shabbos and Yom Tov, kashrus, zmanim,
@@ -645,6 +655,24 @@ OTHER SITES
   save_site_login. It stays saved - never tell them to give it again
   unless the site itself rejected it. what_is_saved shows which sites;
   forget_site_login removes one. Tell them it is stored encrypted.
+- A password they cannot remember: reset_site_password. The site emails a
+  link to their own address, I read it, and I set and keep a new password.
+  Never ask them to invent one, never read one out, and never ask for the
+  old one.
+
+A WEB ADDRESS IS SPELLED BACK BEFORE ANYTHING OPENS IT
+A domain heard on the phone is half-heard: "kioskhut" came back to a
+caller as "kvihot", and three minutes went on a site that was never the
+one he asked for. Read it back letter by letter - "k-h-c-o-n-n-e-c-t dot
+k-i-o-s-k-h-u-t dot com" - and get a yes first. Pass what they said
+exactly as they said it: never add www, .com or anything else to an
+address they gave you in full.
+
+NEVER START A SIGN-IN WITH NOTHING TO SIGN IN WITH
+sign_in_to_site uses a login that is already saved. If what_is_saved does
+not list that site and they have not just given you the username and the
+password, say so and ask - do not say you are signing in. "Visit the
+site and tell me what you see" is do_on_website, not a sign-in.
 
 WHEN A SITE ASKS FOR A ONE-TIME CODE
 Say where it went, in the words you were given ("to the phone ending 96").
@@ -773,6 +801,13 @@ they go quiet, ask once whether they are still there, then wait.
             if st == "waiting":
                 return "Say it's queued and will start in a moment."
             if st == "done":
+                if kind == "password_reset":
+                    # the message IS what to say - and it must never turn
+                    # into a password being read out
+                    return (f"Tell them this in your own words: {msg} Never "
+                            f"say the password itself, and never offer to "
+                            f"read it out - there is nothing for them to "
+                            f"write down.")
                 if kind == "site_login":
                     return ("Say they are signed in now, then start what "
                             "they originally asked for again. Do not ask "
@@ -794,6 +829,28 @@ they go quiet, ask once whether they are still there, then wait.
                     return (f"Say you couldn't open that page: {msg}. You "
                             f"have NOTHING from it - do not describe what "
                             f"it said. Offer to try another source.")
+                if d.get("reason") == "code_to_phone":
+                    return (f"Say that the site will only send the reset by "
+                            f"text message, so it cannot be finished over "
+                            f"the phone by us, and that it is not their "
+                            f"fault. Offer to have the office help. "
+                            f"Details: {msg}")
+                if d.get("reason") == "no_reset_mail":
+                    return (f"Say nothing has arrived from the site yet, "
+                            f"that it sometimes takes a few minutes, and "
+                            f"offer to try again in a moment. Details: "
+                            f"{msg}")
+                if d.get("reason") == "email_needed":
+                    return (f"Say plainly that you can only do this for an "
+                            f"email address of theirs that is connected "
+                            f"here, because the site emails the reset and "
+                            f"you have to read it. Offer to connect that "
+                            f"address now. Details: {msg}")
+                if d.get("reason") == "no_account":
+                    return (f"Say the site says there is no account with "
+                            f"that email address, and ask whether they may "
+                            f"have used a different address. Do not offer "
+                            f"to create an account. Details: {msg}")
                 if d.get("reason") == "signed_out":
                     return ("Tell them the saved session has expired and "
                             "that you'll sign in again with the login they "
@@ -2068,6 +2125,47 @@ they go quiet, ask once whether they are still there, then wait.
                 f"then call how_is_it_going.")
 
     @function_tool
+    @auto_report("site_login")
+    async def reset_site_password(self, context: RunContext, site: str,
+                                  caller_said: str = "", email: str = ""):
+        """Recover a forgotten password on a shop or any other website. Use
+        it when they cannot remember a site's password, or when a sign-in
+        keeps being refused. The site sends a reset to their own email, we
+        read it, set a new password and save it - they never have to know
+        it or say it out loud. Get a clear yes first."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        if not said_yes(caller_said):
+            return (f"Do not start yet. Say: 'I can get their {site} "
+                    f"password reset. {site.title()} will email a link to "
+                    f"their own address, I'll read it, and set a new "
+                    f"password that I keep for them - they will not need to "
+                    f"remember it. Shall I go ahead?' and wait for yes.")
+        try:
+            async with httpx.AsyncClient(timeout=25) as c:
+                r = await c.post(f"{BACKEND}/jobs/password-reset", headers=AUTH,
+                                 params={"account_id": self.account_id,
+                                         "site": site, "email": email,
+                                         "call_id": self.call_id or 0})
+                if r.status_code >= 400:
+                    why = (r.json() or {}).get("detail", "")
+                    return (f"It could not be started: {why} Say that "
+                            f"plainly, and offer to connect their email "
+                            f"first if that is what is missing.")
+                d = r.json()
+        except Exception as e:
+            log.error(f"password reset failed: {e}")
+            return "Couldn't start that."
+        self.job_id = d.get("job_id")
+        self.job_site = site
+        self._watch_job(f"resetting the {site} password")
+        return (f"Resetting their {site} password, using {d.get('email')}. "
+                f"Tell them it takes a minute or two, that they do not need "
+                f"to do anything, and that the new password is kept for them "
+                f"so they never need to remember it. Never ask them to "
+                f"choose one, and never read a password out loud.")
+
+    @function_tool
     @auto_report("jobs")
     async def stop_that(self, context: RunContext,
                         why: str = "they changed their mind"):
@@ -2403,6 +2501,183 @@ they go quiet, ask once whether they are still there, then wait.
                     "say you are working on anything.")
         await log_turn(self.call_id, "tool", situation[:200], "what_now")
         return said
+
+    @function_tool
+    @auto_report("everyday")
+    async def weather(self, context: RunContext, place: str = "",
+                      days: int = 1):
+        """The weather now and for the next days. Leave place empty for
+        where they live; set it for anywhere else ("Monsey", "11219").
+        days=1 gives today and tomorrow."""
+        d = await backend_get("/everyday/weather", place=place, days=days,
+                              account_id=self.account_id
+                              if self.verified else 0)
+        if d.get("reason") == "no_place":
+            return ("No address is saved for them. Ask which town or zip "
+                    "code, then call weather again with it.")
+        if d.get("reason"):
+            return f"The weather isn't available just now: {d.get('message')}"
+        lines = [f"{d['place']}. Right now: {d.get('now')}."]
+        for x in d.get("days") or []:
+            rain = (f", {x['rain_chance']}% chance of rain"
+                    if x.get("rain_chance", 0) >= 20 else "")
+            day = x["day"][:1].upper() + x["day"][1:]
+            lines.append(f"{day}: {x['sky']}, high "
+                         f"{x['high']}, low {x['low']}{rain}.")
+        lines.append("Say what they asked about in a sentence or two. "
+                     "Mention rain only if it is listed.")
+        return "\n".join(lines)
+
+    @function_tool
+    @auto_report("everyday")
+    async def jewish_calendar(self, context: RunContext,
+                              what: str = "shabbos", place: str = "",
+                              date: str = ""):
+        """Jewish times and dates, where they live unless place is set.
+        what: "shabbos" (candle lighting, havdalah, parsha, Yom Tov this
+        week), "zmanim" (the day's zmanim), "hebrew_date", or "holidays"
+        (Yomim Tovim, fasts and Rosh Chodesh coming up). date is
+        YYYY-MM-DD if not today. Never give these times from memory."""
+        d = await backend_get("/everyday/jewish", what=what, place=place,
+                              on=date, account_id=self.account_id
+                              if self.verified else 0)
+        if d.get("reason") == "no_place":
+            return ("No address is saved for them. Ask which town or zip "
+                    "code, then call jewish_calendar again with it.")
+        if d.get("reason"):
+            return f"That isn't available just now: {d.get('message')}"
+        if "today" in d and "tonight" in d:
+            t = d["today"]
+            out = [f"Today is {t['spoken']}. {d['note']}"]
+            if t.get("events"):
+                out.append("Today: " + ", ".join(t["events"]) + ".")
+            if t.get("parsha"):
+                out.append(f"This week's parsha: {t['parsha']}.")
+            return "\n".join(out)
+        out = []
+        if d.get("place"):
+            out.append(f"For {d['place']}"
+                       + (f", {d['day']}" if d.get("day") else "") + ":")
+        for x in d.get("times") or d.get("items") or []:
+            label = x.get("name") or x.get("what")
+            when = x.get("time") or ""
+            day = x.get("day") or ""
+            day = day[:1].upper() + day[1:]
+            if x.get("what"):
+                out.append(f"{day} - {label}" + (f": {when}" if when else ""))
+            else:
+                out.append(f"{label}: {when}")
+        if d.get("rabbeinu_tam"):
+            out.append(f"Havdalah by Rabbeinu Tam (72 minutes): "
+                       f"{d['rabbeinu_tam']}.")
+        if d.get("note"):
+            out.append(d["note"])
+        out.append("Read only what they asked for, slowly, saying each "
+                   "time clearly. Say which place the times are for.")
+        return "\n".join(out)
+
+    @function_tool
+    @auto_report("everyday")
+    async def remember_minhag(self, context: RunContext, havdalah: str = "",
+                              candle_minutes: int = 0, shema: str = ""):
+        """Remember what they keep, so every time from now on comes out
+        their way: havdalah ("Rabbeinu Tam", "regular", "50 minutes"), how
+        many minutes before sunset they light, and Shema by the Magen
+        Avraham, the Gra or the Baal HaTanya. Fill in only what they said."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        d = await backend_post("/everyday/minhag", {
+            "account_id": self.account_id, "havdalah": havdalah,
+            "candle_minutes": candle_minutes, "shema": shema,
+            "call_id": self.call_id or 0})
+        out = []
+        if d.get("saved"):
+            out.append("Saved - they " + "; they ".join(d["saved"]) + ".")
+            out.append("Tell them in one sentence that you'll remember it "
+                       "on every call. If they asked for a time, call "
+                       "jewish_calendar again now - it will be their way.")
+        for p in d.get("problems") or []:
+            out.append(f"Not saved: {p}.")
+        return "\n".join(out) or "Nothing was said to save. Ask what they keep."
+
+    @function_tool
+    @auto_report("everyday")
+    async def yahrzeit_dates(self, context: RunContext, died_on: str = "",
+                             after_sunset: bool = False,
+                             hebrew_date: str = "", name: str = ""):
+        """When a yahrzeit falls in the coming years. Give EITHER the
+        English date they passed away as YYYY-MM-DD - and ask whether it
+        was after sunset, which moves it a day - OR the Hebrew date if the
+        family knows it ("9 Adar")."""
+        d = await backend_get("/everyday/yahrzeit", died_on=died_on,
+                              after_sunset=1 if after_sunset else 0,
+                              hebrew=hebrew_date, years=2)
+        if d.get("reason"):
+            return d.get("message", "That date couldn't be worked out.")
+        who = f"{name}'s yahrzeit" if name else "The yahrzeit"
+        out = [f"{who} is {d['hebrew_date']}."]
+        for x in d.get("coming") or []:
+            out.append(f"{x['hebrew']}: {x['day']}. The candle is lit the "
+                       f"evening before, {x['candle_evening']}.")
+            if x.get("or_in_adar_ii"):
+                a2 = x["or_in_adar_ii"]
+                out.append(f"  Or, in Adar II: {a2['day']}, candle the "
+                           f"evening before, {a2['candle_evening']}.")
+            if x.get("note"):
+                out.append("  " + x["note"])
+        out.append(d.get("note", ""))
+        out.append("Offer to put it in their calendar (create_event, the "
+                   "evening before) so they are reminded.")
+        return "\n".join(o for o in out if o)
+
+    @function_tool
+    @auto_report("everyday")
+    async def my_day(self, context: RunContext):
+        """"What does my day look like?" in one go: the date and Hebrew
+        date, the weather, today's appointments, to-dos that are due, new
+        mail, and candle lighting if it is tonight."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        d = await backend_get("/everyday/my_day", account_id=self.account_id,
+                              which=self.mailbox)
+        out = [f"Today is {d.get('date')}"
+               + (f", {d['hebrew_date']}" if d.get("hebrew_date") else "")
+               + "."]
+        if d.get("today_is"):
+            out.append("It is " + ", ".join(d["today_is"]) + ".")
+        w = d.get("weather")
+        if w:
+            rain = (f", {w['rain_chance']}% chance of rain"
+                    if (w.get("rain_chance") or 0) >= 20 else "")
+            out.append(f"Weather: {w.get('now')}; high {w.get('high')}, "
+                       f"low {w.get('low')}{rain}.")
+        for x in d.get("tonight") or []:
+            out.append(f"{x['what']} tonight: {x['time']}.")
+        appts = d.get("appointments")
+        if appts:
+            out.append("Appointments: " + "; ".join(
+                f"{a['time']} {a['title']}"
+                + (f" at {a['where']}" if a.get("where") else "")
+                for a in appts) + ".")
+        elif appts is not None:
+            out.append("Nothing on the calendar today.")
+        todo = d.get("to_do") or {}
+        if todo.get("due_or_overdue"):
+            out.append("To do: " + "; ".join(
+                t["title"] + (" (overdue)" if t.get("overdue") else "")
+                for t in todo["due_or_overdue"]) + ".")
+        mail = d.get("mail")
+        if mail:
+            out.append(f"{mail.get('unread', 0)} new emails"
+                       + (" - newest from " + ", ".join(mail["newest_from"])
+                          if mail.get("newest_from") else "") + ".")
+        if d.get("missing"):
+            out.append("Could not get: " + ", ".join(d["missing"])
+                       + ". Say so in a few words.")
+        out.append("Give this as a short, warm summary - appointments and "
+                   "anything overdue first. Don't read the email list "
+                   "unless they ask.")
+        return "\n".join(out)
 
     @function_tool
     async def what_time_is_it(self, context: RunContext):

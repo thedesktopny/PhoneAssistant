@@ -3059,6 +3059,697 @@ def _():
         "/calls/end is posted without headers=AUTH - it will 401"
 
 
+@check("an address the caller gives in full is not turned into nonsense")
+def _():
+    """Call 64: he asked for khconnect.kioskhut.com and we opened
+    https://www.khconnect.kioskhut.com.com. com.com answers everything
+    with a wildcard, so the browser reported a certificate error and he
+    was told his own site had a security problem. Three minutes of his
+    call, and the address was ours."""
+    import browser
+    for said, want in (
+            ("amazon", "https://www.amazon.com"),
+            ("Amazon", "https://www.amazon.com"),
+            ("khconnect.kioskhut.com", "https://khconnect.kioskhut.com"),
+            ("www.lowes.com", "https://www.lowes.com"),
+            ("shop.example.co.uk", "https://shop.example.co.uk"),
+            ("https://etsy.com/orders", "https://etsy.com/orders"),
+            ("amazon/gp/orders", "https://www.amazon.com/gp/orders"),
+            ("", "")):
+        got = browser.site_url(said)
+        assert got == want, f"site_url({said!r}) gave {got!r}, wanted {want!r}"
+    src = source()
+    assert 'www.{site}.com' not in src, \
+        "a runner is still building an address by hand instead of site_url()"
+
+
+# ------------------------------------------------------------- everyday
+print("everyday questions")
+
+
+def _everyday_offline(answers):
+    """Put everyday.py on canned answers - shaped like the real ones from
+    Hebcal, Open-Meteo and zippopotam - and fix today's date, so these
+    checks never touch the network and never go stale."""
+    import datetime as _dt
+    import everyday
+    real_fetch, real_today = everyday._fetch_json, everyday._today
+    seen = []
+
+    def fake(url, keep_s=600):
+        seen.append(url)
+        for part, answer in answers:
+            if part in url:
+                return answer(url) if callable(answer) else answer
+        raise AssertionError(f"unexpected lookup: {url}")
+
+    everyday._fetch_json = fake
+    everyday._today = lambda: _dt.date(2026, 9, 23)
+    everyday._CACHE.clear()
+
+    def restore():
+        everyday._fetch_json, everyday._today = real_fetch, real_today
+    return everyday, seen, restore
+
+
+_ZIP_11211 = {"places": [{"place name": "Brooklyn",
+                          "state abbreviation": "NY",
+                          "latitude": "40.7095", "longitude": "-73.9563"}]}
+
+
+@check("the weather is for where they live, in words")
+def _():
+    """Asked with no place, it must use their saved address - not a guess,
+    and not the office's town."""
+    ev, seen, restore = _everyday_offline([
+        ("zippopotam.us/us/11211", _ZIP_11211),
+        ("api.open-meteo.com", {
+            "current": {"temperature_2m": 63.3, "apparent_temperature": 55.0,
+                        "weather_code": 3},
+            "daily": {"time": ["2026-09-23", "2026-09-24"],
+                      "temperature_2m_max": [68.1, 64.5],
+                      "temperature_2m_min": [54.6, 52.1],
+                      "precipitation_probability_max": [0, 40],
+                      "weather_code": [3, 61]}}),
+    ])
+    db = main.Session()
+    acct = main.Account(name="Weather Check")
+    db.add(acct)
+    db.commit()
+    db.refresh(acct)
+    aid = acct.id
+    db.add(main.Address(account_id=aid, line1="1 Lee Ave", city="Brooklyn",
+                        state="NY", zip="11211", is_default=1))
+    db.commit()
+    db.close()
+    try:
+        w = ev.weather(aid, "", 1)
+    finally:
+        restore()
+    assert any("11211" in u for u in seen), f"didn't use their zip: {seen}"
+    assert w["place"] == "Brooklyn, NY 11211", w
+    assert w["now"].startswith("63 degrees and cloudy"), w["now"]
+    assert "feels like 55" in w["now"], w["now"]
+    days = w["days"]
+    assert [d["day"] for d in days] == ["today", "tomorrow"], days
+    assert days[1]["sky"] == "light rain" and days[1]["rain_chance"] == 40
+
+
+@check("with no address and no place, it asks rather than guesses")
+def _():
+    ev, seen, restore = _everyday_offline([])
+    try:
+        w = ev.weather(None, "", 1)
+        j = ev.jewish_calendar(None, "shabbos", "")
+    finally:
+        restore()
+    assert w.get("reason") == "no_place", w
+    assert j.get("reason") == "no_place", j
+    assert not seen, f"it looked something up anyway: {seen}"
+
+
+@check("the town they mean: Williamsburg is Brooklyn, Lakewood is NJ")
+def _():
+    """Williamsburg came back as Virginia and Yerushalayim as a hamlet in
+    Virginia. The nearest town of that name wins - unless another one is
+    twenty times bigger."""
+    import everyday
+    assert everyday.NEIGHBOURHOOD_ZIPS["williamsburg"] == "11211"
+    assert everyday.NEIGHBOURHOOD_ZIPS["boro park"] == "11219"
+    lakewoods = [
+        {"name": "Lakewood", "admin1": "Colorado", "country_code": "US",
+         "timezone": "America/Denver", "population": 155984},
+        {"name": "Lakewood", "admin1": "New Jersey", "country_code": "US",
+         "timezone": "America/New_York", "population": 135158}]
+    assert everyday._likeliest(lakewoods)["admin1"] == "New Jersey"
+    jerusalems = [
+        {"name": "Jerusalem", "admin1": "Virginia", "country_code": "US",
+         "timezone": "America/New_York", "population": 0},
+        {"name": "Jerusalem", "admin1": "Jerusalem", "country_code": "IL",
+         "timezone": "Asia/Jerusalem", "population": 801000}]
+    assert everyday._likeliest(jerusalems)["country_code"] == "IL"
+    ev, seen, restore = _everyday_offline([
+        ("zippopotam.us/us/11211", _ZIP_11211)])
+    try:
+        got = ev.where(None, "Williamsburg")
+    finally:
+        restore()
+    assert got["zip"] == "11211", got
+    assert "Brooklyn" in got["label"], got
+
+
+@check("Jerusalem lights candles at 40 minutes, everywhere else at 18")
+def _():
+    import everyday
+    assert everyday.candle_minutes(
+        {"country": "IL", "label": "Jerusalem, Israel"}) == 40
+    assert everyday.candle_minutes(
+        {"country": "IL", "label": "Bnei Brak, Israel"}) == 18
+    assert everyday.candle_minutes(
+        {"country": "US", "label": "Brooklyn, NY 11211"}) == 18
+    assert everyday._loc_params({"country": "IL", "hebcal": {}})["i"] == "on", \
+        "Israel keeps one day of Yom Tov"
+
+
+@check("Shabbos times come with Rabbeinu Tam, and the parsha isn't a holiday")
+def _():
+    ev, seen, restore = _everyday_offline([
+        ("zippopotam.us/us/11211", _ZIP_11211),
+        ("hebcal.com/shabbat", {"items": [
+            {"category": "candles", "title": "Candle lighting: 6:29pm",
+             "date": "2026-09-25T18:29:00-04:00"},
+            {"category": "holiday", "title": "Sukkot I",
+             "date": "2026-09-26"},
+            {"category": "havdalah", "title": "Havdalah: 7:25pm",
+             "date": "2026-09-27T19:25:00-04:00"}]}),
+        ("hebcal.com/zmanim", {"times": {
+            "tzeit72min": "2026-09-27T20:03:00-04:00"}}),
+        ("hebcal.com/converter", {"hd": 12, "hm": "Tishrei", "hy": 5787,
+                                  "events": ["Parashat Vezot Haberakhah"]}),
+    ])
+    try:
+        s = ev.shabbos(None, "11211")
+        h = ev.hebrew_date()
+    finally:
+        restore()
+    candles = [i for i in s["items"] if i["what"] == "Candle lighting"]
+    assert candles and candles[0]["time"] == "6:29 PM", s["items"]
+    assert candles[0]["day"] == "Friday, September 25", candles
+    assert s["rabbeinu_tam"] == "8:03 PM", s
+    assert any("b=18" in u for u in seen if "shabbat" in u), \
+        "candle lighting minutes were not sent"
+    assert h["events"] == [], "the parsha was read out as today's holiday"
+    assert h["parsha"] == "Vezot Haberakhah", h
+    assert h["spoken"] == "the 12th of Tishrei, 5787", h
+
+
+@check("a Hebrew date is read however it's said, or not at all")
+def _():
+    import everyday
+    for said, want in (("9 Adar", (9, "Adar")),
+                       ("the 9th of Adar", (9, "Adar")),
+                       ("Adar 9", (9, "Adar")),
+                       ("Adar II 14", (14, "Adar2")),
+                       ("14 adar sheni", (14, "Adar2")),
+                       ("Teves 10", (10, "Tevet")),
+                       ("15th of Shevat", (15, "Shvat")),
+                       ("1st of Tishrei", (1, "Tishrei"))):
+        got = everyday.parse_hebrew_date(said)
+        assert got == want, f"{said!r} read as {got}, wanted {want}"
+    for nonsense in ("sometime in winter", "Adar", "32 Nisan", ""):
+        assert everyday.parse_hebrew_date(nonsense) is None, nonsense
+    # 5784 had two Adars (spring 2024); 5785 and 5786 did not; 5787 does
+    for hy, leap in ((5784, True), (5785, False), (5786, False),
+                     (5787, True)):
+        assert everyday.hebrew_leap(hy) is leap, hy
+
+
+@check("a yahrzeit in a year with two Adars gives both, and the evening")
+def _():
+    """Someone who passed in an ordinary Adar: in a leap year the minhag
+    is not one thing. Giving one date quietly takes a side. And a date
+    said on its own sends people a day late - the candle is lit the
+    evening before."""
+    def converter(url):
+        if "g2h=1" in url:
+            return {"hd": 12, "hm": "Tishrei", "hy": 5787, "events": []}
+        table = {("5787", "Adar1"): (2027, 2, 15),
+                 ("5787", "Adar2"): (2027, 3, 17),
+                 ("5788", "Adar"): (2028, 3, 6),
+                 ("5789", "Adar"): (2029, 2, 23)}
+        hy = url.split("hy=")[1].split("&")[0]
+        hm = url.split("hm=")[1].split("&")[0]
+        gy, gm, gd = table[(hy, hm)]
+        return {"gy": gy, "gm": gm, "gd": gd}
+
+    ev, seen, restore = _everyday_offline([("hebcal.com/converter",
+                                            converter)])
+    try:
+        y = ev.yahrzeit("", False, "8 Adar", 2)
+    finally:
+        restore()
+    assert y["hebrew_date"] == "the 8th of Adar", y["hebrew_date"]
+    first = y["coming"][0]
+    assert "Adar I" in first["hebrew"], first
+    assert first["day"] == "Monday, February 15", first
+    assert first["candle_evening"] == "Sunday, February 14", first
+    assert first.get("or_in_adar_ii", {}).get("day") == \
+        "Wednesday, March 17", "Adar II was not offered"
+    assert "rav" in first["note"], "the leap-year question was decided for them"
+    second = y["coming"][1]
+    assert "Adar, 5788" in second["hebrew"] and not second.get("note"), second
+    assert "evening before" in y["note"], y["note"]
+
+
+@check("'what's my day' still answers when Google doesn't")
+def _():
+    """An expired Google connection must not cost them the weather and
+    candle lighting. Each part fails on its own and is named."""
+    import google_tools
+    ev, seen, restore = _everyday_offline([
+        ("hebcal.com/converter", {"hd": 12, "hm": "Tishrei", "hy": 5787,
+                                  "events": []})])
+    real = (google_tools.tool_list_events, google_tools.tool_tasks_list,
+            google_tools.tool_unread_summary)
+    real_w, real_s = ev.weather, ev.shabbos
+
+    def expired(*a, **k):
+        raise RuntimeError("invalid_grant: Token has been expired or revoked")
+
+    google_tools.tool_list_events = expired
+    google_tools.tool_tasks_list = expired
+    google_tools.tool_unread_summary = expired
+    ev.weather = lambda *a, **k: {"place": "Brooklyn", "now": "63 degrees",
+                                  "days": [{"high": 68, "low": 55,
+                                            "sky": "cloudy",
+                                            "rain_chance": 0}]}
+    ev.shabbos = lambda *a, **k: {"items": []}
+    try:
+        d = ev.my_day(1)
+    finally:
+        (google_tools.tool_list_events, google_tools.tool_tasks_list,
+         google_tools.tool_unread_summary) = real
+        ev.weather, ev.shabbos = real_w, real_s
+        restore()
+    assert d["date"] == "Wednesday, September 23", d
+    assert d["hebrew_date"] == "the 12th of Tishrei, 5787", d
+    assert d["weather"]["now"] == "63 degrees", d
+    missing = " ".join(d["missing"])
+    assert "calendar" in missing and "expired" in missing, missing
+    assert "to-do" in missing and "email" in missing, missing
+
+
+@check("what they keep is read however they say it, or not at all")
+def _():
+    import everyday
+    for said in ("Rabbeinu Tam", "rabenu tam", "I keep RT", "72 minutes",
+                 "72"):
+        assert everyday._read_havdalah(said) in ("rabbeinu_tam", "72"), said
+    assert everyday._read_havdalah("the regular time") == "tzeis"
+    assert everyday._read_havdalah("50 minutes") == "50"
+    assert everyday._read_havdalah("give me both") == ""
+    assert everyday._read_havdalah("whatever my father did") is None
+    assert everyday._read_shema("Magen Avraham") == "mga"
+    assert everyday._read_shema("the Gra") == "gra"
+    assert everyday._read_shema("we're Chabad") == "tanya"
+    assert everyday._read_shema("the rebbe's") is None
+
+
+@check("a minhag once said is kept, applied, and never guessed")
+def _():
+    """Asked "will it remember I keep Rabbeinu Tam?" - it didn't: the
+    profile learner was told to drop anything about religion, and the
+    times read out both opinions regardless. Now it is a setting, and the
+    code applies it."""
+    ev, seen, restore = _everyday_offline([
+        ("zippopotam.us/us/11211", _ZIP_11211),
+        ("hebcal.com/shabbat", {"items": [
+            {"category": "candles", "title": "Candle lighting: 6:25pm",
+             "date": "2026-09-25T18:25:00-04:00"},
+            {"category": "havdalah", "title": "Havdalah (72 min): 7:56pm",
+             "date": "2026-09-27T19:56:00-04:00"}]}),
+        ("hebcal.com/zmanim", {"times": {
+            "tzeit72min": "2026-09-27T19:56:00-04:00"}}),
+    ])
+    db = main.Session()
+    acct = main.Account(name="Minhag Check")
+    db.add(acct)
+    db.commit()
+    db.refresh(acct)
+    aid = acct.id
+    db.add(main.Address(account_id=aid, line1="1 Lee Ave", city="Brooklyn",
+                        state="NY", zip="11211", is_default=1))
+    db.commit()
+    db.close()
+    try:
+        bad = ev.set_minhag(aid, 5, "whatever my father did", "")
+        assert bad["problems"] and not bad["saved"], bad
+        assert not ev.minhag_of(aid).get("havdalah"), "a guess was saved"
+
+        ev.set_minhag(aid, 22, "Rabbeinu Tam", "")
+        seen.clear()
+        s = ev.shabbos(aid)
+        asked = [u for u in seen if "hebcal.com/shabbat" in u][0]
+    finally:
+        restore()
+    assert "m=72" in asked and "M=on" not in asked, \
+        f"havdalah wasn't asked for at Rabbeinu Tam: {asked}"
+    assert "b=22" in asked, f"their 22 minutes weren't used: {asked}"
+    havdalah = [i for i in s["items"] if i["what"].startswith("Havdalah")]
+    assert "Rabbeinu Tam" in havdalah[0]["what"], havdalah
+    assert s["rabbeinu_tam"] == "", "a second opinion was offered anyway"
+    assert "their minhag" in s["note"], s["note"]
+    # the custom of the place still wins in Jerusalem
+    assert ev.candle_minutes({"country": "IL", "label": "Jerusalem, Israel"},
+                             {"candle_minutes": 22}) == 40
+    assert ev.candle_minutes({"country": "US", "label": "Brooklyn"},
+                             {"candle_minutes": 22}) == 22
+    db = main.Session()
+    said = [c.detail for c in db.query(main.Change)
+            .filter_by(account_id=aid, area="minhag").all()]
+    db.close()
+    assert any("Rabbeinu Tam" in d for d in said), \
+        "the office can't see the minhag was changed"
+
+
+@check("zmanim list only their shita once they've said it")
+def _():
+    import everyday
+    whose = {key: who for key, _, who in everyday.ZMANIM_SPOKEN}
+    assert whose["sofZmanShmaBaalHatanya"] == "tanya"
+    assert whose["sofZmanShmaMGA"] == "mga" and whose["sofZmanShma"] == "gra"
+    times = {key: "2026-09-23T09:00:00-04:00" for key in whose}
+    ev, seen, restore = _everyday_offline([
+        ("zippopotam.us/us/11211", _ZIP_11211),
+        ("hebcal.com/zmanim", {"times": times})])
+    real = ev.minhag_of
+    try:
+        ev.minhag_of = lambda aid: {"shema": "tanya"}
+        mine = [t["name"] for t in ev.zmanim(1, "11211")["times"]]
+        ev.minhag_of = lambda aid: {}
+        anyone = [t["name"] for t in ev.zmanim(1, "11211")["times"]]
+    finally:
+        ev.minhag_of = real
+        restore()
+    assert "Latest Shema, Baal HaTanya" in mine, mine
+    assert not any("Magen Avraham" in n or ", Gra" in n for n in mine), mine
+    assert "Latest Shema, Magen Avraham" in anyone
+    assert "Latest Shema, Gra" in anyone
+    assert not any("Tanya" in n for n in anyone), \
+        "a third opinion was read to someone who never asked"
+
+
+@check("the memory keeps minhagim instead of dropping them as 'religion'")
+def _():
+    import advisor
+    p = advisor.PROFILE_SYSTEM
+    assert "minhagim" in p, "the profile learner doesn't know to keep them"
+    assert "health, religion or family" not in p, \
+        "the learner is still told to drop anything about religion"
+    src = io.open("agent.py", encoding="utf-8").read()
+    i = src.index("async def remember_minhag(")
+    assert "self.verified" in src[i:i + 900], "it saves without the PIN"
+    assert "call remember_minhag" in src, "the instructions never mention it"
+
+
+@check("the everyday tools exist and my_day needs the PIN")
+def _():
+    src = io.open("agent.py", encoding="utf-8").read()
+    for tool in ("weather", "jewish_calendar", "yahrzeit_dates", "my_day"):
+        assert f"async def {tool}(" in src, f"{tool} is missing"
+        assert tool in src[src.index("EVERYDAY QUESTIONS"):][:900], \
+            f"the instructions never mention {tool}"
+    i = src.index("async def my_day(")
+    assert "self.verified" in src[i:i + 800], \
+        "my_day reads their calendar and mail without the PIN"
+    for route in ("/everyday/weather", "/everyday/jewish",
+                  "/everyday/yahrzeit", "/everyday/my_day"):
+        assert route in {r.path for r in main.app.routes}, route
+
+
+# ------------------------------------------------- forgotten passwords
+print("password reset")
+
+
+@check("a password is only reset on a mailbox they have connected")
+def _():
+    """The whole thing rests on reading the mail the site sends. If the
+    address is not one this customer has connected, we cannot read it -
+    and resetting it would be changing the password on an account whose
+    mail belongs to someone else. It must stop before a browser opens."""
+    opened = []
+
+    def no_browser(*a, **k):
+        opened.append(a)
+        raise AssertionError("a browser was opened for an unreadable mailbox")
+
+    import json as _json
+    undo_boxes = everywhere("list_mailboxes",
+                            lambda aid: [{"email": "theirs@gmail.com"}])
+    undo_open = everywhere("_open_with_session", no_browser)
+    try:
+        db = main.Session()
+        job = main.Job(account_id=1, kind="password_reset", site="lowes",
+                       state="queued",
+                       payload=_json.dumps(
+                           {"email": "someone.else@gmail.com"}))
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        jid = job.id
+        db.close()
+        main._run_reset(jid, 1, "lowes")
+        db = main.Session()
+        row = db.query(main.Job).filter_by(id=jid).first()
+        state, reason = row.state, row.reason
+        db.close()
+    finally:
+        undo_open()
+        undo_boxes()
+    assert not opened, "it opened a browser anyway"
+    assert state == "failed", f"state was {state!r}"
+    assert reason == "email_needed", f"reason was {reason!r}"
+
+
+@check("the new password never reaches a log, a job message or the model")
+def _():
+    """A password written into a job message is a password in the database,
+    the live log and the admin panel. The value exists in one local
+    variable and goes to the vault; everything a person can read gets the
+    placeholder's name instead."""
+    src = source()
+    i = src.index("def _run_reset(")
+    body = src[i:src.index("\ndef ", i + 20)] if "\ndef " in src[i + 20:] \
+        else src[i:]
+    for line in body.splitlines():
+        if "new_pw" not in line:
+            continue
+        for leak in ("_job_set(", "emit(", "history.append(", "print("):
+            assert leak not in line, \
+                f"the new password is being written out: {line.strip()}"
+    assert "NEW_PASSWORD" in body, \
+        "the model should be given a placeholder, not the password"
+    assert 'f"({shown' in body or "(new password)" in body, \
+        "the typed value is not redacted in the step history"
+
+
+@check("a made-up password is strong, unambiguous and never repeated")
+def _():
+    """A password nobody says out loud can be long and awkward. It still
+    has to satisfy the rules every site publishes, or the reset fails on
+    the last screen with the old password already dead."""
+    import browser
+    seen = set()
+    for _ in range(40):
+        pw = browser._new_password()
+        seen.add(pw)
+        assert len(pw) == 16, f"length {len(pw)}"
+        assert any(c.islower() for c in pw), pw
+        assert any(c.isupper() for c in pw), pw
+        assert any(c.isdigit() for c in pw), pw
+        assert any(c in "!#$%&*+=?@" for c in pw), pw
+        for bad in "lI1O0":
+            assert bad not in pw, f"{bad!r} is easy to misread: {pw}"
+    assert len(seen) == 40, "the same password came back twice"
+    short = browser._new_password(10, symbols=False)
+    assert len(short) == 10 and short.isalnum(), short
+
+
+@check("nothing is saved as their password unless it was really typed in")
+def _():
+    """The model saying "changed" does not make it changed. If no new
+    password was ever typed into a box, saving one would lock them out of
+    their own account - the old password would still be the live one and
+    we would have thrown it away."""
+    src = source()
+    i = src.index("def _run_reset(")
+    body = src[i:i + 20000]
+    assert "typed_pw" in body, "there is no record of whether it was typed"
+    assert "if not typed_pw" in body, \
+        "the 'changed' path does not check that a password was typed"
+    j = body.index('if a == "changed"')
+    assert body.index("save_it(", j) > body.index("if not typed_pw", j), \
+        "it saves before checking that anything was typed"
+
+
+@check("a reset never opens the password it is replacing")
+def _():
+    """A password being thrown away is still a password. Decrypting it
+    would put it in memory and write a secret-access row for nothing:
+    all the reset needs is the username."""
+    src = source()
+    i = src.index("def _run_reset(")
+    body = src[i:i + 20000]
+    assert "use_site_login" not in body, \
+        "the reset decrypts the old password, which it never uses"
+    assert "list_site_logins" in body, \
+        "it should read the username from the list that stays encrypted"
+
+
+@check("a human check on a reset page is a stop, not a puzzle")
+def _():
+    src = source()
+    i = src.index("def _run_reset(")
+    body = src[i:i + 20000]
+    assert "looks_like_bot_check" in body and "record_block" in body, \
+        "a wall on the reset page would go unnamed"
+    assert "block_reason" in body, \
+        "the caller's side needs the reason code, not the wording"
+
+
+@check("a reset job will not press a button that ends the account")
+def _():
+    import browser
+    for wording in ("Delete my account", "Close account",
+                    "Deactivate my account", "Cancel membership",
+                    "Unsubscribe from all email"):
+        assert browser.DANGER_BUTTONS.search(wording), \
+            f"would have pressed {wording!r}"
+    for fine in ("Reset password", "Forgot your password?", "Continue",
+                 "Send me a link", "Change password", "Save password"):
+        assert not browser.DANGER_BUTTONS.search(fine), \
+            f"refused something harmless: {fine!r}"
+    src = source()
+    i = src.index("def _run_reset(")
+    assert "DANGER_BUTTONS" in src[i:i + 20000], \
+        "_run_reset does not check the buttons it clicks"
+
+
+@check("the reset link is picked out of the mail, not the unsubscribe link")
+def _():
+    """A reset mail carries a dozen links: the logo, the app stores, the
+    help centre, unsubscribe. Following the first one that mentions the
+    shop opens the homepage and the job reports success having changed
+    nothing - or worse, unsubscribes them."""
+    import google_tools
+    rank = google_tools._rank_reset_link
+    for never in ("https://www.lowes.com/unsubscribe?id=99",
+                  "https://email.lowes.com/optout/abc123",
+                  "https://www.lowes.com/help/privacy"):
+        assert rank(never, "lowes") < 0, f"would have followed {never}"
+    real = "https://www.lowes.com/u/reset-password?token=9f8a7b6c5d4e3f2a1b0c"
+    for lesser in ("https://www.lowes.com/",
+                   "https://www.lowes.com/l/about.html",
+                   "https://apps.apple.com/app/lowes"):
+        assert rank(real, "lowes") > rank(lesser, "lowes"), \
+            f"{lesser} outranked the real reset link"
+
+
+@check("the subjects sites really use are recognised as reset mail")
+def _():
+    import google_tools
+    hit = google_tools.RESET_MAIL
+    for subject in ("Amazon Password Assistance",
+                    "Reset your password",
+                    "Reset Your Lowe's Password",
+                    "Your password reset request",
+                    "Forgot your password?",
+                    "Password recovery for your account",
+                    "Here is the link to change your password",
+                    "Set a new password for your Etsy account"):
+        assert hit.search(subject), f"missed {subject!r}"
+    for ordinary in ("Your order has shipped",
+                     "Change your delivery address",
+                     "Your receipt from Costco",
+                     "2 items are back in stock"):
+        assert not hit.search(ordinary), f"treated as reset mail: {ordinary!r}"
+
+
+@check("a real reset mail is read, and somebody else's is left alone")
+def _():
+    """End to end on the reading side, against the shape of mail shops
+    actually send: HTML only, the link wrapped in a tracking domain, and
+    a dozen other links around it. Also the case that matters most - a
+    reset mail for a DIFFERENT site sitting in the same inbox must not be
+    used to change this site's password."""
+    import time as _t
+    import google_tools
+    now = int(_t.time() * 1000)
+    real_search = google_tools.tool_search_email
+    real_body = google_tools._mail_text
+
+    html_mail = (
+        '<html><body><a href="https://www.lowes.com/">'
+        '<img src="logo.png"></a>'
+        '<p>We received a request to reset your password.</p>'
+        '<a href="https://click.e.lowes.com/u/reset-password'
+        '?token=8fbe1d4a9c7e2b6f0d3a5c81&amp;e=1">Reset my password</a>'
+        '<a href="https://www.lowes.com/l/help.html">Need help?</a>'
+        '<a href="https://email.lowes.com/unsubscribe/xyz">Unsubscribe</a>'
+        '<a href="https://apps.apple.com/app/lowes">Get the app</a>'
+        '</body></html>')
+
+    def fake_search(aid, query, limit=5, which="", newest_first=False):
+        return {"messages": [
+            {"id": "other", "from": "no-reply@target.com", "at_ms": now,
+             "subject": "Reset your Target password", "snippet":
+                 "We received a request to reset your password."},
+            {"id": "theirs", "from": "no-reply@e.lowes.com", "at_ms": now,
+             "subject": "Reset Your Lowe’s Password", "snippet":
+                 "We received a request to reset your password."},
+        ]}
+
+    def fake_body(aid, msg_id, which="", limit=60000):
+        if msg_id == "other":
+            return ('<a href="https://click.target.com/reset?token=zzz1234567'
+                    '890abcdef">Reset</a>')
+        return html_mail
+
+    google_tools.tool_search_email = fake_search
+    google_tools._mail_text = fake_body
+    try:
+        got = google_tools.reset_from_email(1, "lowes", now - 60000)
+    finally:
+        google_tools.tool_search_email = real_search
+        google_tools._mail_text = real_body
+    assert got, "the reset mail was not found at all"
+    link = got.get("link", "")
+    assert "reset-password" in link and "token=" in link, link
+    assert "lowes" in link, f"it followed another shop's link: {link}"
+    assert "unsubscribe" not in link and "apps.apple" not in link, link
+    assert "&amp;" not in link, f"the HTML escaping was left in: {link}"
+
+    # And nothing older than the request is ever reopened.
+    google_tools.tool_search_email = fake_search
+    google_tools._mail_text = fake_body
+    try:
+        stale = google_tools.reset_from_email(1, "lowes", now + 600000)
+    finally:
+        google_tools.tool_search_email = real_search
+        google_tools._mail_text = real_body
+    assert not stale, "it reused a link that arrived before we asked"
+
+
+@check("every way a reset can fail is something the agent can say")
+def _():
+    """A reason code the voice side has never heard of comes out as "it
+    didn't work" with no explanation the caller can act on."""
+    src = source()
+    i = src.index("def _run_reset(")
+    body = src[i:i + 20000]
+    reasons = set(re.findall(r'reason="([a-z_]+)"', body))
+    agent_src = io.open("agent.py", encoding="utf-8").read()
+    generic = {"cancelled", "stuck", "site_error", "bot_check",
+               "rate_limited", "geo_block", "login_needed", "ip_block"}
+    for r in reasons:
+        assert r in agent_src or r in generic, \
+            f"nothing in agent.py knows what to say about {r!r}"
+    for must in ("email_needed", "no_reset_mail", "code_to_phone"):
+        assert must in reasons, f"{must} is never reported"
+
+
+@check("a password reset needs a spoken yes")
+def _():
+    src = io.open("agent.py", encoding="utf-8").read()
+    i = src.index("async def reset_site_password(")
+    body = src[i:src.index("@function_tool", i)]
+    assert "said_yes(caller_said)" in body, \
+        "it would reset a password without being asked to"
+    assert "self.verified" in body, "it does not check the PIN"
+    assert body.index("said_yes") < body.index("/jobs/password-reset"), \
+        "it starts the job before checking they agreed"
+
+
 # ------------------------------------------------------------ result
 # Windows won't delete a file that's still open, and the database pool holds
 # it - so close the pool first, or check_tmp.db is left behind every run.

@@ -194,13 +194,18 @@ Keep only STANDING facts - things likely to matter on a future call:
   before Sunday")
 - what has gone wrong for them before, and what worked instead
 - anything they asked us to remember
+- their minhagim: which havdalah they keep (Rabbeinu Tam or not), how
+  many minutes before sunset they light, Magen Avraham or Gra. For this
+  service these are how the job is done, not private matters
 
 Never keep:
 - passwords, PINs, codes, card numbers, or anything secret
 - one-off details of a single call (what was said, an order number)
 - guesses. If you are not sure it is true, leave it out.
-- anything about health, religion or family circumstances beyond what is
-  needed to do the job
+- anything about health or family circumstances beyond what is needed
+  to do the job
+- opinions about religion. What they keep (above) is a fact; what they
+  think of other people's practice is not ours to write down
 
 Rules: one short fact per line, plain English, no bullets or numbering.
 At most 25 lines. Keep every line from the existing notes that is still

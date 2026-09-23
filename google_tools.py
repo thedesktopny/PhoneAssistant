@@ -514,6 +514,149 @@ def code_from_email(account_id: int, site: str, since_ms: int,
     return ""
 
 
+# Subjects and first lines that mean "this is the reset mail". The gap in
+# the middle is there because a shop puts its own name in: Lowe's sends
+# "Reset Your Lowe's Password", and a pattern that only allowed "your"
+# between the two words missed it.
+# Subjects and first lines that mean "this is the reset mail". The gap in
+# the middle is there because a shop puts its own name between the two
+# words: Lowe's sends "Reset Your Lowe's Password", and a pattern that
+# only allowed "your" in between missed it. \u2019 is the curly
+# apostrophe, which is what a shop's mail actually contains.
+RESET_MAIL = _re_scrub.compile(
+    r"(?i)\b(reset|forgot|change|update|recover|new|set)\b"
+    r"[\w'\u2019\- ]{0,24}\b(password|passcode|credential|sign.?in)\b"
+    r"|\b(password|passcode)\b[\w'\u2019\- ]{0,24}"
+    r"\b(reset|recovery|change|assistance|help|request)\b")
+RESET_URL = _re_scrub.compile(r"""https?://[^\s"'<>)\]]+""")
+# The words that mark a link as the one to press, and the words that mark
+# one as a link nobody should ever be pressed on a customer's behalf.
+RESET_WORDS = _re_scrub.compile(
+    r"(?i)(reset|forgot|recover|set.?password|change.?password|"
+    r"new.?password|credential|passwordreset|pwd|token|verify|validate)")
+RESET_NEVER = _re_scrub.compile(
+    r"(?i)(unsubscribe|opt.?out|optout|preferences|privacy|terms|"
+    r"contact.?us|/help|/support|facebook\.|twitter\.|x\.com|"
+    r"instagram\.|youtube\.|apps?\.apple\.com|play\.google\.com|"
+    r"report|feedback|survey|manage.?email)")
+
+
+def _mail_text(account_id: int, msg_id: str, which: str = "",
+               limit: int = 60000) -> str:
+    """Everything a message says, plain part and HTML part together.
+
+    tool_read_email stops at the first text/plain part and cuts it at
+    4,000 characters - fine for a person listening, useless for finding a
+    reset link, which sites bury far down an HTML mail and often send
+    ONLY as HTML."""
+    import html
+    svc = gmail_client(account_id, which)
+    m = svc.users().messages().get(
+        userId="me", id=msg_id, format="full").execute()
+    out = []
+
+    def walk(part):
+        data = (part.get("body") or {}).get("data")
+        if data:
+            try:
+                out.append(base64.urlsafe_b64decode(data)
+                           .decode("utf-8", "ignore"))
+            except Exception:
+                pass
+        for sub in part.get("parts", []) or []:
+            walk(sub)
+
+    walk(m["payload"])
+    return html.unescape("\n".join(out))[:limit]
+
+
+def _rank_reset_link(url: str, site_word: str) -> int:
+    """How likely this link is the one that opens the reset page.
+
+    A password-reset mail carries a dozen links: the logo, the app stores,
+    unsubscribe, the help centre. Picking the first one that mentions the
+    site opened the homepage and the job reported success having changed
+    nothing."""
+    low = (url or "").lower()
+    if RESET_NEVER.search(low):
+        return -1
+    score = 0
+    if RESET_WORDS.search(low):
+        score += 3
+    bits = low.split("/")
+    host = bits[2] if len(bits) > 2 else ""
+    if site_word and site_word in host:
+        score += 2
+    elif site_word and site_word in low:
+        score += 1
+    # A one-time link carries a long opaque token. A menu link does not.
+    if _re_scrub.search(r"[?&/][A-Za-z0-9_\-=%.]{24,}", low):
+        score += 2
+    if low.count("/") <= 3 and "?" not in low:
+        score -= 1          # bare homepage
+    return score
+
+
+def reset_from_email(account_id: int, site: str, since_ms: int,
+                     which: str = "") -> dict:
+    """The reset link, or code, that a site has just emailed.
+
+    Same reasoning as code_from_email: the caller has no screen and often
+    no text messages, and we already have their permission to read this
+    mailbox. Only mail that arrived AFTER the reset was asked for counts,
+    so an old link is never reopened. Returns {"link", "code", "from",
+    "subject"} - the link itself is a one-time secret and is never logged
+    or spoken."""
+    import html
+    site_word = (site or "").split(".")[0].lower()
+    try:
+        found = tool_search_email(
+            account_id, "newer_than:1d in:anywhere", limit=12, which=which,
+            newest_first=True)
+    except Exception:
+        return {}
+    for m in found.get("messages", []):
+        if int(m.get("at_ms") or 0) < since_ms - 60000:
+            continue
+        who = (m.get("from") or "").lower()
+        subject = m.get("subject", "") or ""
+        snippet = m.get("snippet", "") or ""
+        theirs = bool(site_word) and (site_word in who
+                                      or site_word in subject.lower())
+        if not RESET_MAIL.search(subject + " " + snippet):
+            continue
+        try:
+            body = _mail_text(account_id, m["id"], which)
+        except Exception:
+            body = snippet
+        best, best_score = "", 0
+        for raw in RESET_URL.findall(body):
+            # An HTML mail writes the link as ...?token=x&amp;e=1. Following
+            # that verbatim drops the parameters after it and the site
+            # answers "this link has expired".
+            url = html.unescape(raw).rstrip(".,);:'\"]>")
+            score = _rank_reset_link(url, site_word)
+            if score > best_score:
+                best, best_score = url, score
+        # A reset mail from a sender that never names the site is only
+        # believed if the link itself goes to the site. Otherwise this is
+        # somebody else's reset mail and we must not touch it.
+        if not theirs and not (site_word and best and site_word in best.lower()):
+            continue
+        code = ""
+        if CODE_MAIL.search(subject + " " + snippet) or \
+                _re_scrub.search(r"(?i)(code|pin)", subject + " " + body[:600]):
+            hit = (CODE_DIGITS.search(subject)
+                   or CODE_DIGITS.search(snippet)
+                   or CODE_DIGITS.search(body[:1200]))
+            if hit:
+                code = hit.group(1)
+        if best or code:
+            return {"link": best, "code": code, "from": who,
+                    "subject": subject[:120]}
+    return {}
+
+
 def tool_find_contact(account_id: int, name: str, which: str = "") -> dict:
     """Find someone's email address: their Google Contacts first, then
     anyone they've emailed with."""
