@@ -409,6 +409,17 @@ def _():
     assert d.get("shop") == "B&H", f"the shop wasn't separated: {d}"
 
 
+@scenario("browser: a shop's name goes where a search for it would",
+          "David - 'if I type BNH into Google it comes up with the BNH "
+          "website, why can't we?'")
+def _():
+    """Pomegranate's own site is thepompeople.com - no list and no guess
+    would find it; a search does."""
+    got = call("/browser/address", site="Pomegranate Brooklyn").get("url")
+    assert got == "https://thepompeople.com", (
+        f"the live system would open {got!r} for Pomegranate")
+
+
 @scenario("browser: an address given in full is opened as it was said",
           "call 64 - he asked for khconnect.kioskhut.com, the live system "
           "opened www.khconnect.kioskhut.com.com, and he was told his own "

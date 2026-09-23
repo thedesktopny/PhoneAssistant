@@ -1976,7 +1976,9 @@ they go quiet, ask once whether they are still there, then wait.
                             site: str = "", url: str = ""):
         """Do something on any website, described in plain English. Works on
         sites we've never configured. It reads pages and decides its own
-        steps. It will never buy or pay for anything."""
+        steps. It will never buy or pay for anything. site is the shop as
+        they said it ("B&H") - it is looked up like a search would; for a
+        small local shop add the area ("Pomegranate Brooklyn")."""
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
         try:

@@ -23,7 +23,7 @@ from signals import (looks_like_bot_check, looks_signed_in,
                      classify_block, record_block, block_reason,
                      CODE_BAD, BOT_CHECK_MARKS, SIGNED_OUT_MARKS,
                      SIGNED_IN_MARKS, CODE_DEST, BLOCK_KINDS)
-from search import tool_web_search
+from search import tool_web_search, official_site
 from google_tools import (code_from_email, gmail_client,
                           reset_from_email,
                           google_client, pick_connection,
@@ -1543,9 +1543,15 @@ def site_url(site: str, path: str = "") -> str:
     rest = ("/" + bits[1] if len(bits) > 1 else "") + path
     if "." in host and " " not in host:
         return "https://" + host + rest
-    # A name, not an address: "Trader Joe's" is traderjoes.com, "Barnes &
-    # Noble" is barnesandnoble.com. Nothing that can't be in an address
-    # is left in it.
+    # A name, not an address. Ask what it means, the way a person would:
+    # search it and go to the shop's own site. That knows Pomegranate is
+    # thepompeople.com, which no list and no guess ever would.
+    found = official_site(bits[0])
+    if found:
+        return found + rest
+    # Search unavailable: make the best address the name allows -
+    # "Trader Joe's" is traderjoes.com, "Barnes & Noble" is
+    # barnesandnoble.com - with nothing in it that can't be in one.
     host = _shop_key(host).replace("&", " and ").replace("'", "")
     host = _re_scrub.sub(r"[^a-z0-9-]", "", host)
     if not host:

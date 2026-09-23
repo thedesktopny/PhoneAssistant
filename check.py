@@ -3066,42 +3066,107 @@ def _():
     with a wildcard, so the browser reported a certificate error and he
     was told his own site had a security problem. Three minutes of his
     call, and the address was ours."""
-    import browser
-    for said, want in (
-            ("amazon", "https://www.amazon.com"),
-            ("Amazon", "https://www.amazon.com"),
-            ("khconnect.kioskhut.com", "https://khconnect.kioskhut.com"),
-            ("www.lowes.com", "https://www.lowes.com"),
-            ("shop.example.co.uk", "https://shop.example.co.uk"),
-            ("https://etsy.com/orders", "https://etsy.com/orders"),
-            ("amazon/gp/orders", "https://www.amazon.com/gp/orders"),
-            ("", "")):
-        got = browser.site_url(said)
-        assert got == want, f"site_url({said!r}) gave {got!r}, wanted {want!r}"
-    src = source()
-    assert 'www.{site}.com' not in src, \
-        "a runner is still building an address by hand instead of site_url()"
+    _undo_site = everywhere("official_site", lambda name: "")
+    try:
+        import browser
+        for said, want in (
+                ("amazon", "https://www.amazon.com"),
+                ("Amazon", "https://www.amazon.com"),
+                ("khconnect.kioskhut.com", "https://khconnect.kioskhut.com"),
+                ("www.lowes.com", "https://www.lowes.com"),
+                ("shop.example.co.uk", "https://shop.example.co.uk"),
+                ("https://etsy.com/orders", "https://etsy.com/orders"),
+                ("amazon/gp/orders", "https://www.amazon.com/gp/orders"),
+                ("", "")):
+            got = browser.site_url(said)
+            assert got == want, f"site_url({said!r}) gave {got!r}, wanted {want!r}"
+        src = source()
+        assert 'www.{site}.com' not in src, \
+            "a runner is still building an address by hand instead of site_url()"
+    finally:
+        _undo_site()
 
 
 @check("a shop's name becomes the shop's real address")
 def _():
     """Call 65: "from B&H" opened https://www.b&h.com, which is not a
     website, and the caller was told B&H "isn't reachable"."""
+    _undo_site = everywhere("official_site", lambda name: "")
+    try:
+        import browser
+        for said, want in (("B&H", "https://www.bhphotovideo.com"),
+                           ("b and h", "https://www.bhphotovideo.com"),
+                           ("B&H Photo-Video-Audio", "https://www.bhphotovideo.com"),
+                           ("Trader Joe's", "https://www.traderjoes.com"),
+                           ("Barnes & Noble", "https://www.barnesandnoble.com"),
+                           ("Home Depot", "https://www.homedepot.com"),
+                           ("Lowe's website", "https://www.lowes.com")):
+            got = browser.site_url(said)
+            assert got == want, f"{said!r} -> {got!r}, wanted {want!r}"
+        for said in ("B&H", "Macy's", "Stop & Shop", "Dick's", "A&P", "Joe's Deli",
+                     "some shop", "AT&T"):
+            host = browser.site_url(said).split("/")[2]
+            assert not any(ch in host for ch in "&' "), \
+                f"{said!r} became {host!r} - that can't be a web address"
+    finally:
+        _undo_site()
+
+
+@check("a shop's name is looked up the way a search would, not guessed")
+def _():
+    """David: "if I type BNH into Google it comes up with the BNH website -
+    why can't we?" Now it does. These are the real top results for each
+    name; the answer is the first one that is the shop itself rather than
+    a page about it."""
+    import search
+    real = {
+        "b&h": ["https://www.bhphotovideo.com/", "https://www.youtube.com/x",
+                "https://www.facebook.com/bhphoto"],
+        "pomegranate brooklyn": ["https://www.yelp.com/biz/pomegranate",
+                                 "https://thepompeople.com/",
+                                 "https://www.tripadvisor.com/x"],
+        "seasons kosher supermarket": ["https://www.linkedin.com/company/x",
+                                       "https://seasonskosher.com/"],
+        "instacart": ["https://www.instacart.com/", "https://en.wikipedia.org/x"],
+        "nowhere at all": ["https://www.yelp.com/x", "https://www.facebook.com/y"],
+    }
+    asked = []
+
+    def fake(name):
+        asked.append(name)
+        return {"organic": [{"link": u} for u in real[name.lower()]]}
+
+    undo_key = everywhere("SERPER_API_KEY", "x")
+    undo_fn = everywhere("_serper_site", fake)
+    search._SITE_CACHE.clear()
+    try:
+        got = {n: search.official_site(n) for n in
+               ("B&H", "Pomegranate Brooklyn", "Seasons kosher supermarket",
+                "Instacart", "nowhere at all")}
+        search.official_site("B&H")                 # asked again
+    finally:
+        undo_fn()
+        undo_key()
+        search._SITE_CACHE.clear()
+    assert got["B&H"] == "https://www.bhphotovideo.com", got
+    assert got["Pomegranate Brooklyn"] == "https://thepompeople.com", \
+        "a directory page was taken for the shop"
+    assert got["Seasons kosher supermarket"] == "https://seasonskosher.com"
+    assert got["Instacart"] == "https://www.instacart.com", \
+        "the thing they asked for was thrown out as a directory"
+    assert got["nowhere at all"] == "", "a directory was used as a last resort"
+    assert asked.count("B&H") == 1, "the same name was searched twice"
+
     import browser
-    for said, want in (("B&H", "https://www.bhphotovideo.com"),
-                       ("b and h", "https://www.bhphotovideo.com"),
-                       ("B&H Photo-Video-Audio", "https://www.bhphotovideo.com"),
-                       ("Trader Joe's", "https://www.traderjoes.com"),
-                       ("Barnes & Noble", "https://www.barnesandnoble.com"),
-                       ("Home Depot", "https://www.homedepot.com"),
-                       ("Lowe's website", "https://www.lowes.com")):
-        got = browser.site_url(said)
-        assert got == want, f"{said!r} -> {got!r}, wanted {want!r}"
-    for said in ("B&H", "Macy's", "Stop & Shop", "Dick's", "A&P", "Joe's Deli",
-                 "some shop", "AT&T"):
-        host = browser.site_url(said).split("/")[2]
-        assert not any(ch in host for ch in "&' "), \
-            f"{said!r} became {host!r} - that can't be a web address"
+    undo = everywhere("official_site", lambda name: "https://thepompeople.com")
+    try:
+        assert browser.site_url("Pomegranate Brooklyn") == \
+            "https://thepompeople.com"
+        # an address they gave is never replaced by a search
+        assert browser.site_url("khconnect.kioskhut.com") == \
+            "https://khconnect.kioskhut.com"
+    finally:
+        undo()
 
 
 @check("the shop isn't part of the item's name, and a model number decides")

@@ -72,6 +72,72 @@ def _search_tavily(q: str) -> dict:
     }
 
 
+def _serper_site(name: str) -> dict:
+    """A plain search for one name, for official_site. Its own function
+    so a test can stand in for the network."""
+    payload = json.dumps({"q": name, "num": 8}).encode()
+    req = urllib.request.Request(
+        "https://google.serper.dev/search", data=payload,
+        headers={"X-API-KEY": SERPER_API_KEY,
+                 "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=12) as r:
+        return json.loads(r.read().decode())
+
+
+# What comes up when you search a shop's name but is never the shop:
+# directories, reviews, maps, social pages, and delivery apps that list
+# it. Unless it IS what they asked for - "Instacart" means instacart.com.
+NOT_THE_SHOP = _re_scrub.compile(
+    r"(?i)(^|\.)(wikipedia\.org|yelp\.com|facebook\.com|instagram\.com|"
+    r"linkedin\.com|twitter\.com|x\.com|youtube\.com|tiktok\.com|"
+    r"pinterest\.com|reddit\.com|quora\.com|bbb\.org|tripadvisor\.com|"
+    r"mapquest\.com|google\.com|apple\.com|trustpilot\.com|"
+    r"sitejabber\.com|glassdoor\.com|indeed\.com|crunchbase\.com|"
+    r"grocerydive\.com|instacart\.com|doordash\.com|ubereats\.com|"
+    r"seamless\.com|grubhub\.com|nextdoor\.com|foursquare\.com|"
+    r"allmenus\.com|yellowpages\.com|manta\.com|bloomberg\.com)$")
+
+_SITE_CACHE = {}
+
+
+def official_site(name: str) -> str:
+    """The web address a person means by a shop's name, the way a search
+    engine knows it: "B&H" is https://www.bhphotovideo.com, "Pomegranate
+    Brooklyn" is https://thepompeople.com. Empty if nobody can say -
+    never a guess. Remembered for a month, so each name costs one search.
+    """
+    key = " ".join((name or "").lower().split())
+    if not key or not SERPER_API_KEY or is_blocked(key):
+        return ""
+    hit = _SITE_CACHE.get(key)
+    if hit and time.time() - hit[0] < 30 * 86400:
+        return hit[1]
+    try:
+        d = _serper_site(name)
+    except Exception:
+        return ""
+    wanted = _squash(key.replace("&", "").replace(" and ", ""))
+    links = []
+    kg = d.get("knowledgeGraph") or {}
+    if kg.get("website"):
+        links.append(kg["website"])
+    links += [x.get("link", "") for x in d.get("organic") or []]
+    found = ""
+    for link in links:
+        bits = (link or "").split("/")
+        if len(bits) < 3 or not bits[2]:
+            continue
+        host = bits[2].lower()
+        if NOT_THE_SHOP.search(host) and wanted not in _squash(host):
+            continue
+        found = "https://" + host
+        break
+    if len(_SITE_CACHE) > 2000:
+        _SITE_CACHE.clear()
+    _SITE_CACHE[key] = (time.time(), found)
+    return found
+
+
 def _serper_shopping(item: str) -> dict:
     """The shopping block for one query. Its own function so a test can
     stand in for the network without reaching into urllib."""
