@@ -14,6 +14,7 @@ import os
 import asyncio
 import functools
 import inspect
+import re
 import logging
 import httpx
 from datetime import datetime
@@ -377,6 +378,15 @@ def _describe(i: int, m: dict) -> str:
 
 
 class Assistant(Agent):
+    async def on_enter(self):
+        """Only speaks when it has taken over a call already under way - a
+        caller who has just signed up. A normal call is greeted by the
+        entrypoint."""
+        words = getattr(self, "_welcome", "")
+        if words:
+            self._welcome = ""
+            await self.session.generate_reply(instructions=words)
+
     def __init__(self, account: dict, caller_number: str = "",
                  call_id: int | None = None, history: str = "",
                  known: str = ""):
@@ -425,8 +435,9 @@ one turns out to be wrong, say so and work from what they tell you now.
 RECENT HISTORY — what was SAID on earlier calls and texts
 {history or "Nothing recent."}
 
-That is a record of conversation, NOT a record of facts. What you said
-before may have been wrong. If they ask the same thing again, assume the last answer was wrong
+That is a record of conversation, NOT a record of facts. When they
+mean "what I asked for last time", tell them what it shows they asked for
+- never ask them to repeat it. What you said before may have been wrong. If they ask the same thing again, assume the last answer was wrong
 and get it right this time.
 
 HOW YOU TALK
@@ -740,9 +751,33 @@ they go quiet, ask once whether they are still there, then wait.
                       "Do not guess and do not read anything yet.")
         return ""
 
+    def _failure_words(self, d: dict) -> str:
+        """The exact words for a job that has failed, decided by its reason
+        code. Spoken with say(), not handed to the model to phrase: call 67
+        was told to say B&H's sign-in had failed and said "it's still in
+        progress" instead, and the caller waited in silence until the line
+        was hung up on him."""
+        reason = d.get("reason") or ""
+        if reason == "cancelled":
+            return ""
+        site = getattr(self, "job_site", "") or "that site"
+        where = "its sign-in page" if d.get("kind") == "site_login" \
+            else "the page"
+        if reason == "bot_check":
+            return (f"I'm sorry - {site} put a human check on {where}, the "
+                    f"press-and-hold kind, so I can't get through it for you "
+                    f"by phone.")
+        if reason == "rate_limited":
+            return (f"I'm sorry - {site} is turning us away for now. We can "
+                    f"try again a little later.")
+        if reason in ("site_refused", "ip_blocked"):
+            return f"I'm sorry - {site} is refusing our connection right now."
+        return f"I'm sorry - that didn't work on {site}."
+
     async def _watch(self, kind, fetch, describe):
         """Poll a background job and make the agent speak when it changes."""
         last = None
+        self.job_live = True
         for _ in range(100):                     # about five minutes
             await asyncio.sleep(3)
             try:
@@ -755,10 +790,20 @@ they go quiet, ask once whether they are still there, then wait.
                 continue
             last = key
             line = describe(d)
-            if line:
+            said = ""
+            if state == "failed" and kind == "job":
+                said = self._failure_words(d)
+            if line or said:
                 try:
                     sess = getattr(self, "session", None)
-                    if sess:
+                    if sess and said:
+                        handle = sess.say(said, allow_interruptions=True)
+                        if inspect.isawaitable(handle):
+                            await handle
+                        line = (f"You have just told them it didn't work - "
+                                f"never say it is still going. Next: {line}"
+                                if line else "")
+                    if sess and line:
                         await sess.generate_reply(
                             instructions=(f"Update the caller now, in one "
                                           f"short sentence, in English: "
@@ -766,6 +811,7 @@ they go quiet, ask once whether they are still there, then wait.
                 except Exception as e:
                     log.warning(f"watch speak failed: {e}")
             if state in ("done", "failed", "placed", "cancelled"):
+                self.job_live = False
                 break
 
     def _start_watch(self, kind, fetch, describe):
@@ -1854,7 +1900,10 @@ they go quiet, ask once whether they are still there, then wait.
         if want in ("all", "mailboxes", "mailbox", "email"):
             out.append("MAILBOXES: "
                        + str(await self._saved_mailboxes(context)))
-        return "\n".join(out) or "Nothing saved."
+        out.append("These are saved HERE, with us - not on any shop's own "
+                   "site. Being saved here does not mean you are signed in "
+                   "anywhere; only sign_in_to_site finishing says that.")
+        return "\n".join(out)
 
     @function_tool
     @auto_report("orders")
@@ -3431,6 +3480,135 @@ they go quiet, ask once whether they are still there, then wait.
         return "Sent."
 
 
+# ------------------------------------------------------------------ secrets
+# what may be written down of a conversation - see secrets_guard.py
+from secrets_guard import keep_or_blank, BLANKED   # noqa: E402
+
+
+# ------------------------------------------------------------------ sign-up
+
+SIGNUP_INSTRUCTIONS = """You answer the phone for a personal assistant
+service. This caller's number is not a customer yet. Speak English,
+warmly and slowly - many callers are elderly.
+
+People join with an invite code from the office: six digits.
+1. If they have a code, ask them to read it out and call check_invite_code
+   with the digits. If they don't have one, say they can get one from the
+   office, then say goodbye and call end_call.
+2. Once the code is good, ask for their first name and their last name.
+   Say the whole name back. If a name could be spelled more than one way,
+   ask them to spell it, and use their spelling exactly.
+3. Ask them to choose a PIN of four digits that they will remember - they
+   will say it at the start of every call. Say it back digit by digit.
+   Not 1234, and not the same digit four times.
+4. Say back the name and the PIN together and ask if that is right. When
+   they say yes, call create_my_account with the words they used.
+Never discuss anything else before they are signed up. Never say the
+invite code back to them."""
+
+
+class Signup(Agent):
+    """A number we don't know. With an invite code from the office they
+    sign themselves up on this call and carry straight on as a customer;
+    without one they are told how to get one. Nothing here can reach any
+    existing account."""
+
+    def __init__(self, caller_number: str, call_id, on_signed_up):
+        super().__init__(instructions=SIGNUP_INSTRUCTIONS)
+        self.caller_number = caller_number
+        self.call_id = call_id
+        self.when_signed_up = on_signed_up
+        self.code = ""
+        # read by the call's watchdog and hang-up, as on Assistant
+        self.verified = False
+        self.hangup_reason = ""
+        self._hangup = None
+        self.job_id = None
+        self.onboard_sid = None
+        self.order_id = None
+
+    @function_tool
+    async def check_invite_code(self, context: RunContext, code: str):
+        """Check the six-digit invite code they read out. Digits only."""
+        digits = "".join(ch for ch in code if ch.isdigit())
+        try:
+            d = await backend_post("/signup/check", {
+                "phone": self.caller_number, "code": digits})
+        except Exception as e:
+            log.error(f"invite check failed: {e}")
+            return "The check didn't go through. Ask them to try again."
+        why = d.get("reason", "")
+        if d.get("ok"):
+            self.code = digits
+            await log_turn(self.call_id, "tool", "invite code accepted",
+                           "check_invite_code")
+            return ("The code is good. Now ask for their first name and "
+                    "their last name, and get the spelling exactly right.")
+        if why == "bad_code":
+            return ("That code isn't valid - it may be misheard, already "
+                    "used or expired. Ask them to read it again slowly. If "
+                    "it fails again, say the office can give them a new one.")
+        if why == "too_many":
+            return ("Too many wrong codes from this phone. Say they should "
+                    "ask the office for help, say goodbye, and call end_call.")
+        if why == "no_number":
+            return ("Their phone number is hidden, so we could never know "
+                    "them next time. Say they need to call from a phone "
+                    "that shows its number, say goodbye, and call end_call.")
+        if why == "already_customer":
+            return ("This number is already a customer. Say they can hang "
+                    "up and call again, and it will know them.")
+        return "That didn't work. Ask them to try again."
+
+    @function_tool
+    async def create_my_account(self, context: RunContext, first_name: str,
+                                last_name: str, pin: str,
+                                caller_said: str = ""):
+        """Sign them up, once the code is checked and they have said yes to
+        their name and PIN read back together. caller_said is their yes."""
+        if not self.code:
+            return "Check their invite code first."
+        if not said_yes(caller_said):
+            return ("Say back their full name and their PIN, digit by "
+                    "digit, and wait for a clear yes.")
+        try:
+            d = await backend_post("/signup/complete", {
+                "phone": self.caller_number, "code": self.code,
+                "first_name": first_name, "last_name": last_name,
+                "pin": pin, "call_id": self.call_id or 0})
+        except Exception as e:
+            log.error(f"sign-up failed: {e}")
+            return "The sign-up didn't go through. Ask them to hold on and try again."
+        why = d.get("reason", "")
+        if not d.get("ok"):
+            return {
+                "weak_pin": "That PIN is too easy to guess - the same digit "
+                            "or a straight run like 1234. Ask for a "
+                            "different four digits.",
+                "pin_length": "A PIN is four digits. Ask again.",
+                "name_needed": "Ask for both their first and last name.",
+                "bad_code": "The invite code is no longer valid. Say the "
+                            "office can give them a new one.",
+                "too_many": "Too many tries. Say the office will help, and "
+                            "say goodbye.",
+            }.get(why, "That didn't work. Ask them to try again.")
+        await log_turn(self.call_id, "tool", f"signed up: {d['name']}",
+                       "create_my_account")
+        # From here the call is theirs. The full assistant takes over on
+        # this same call - LiveKit hands over to the Agent a tool returns.
+        return self.when_signed_up({
+            "account_id": d["account_id"], "name": d["name"],
+            "phones": [self.caller_number], "gmail": None, "mailboxes": []})
+
+    @function_tool
+    async def end_call(self, context: RunContext, reason: str = "finished"):
+        """Hang up, after saying goodbye."""
+        self.hangup_reason = reason
+        if self._hangup:
+            self._hangup.set()
+        return "Say a short goodbye now. Nothing else."
+
+
 # ------------------------------------------------------------------ session
 
 @server.rtc_session(agent_name="phone-assistant")
@@ -3461,33 +3639,50 @@ async def entrypoint(ctx: JobContext):
         vad=silero.VAD.load(),
     )
 
-    if not account:
-        await session.start(room=ctx.room, agent=Agent(
-            instructions=("Speak English. Say this number isn't set up yet, "
-                          "then say goodbye.")))
-        await session.generate_reply(
-            instructions=("In English: tell them this number isn't registered "
-                          "and to call the office. One sentence."))
-        return
+    def signed_up(new_account: dict):
+        """Someone has just signed up on this call. From here the call is
+        theirs. Everything below that follows the caller - the log, their
+        memory, the silence watchdog, hanging up, the call record - reads
+        these two names when it runs, so rebinding them is the handover."""
+        nonlocal account, agent_obj
+        account = new_account
+        fresh = Assistant(new_account, caller, call_id, "", "")
+        fresh.verified = True          # they chose the PIN a moment ago
+        fresh._hangup = agent_obj._hangup
+        first = (new_account.get("name") or "").split(" ")[0]
+        fresh._welcome = (f"In English: welcome {first} warmly by first "
+                          f"name, say they are all set, and that from now "
+                          f"on they just call this number and say their "
+                          f"PIN. Then ask what you can do for them today. "
+                          f"Two short sentences.")
+        agent_obj = fresh
+        return fresh
 
-    known = ""
-    try:
-        p = await backend_get("/profile",
-                              account_id=account["account_id"])
-        known = p.get("for_the_assistant", "") or ""
-    except Exception as e:
-        log.warning(f"profile load failed: {e}")
+    if account:
+        known = ""
+        try:
+            p = await backend_get("/profile",
+                                  account_id=account["account_id"])
+            known = p.get("for_the_assistant", "") or ""
+        except Exception as e:
+            log.warning(f"profile load failed: {e}")
 
-    history = ""
-    try:
-        rows = await backend_get("/memory",
-                                 account_id=account["account_id"], limit=12)
-        history = "\n".join(
-            f"- ({r['channel']}) {r['who']}: {r['text'][:160]}" for r in rows)
-    except Exception as e:
-        log.warning(f"history load failed: {e}")
+        history = ""
+        try:
+            rows = await backend_get("/memory",
+                                     account_id=account["account_id"],
+                                     limit=12)
+            history = "\n".join(
+                f"- ({r['channel']}) {r['who']}: {r['text'][:160]}"
+                for r in rows)
+        except Exception as e:
+            log.warning(f"history load failed: {e}")
+        agent_obj = Assistant(account, caller, call_id, history, known)
+    else:
+        # A number we don't know: they can sign up with an invite code.
+        agent_obj = Signup(caller, call_id, signed_up)
 
-    agent_obj = Assistant(account, caller, call_id, history, known)
+    secret = {"on": False, "turns": 0}
 
     @session.on("conversation_item_added")
     def _on_item(ev):
@@ -3499,13 +3694,18 @@ async def entrypoint(ctx: JobContext):
                 if role != "user":
                     last_heard["agent_done"] = time.monotonic()
                 who = "caller" if role == "user" else "agent"
-                asyncio.create_task(log_turn(call_id, who, text))
+                # Never write down a password or PIN being given, from
+                # either side - the caller spelling it, or the assistant
+                # reading it back. The model still hears it; only the
+                # record is blank.
+                stored = keep_or_blank(secret, role, text)
+                asyncio.create_task(log_turn(call_id, who, stored))
                 if account:
                     asyncio.create_task(backend_post("/memory", {
                         "account_id": account["account_id"],
                         "channel": "voice",
                         "who": "user" if role == "user" else "assistant",
-                        "text": text}))
+                        "text": stored}))
         except Exception:
             pass
 
@@ -3557,8 +3757,11 @@ async def entrypoint(ctx: JobContext):
             # measured from whenever it last became the caller's turn
             quiet = now - max(last_heard["at"], last_heard["agent_done"])
             total = now - started_at
+            # job_live, not job_id: job_id stays set after a job ends so
+            # its result can be fetched, and a failed job used to count as
+            # "busy" - tripling the silence allowed after nothing was left.
             busy = bool(getattr(agent_obj, "onboard_sid", None)
-                        or getattr(agent_obj, "job_id", None)
+                        or getattr(agent_obj, "job_live", False)
                         or getattr(agent_obj, "order_id", None))
 
             if total > MAX_CALL_SECONDS:
@@ -3684,10 +3887,16 @@ async def entrypoint(ctx: JobContext):
         asyncio.create_task(hangup_when_asked())
     except Exception as e:
         log.warning(f"hangup watchdog not started: {e}")
-    await session.generate_reply(
-        instructions=(f"In English: greet {account.get('name')} by name in "
-                      f"one short sentence and ask for their PIN. "
-                      f"Speak English."))
+    if account:
+        await session.generate_reply(
+            instructions=(f"In English: greet {account.get('name')} by name "
+                          f"in one short sentence and ask for their PIN. "
+                          f"Speak English."))
+    else:
+        await session.generate_reply(
+            instructions=("In English: say hello, that this number isn't set "
+                          "up yet, and ask whether they have an invite code "
+                          "from the office. Two short sentences."))
 
 
 if __name__ == "__main__":

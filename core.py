@@ -459,6 +459,22 @@ class SecretAccess(Base):
     purpose = Column(String(120), default="")
 
 
+class Invite(Base):
+    """One person the office has said yes to. They ring, say the code, and
+    sign themselves up. Only a keyed hash of the code is kept."""
+    __tablename__ = "invites"
+    id = Column(Integer, primary_key=True)
+    code_hash = Column(String(64), index=True)
+    note = Column(String(120), default="")       # who it is for
+    made = Column(DateTime, default=datetime.utcnow)
+    expires = Column(DateTime, nullable=True)
+    cancelled = Column(Integer, default=0)
+    used_at = Column(DateTime, nullable=True)
+    account_id = Column(Integer, nullable=True)
+    used_name = Column(String(120), default="")
+    used_phone = Column(String(20), default="")
+
+
 class Minhag(Base):
     """What this customer keeps, so their times come out their way.
 

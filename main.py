@@ -52,6 +52,7 @@ from google_tools import (CODE_DIGITS, CODE_MAIL, CONNECT_CODE_HOURS, CONNECT_MA
 from google_tools import (_as_pdf, _cal, _category, _col_letters, _column_number, _connect_code, _connect_code_ok, _connect_too_many, _drive_kind, _drive_meta, _extract_body, _flow, _google_time, _headers_of, _made, _must_be, _person, _sheet_values, _spoken_date, _tab_range, _upload, _walk_parts)
 from browser import (_order_set, BROWSE_SYSTEM, BUY_BUTTONS, CHECKOUT_SYSTEM, DIAL_MAP, DOING_GOAL, MAX_BROWSERS, NAV_NOISE, ORDER_PAGES, PROXY_STATUS, REFUSAL_HINT, SEARCH_PAGES, SITES, STUCK_LIMIT, US_AREA_STATE, claims_action, delete_everything, disconnect_mailbox, do_back, do_click, do_fill, do_goto, forget_site_login, list_site_logins, looks_like_pdf, page_answer, page_eval, page_shot, page_text, page_url, q, q_all, read_pdf, revoke_google, save_site_login, settle, signed_in, use_site_login, _browser_error)
 import everyday
+import signup
 from browser import (site_url, _JOB_STARTED, _LAST_LIMIT_FLAG, _LAST_PROXY_FLAG, _PENDING, _SNAPSHOT_JS, _TASK_CACHE, _action_index, _action_sig, _agent_fallback, _as_placeholder, _bb_connect_url, _bb_session, _body_mark, _decide, _do_site_login, _find_recipe, _first_json, _flag_account_limit, _flag_proxy_fallback, _flag_proxy_unavailable, _forget_context, _get_context, _going_in_circles, _handle, _is_nav_error, _job_set, _match_element, _new_browserbase_context, _ob_set, _open_with_session, _page_snapshot, _queue_lock, _recipe_result, _recipe_value, _record_request, _replay_recipe, _run_browse, _run_checkout, _run_reset, _run_signin, _run_site_login, _run_site_orders, _run_site_search, _save_context, _save_recipe, _shape, _slots, _stuck_note, _task_label, _task_shape, _user_turn, _waiting, _where_for_account, _where_for_phone)
 from search import (shopping_prices, tool_web_search)
 from search import (_money, _search_serper, _search_tavily, _serper_shopping)
@@ -621,17 +622,78 @@ def signup_request(b: SignupBody):
     return {"ok": True}
 
 
+# ------------------------------------------------------------- sign-up
+# The office makes an invite code; the person rings and signs themselves
+# up by voice. See signup.py.
+
+class InviteBody(BaseModel):
+    note: str = ""
+    days: int = 0
+
+
+@app.post("/invites")
+def invite_make(b: InviteBody, request: Request):
+    """The code comes back once, here, and is never shown again."""
+    require_auth(request)
+    return signup.make_invite(b.note, b.days)
+
+
+@app.get("/invites")
+def invite_list(request: Request):
+    require_auth(request)
+    return signup.list_invites()
+
+
+@app.post("/invites/cancel")
+def invite_cancel(request: Request, invite_id: int):
+    require_auth(request)
+    return signup.cancel_invite(invite_id)
+
+
+class SignupCheck(BaseModel):
+    phone: str
+    code: str
+
+
+@app.post("/signup/check")
+def signup_check(b: SignupCheck, request: Request):
+    require_auth(request)
+    return signup.check_invite(b.phone, b.code)
+
+
+class SignupDone(BaseModel):
+    phone: str
+    code: str
+    first_name: str
+    last_name: str
+    pin: str
+    call_id: int = 0
+
+
+@app.post("/signup/complete")
+def signup_complete(b: SignupDone, request: Request):
+    require_auth(request)
+    return signup.complete_signup(b.phone, b.code, b.first_name,
+                                  b.last_name, b.pin,
+                                  call_id=b.call_id or None)
+
+
 class NewAccount(BaseModel):
     name: str
     phone: str | None = None
-    pin: str = "1234"
+    pin: str = ""
 
 
 @app.post("/accounts")
 def create_account(a: NewAccount, request: Request):
     require_auth(request)
+    pin = "".join(ch for ch in (a.pin or "") if ch.isdigit())
+    if not 4 <= len(pin) <= 6 or signup.weak_pin(pin):
+        raise HTTPException(
+            400, "Give them a PIN of 4 to 6 digits that isn't 1234 or one "
+                 "digit repeated.")
     db = Session()
-    acct = Account(name=a.name, pin=a.pin)
+    acct = Account(name=a.name, pin=pin)
     db.add(acct)
     db.commit()
     db.refresh(acct)
@@ -1525,6 +1587,75 @@ def call_turn(t: TurnBody, request: Request):
     db.commit()
     db.close()
     return {"ok": True}
+
+
+@app.post("/privacy/blank_secrets")
+def privacy_blank_secrets(request: Request, dry_run: int = 1):
+    """Blank passwords and PINs that reached the records before the voice
+    side stopped writing them down: the call log, their memory and the
+    live log, each read in order with the same rule the voice side now
+    uses (secrets_guard.py). dry_run=1 only counts. Running it twice
+    changes nothing the second time."""
+    require_auth(request)
+    from secrets_guard import keep_or_blank, BLANKED
+    db = Session()
+    counts = {"call_turns": 0, "memory": 0, "live_log": 0}
+    calls = {}
+
+    # the call log, one call at a time
+    for (cid,) in db.query(CallTurn.call_id).distinct().all():
+        state = {"on": False, "turns": 0}
+        for t in (db.query(CallTurn).filter_by(call_id=cid)
+                  .order_by(CallTurn.id).all()):
+            if t.who not in ("caller", "agent"):
+                continue
+            role = "user" if t.who == "caller" else "assistant"
+            new = keep_or_blank(state, role, t.text or "")
+            if new != (t.text or ""):
+                counts["call_turns"] += 1
+                calls[cid] = calls.get(cid, 0) + 1
+                if not dry_run:
+                    t.text = new
+
+    # their memory, one customer at a time
+    for (aid,) in db.query(Memory.account_id).distinct().all():
+        state = {"on": False, "turns": 0}
+        for m in (db.query(Memory).filter_by(account_id=aid, channel="voice")
+                  .order_by(Memory.id).all()):
+            role = "user" if m.who == "user" else "assistant"
+            new = keep_or_blank(state, role, m.text or "")
+            if new != (m.text or ""):
+                counts["memory"] += 1
+                if not dry_run:
+                    m.text = new
+
+    # the live log's copy of each line: "caller: ..." / "agent: ..."
+    for (ref,) in (db.query(Event.ref).filter(Event.kind == "call")
+                   .distinct().all()):
+        state = {"on": False, "turns": 0}
+        for e in (db.query(Event).filter_by(kind="call", ref=ref)
+                  .order_by(Event.id).all()):
+            text = e.text or ""
+            for prefix, role in (("caller: ", "user"), ("agent: ", "assistant")):
+                if text.startswith(prefix):
+                    new = keep_or_blank(state, role, text[len(prefix):])
+                    if new != text[len(prefix):]:
+                        counts["live_log"] += 1
+                        if not dry_run:
+                            e.text = prefix + new
+                    break
+
+    if not dry_run:
+        db.commit()
+    db.close()
+    if not dry_run and any(counts.values()):
+        emit("privacy", "blank", f"blanked {counts['call_turns']} call-log "
+             f"lines, {counts['memory']} memory lines and "
+             f"{counts['live_log']} live-log lines where a password or PIN "
+             f"was being given", "info")
+    return {"dry_run": bool(dry_run), "blanked": counts,
+            "calls_touched": len(calls),
+            "most_in_one_call": max(calls.values()) if calls else 0}
 
 
 @app.post("/calls/end")

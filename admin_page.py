@@ -232,12 +232,28 @@ Waiting for events…</pre>
     <tbody id="rows"><tr><td colspan="5" class="hint">Loading&hellip;</td></tr>
     </tbody></table>
   </div>
-  <div class="card"><h2>Add a customer</h2>
-    <div class="hint">Customers normally set themselves up by phone. This is
-      for when you need to add someone by hand.</div>
+  <div class="card"><h2>Invite someone</h2>
+    <div class="hint">Make a code and give it to them. They call
+      +1 484 518 2072 from their own phone, say the code, say their name and
+      choose their own PIN &mdash; and they are set up. Each code works once,
+      for 14 days. It is shown only now, so write it down or send it.</div>
+    <label>Who it's for (only you see this)</label>
+    <input id="inv_note" placeholder="e.g. Yossi, freelancer">
+    <button onclick="makeInvite()">Make a code</button>
+    <div id="inv_new" style="font-size:30px;font-weight:bold;
+      letter-spacing:6px;margin:10px 0"></div>
+    <table><thead><tr><th>For</th><th>Made</th><th>Status</th>
+    <th>Signed up as</th><th></th></tr></thead>
+    <tbody id="inv_rows"><tr><td colspan="5" class="hint">Loading&hellip;</td>
+    </tr></tbody></table>
+  </div>
+  <div class="card"><h2>Add a customer by hand</h2>
+    <div class="hint">For when someone can't sign up by phone. The PIN
+      below is made fresh each time &mdash; tell it to them, or type the one
+      they want.</div>
     <label>Name</label><input id="n">
     <label>Their phone number</label><input id="p" placeholder="+18455551234">
-    <label>PIN</label><input id="k" value="1234">
+    <label>PIN</label><input id="k" value="">
     <button onclick="add()">Create</button>
     <div class="msg" id="msg"></div>
   </div>
@@ -878,6 +894,54 @@ async function textLink(id){
       : ('Not sent: ' + (d.detail || d.error || 'check SMS settings'));
   }catch(e){ m.textContent = 'Not sent: ' + e.message; }
 }
+function freshPin(){
+  // not 1234, not one digit four times: the same rule as phone sign-up
+  var p = '';
+  while(true){
+    p = String(1000 + Math.floor(Math.random() * 9000));
+    var same = p.split('').every(function(c){ return c === p[0]; });
+    var run = '01234567890'.indexOf(p) >= 0 || '09876543210'.indexOf(p) >= 0;
+    if(!same && !run) return p;
+  }
+}
+async function makeInvite(){
+  const box = document.getElementById('inv_new');
+  box.textContent = 'Making...';
+  try{
+    const r = await fetch('/invites', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({note: document.getElementById('inv_note').value})});
+    const d = await r.json();
+    box.textContent = d.code ? (d.code.slice(0,3) + ' ' + d.code.slice(3)) : 'Failed';
+    document.getElementById('inv_note').value = '';
+    loadInvites();
+  }catch(e){ box.textContent = 'Failed: ' + e.message; }
+}
+async function cancelInvite(id){
+  await fetch('/invites/cancel?invite_id=' + id, {method:'POST'});
+  loadInvites();
+}
+async function loadInvites(){
+  const tb = document.getElementById('inv_rows');
+  if(!tb) return;
+  try{
+    const d = await (await fetch('/invites')).json();
+    if(!d.length){
+      tb.innerHTML = '<tr><td colspan="5" class="hint">No codes yet.</td></tr>';
+      return; }
+    tb.innerHTML = d.map(function(i){
+      var who = i.name ? (esc(i.name) + ' (' + esc(i.phone.slice(-4)) +
+        ', ' + esc(i.used) + ')') : '';
+      var btn = i.state === 'waiting' ? '<button class="sec" ' +
+        'onclick="cancelInvite(' + i.id + ')">Cancel</button>' : '';
+      return '<tr><td>' + esc(i.note || '-') + '</td><td>' + esc(i.made) +
+        '</td><td>' + esc(i.state) + (i.state === 'waiting' ?
+        ' until ' + esc(i.expires) : '') + '</td><td>' + who + '</td><td>' +
+        btn + '</td></tr>'; }).join('');
+  }catch(e){
+    tb.innerHTML = '<tr><td colspan="5" class="no">' + esc(e.message) +
+      '</td></tr>'; }
+}
 async function add(){
   const m = document.getElementById('msg');
   const r = await fetch('/accounts',{method:'POST',
@@ -887,10 +951,13 @@ async function add(){
       pin:document.getElementById('k').value})});
   if(r.ok){ m.textContent='Created.';
     document.getElementById('n').value='';
-    document.getElementById('p').value=''; load(); }
+    document.getElementById('p').value='';
+    document.getElementById('k').value = freshPin(); load(); }
   else { m.textContent='Failed — that number may already exist.'; }
 }
 
+document.getElementById('k').value = freshPin();
+loadInvites();
 load(); loadCalls(); loadStats(); loadDlr(); loadOb(); loadFu(); loadJobs(); loadHealth(); loadSites(); loadOrders(); loadAlerts(); loadCosts();
 if(!window._livePoller){
   pollLive(); window._livePoller = setInterval(pollLive, 2000);

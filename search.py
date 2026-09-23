@@ -173,6 +173,29 @@ MODEL = _re_scrub.compile(r"(?i)\b(?=[a-z0-9-]*\d)(?=[a-z0-9-]*[a-z])"
                           r"[a-z0-9]+(?:-[a-z0-9]+)*\b")
 
 
+# Ink "for Epson ET-5850" names the printer's model and cost $10 (call
+# 67). A listing that is FOR the thing they asked about is not the thing.
+# Deliberately not a list of nouns: the real printer's own title says
+# "Cartridge-Free", and printers come with "paper trays".
+ACCESSORY_WORDS = _re_scrub.compile(
+    r"(?i)\b(compatible|replacement|refills?|toner|dust cover|"
+    r"screen protector|decals?|skins?)\b")
+# They asked for the extra itself - "ink for my Epson" - so extras count.
+EXTRA_ASKED = _re_scrub.compile(
+    r"(?i)\b(ink|inks|cartridges?|toner|refills?|covers?|cases?|cables?|"
+    r"chargers?|paper|parts?|batter(y|ies)|filters?|bags?)\b")
+
+
+def for_the_item(title: str, models: list) -> bool:
+    """"Ink bottles for Epson ET-5850" is for the printer, not it."""
+    low = (title or "").lower()
+    for m in _re_scrub.finditer(r"\b(for|fits|compatible with)\b", low):
+        after = _squash(low[m.end():m.end() + 40])
+        if any(md in after for md in models):
+            return True
+    return False
+
+
 def split_shop(item: str):
     """"Epson ET-5850 printer from B&H" -> ("Epson ET-5850 printer", "B&H")."""
     m = SHOP_PHRASE.search(item or "")
@@ -226,8 +249,19 @@ def shopping_prices(item: str, limit: int = 8, shop: str = "") -> dict:
 
     models = [_squash(m) for m in MODEL.findall(item) if len(_squash(m)) >= 4]
 
+    extras = {m.group(0).lower().rstrip("s")
+              for m in EXTRA_ASKED.finditer(item)}
+    wants_extra = bool(extras or ACCESSORY_WORDS.search(item))
+
     def _fits(title: str) -> float:
         low = (title or "").lower()
+        if not wants_extra and (ACCESSORY_WORDS.search(title or "")
+                                or for_the_item(title, models)):
+            return 0.0
+        # They asked for the ink, not the printer: the listing has to be
+        # the extra they named.
+        if extras and not any(x in low for x in extras):
+            return 0.0
         if models and all(m in _squash(title) for m in models):
             return 1.0
         if not wanted:

@@ -2914,12 +2914,17 @@ def _():
     assert words <= 3200, (
         f"the instructions are back up to {words} words. Move the newest "
         f"section into the tool result it belongs to.")
-    import re as _re
-    tools = _re.findall(r"@function_tool.*?async def (\w+)\(",
-                        open("agent.py", encoding="utf-8").read(), _re.S)
+    # Counted on the assistant itself, not across the file: the sign-up
+    # agent's tools exist only on a first call from an unknown number and
+    # are never sent on a customer's turns. It has its own, smaller limit.
+    tools = inst.tools
     assert len(tools) <= 80, (
         f"{len(tools)} tools. Each one's name and description is sent on "
         f"every turn too - merge the near-duplicates rather than adding.")
+    signup_tools = agent.Signup("+15550100", 1, lambda a: None).tools
+    assert len(signup_tools) <= 5, (
+        f"the sign-up agent has {len(signup_tools)} tools - it only needs "
+        f"to check a code, create the account and hang up")
 
 
 @check("every file has every name it uses")
@@ -3211,6 +3216,170 @@ def _():
     assert d["at_shop"] and d["at_shop"][0]["price"] == "$699.99", d["at_shop"]
 
 
+@check("a listing that is FOR the item is not the item")
+def _():
+    """Call 67: ink "for Epson ET-5850" at $10 was the cheapest ET-5850.
+    The real printer's own title says "Cartridge-Free" and printers come
+    with paper trays - so this can't be a list of nouns."""
+    import search
+    titles = [
+        ("Ink Technologies", "$10.00", "T522 Ink Bottles for Epson ET-5850"),
+        ("DigitalDeckCovers", "$35.99", "Dust Cover for Epson EcoTank ET-5850"),
+        ("ClickInks", "$45.41", "Compatible 522 Ink Set Epson ET-5850 4 Pack"),
+        ("B&H Photo-Video-Audio", "$699.99", "Epson EcoTank Pro ET-5850 "
+         "All-in-One Cartridge-Free Supertank Printer"),
+        ("AllPrintHeads.com", "$395.00", "Multifunction Printer Epson EcoTank "
+         "ET-5850 25 ppm WiFi 250-sheet paper tray"),
+    ]
+    undo_key = everywhere("SERPER_API_KEY", "x")
+    undo_fn = everywhere("_serper_shopping", lambda q: {"shopping": [
+        {"source": s, "price": p, "title": t} for s, p, t in titles]})
+    try:
+        printer = search.shopping_prices("Epson ET-5850")
+        ink = search.shopping_prices("ink for Epson ET-5850")
+    finally:
+        undo_fn()
+        undo_key()
+    shops = [o["shop"] for o in printer["offers"]]
+    assert shops == ["AllPrintHeads.com", "B&H Photo-Video-Audio"], shops
+    assert printer["exact"]
+    assert [o["shop"] for o in ink["offers"]] == ["Ink Technologies",
+                                                   "ClickInks"], \
+        "asking for ink found printers and dust covers"
+
+
+@check("a password or PIN being given never reaches the call log")
+def _():
+    """Call 67: a password spelled a few characters at a time was written
+    to the call log in pieces - one line at a time, nothing looked like a
+    password. Invented values only, here."""
+    state = {"on": False, "turns": 0}
+    convo = [
+        ("assistant", "Can you please say your PIN?", False),
+        ("user", "Four, seven, one, nine.", True),
+        ("assistant", "Thanks, the PIN is confirmed. What can I do?", False),
+        ("user", "Order a printer from B&H.", False),
+        ("assistant", "Please tell me the password for that account, one "
+                      "character at a time.", False),
+        ("user", "capital K", True),
+        ("assistant", "Got it, the first character is a capital K.", True),
+        ("user", "lowercase q, then 4 7", True),
+        ("assistant", "So far: capital K, lowercase q, then 47.", True),
+        ("user", "then z z. That's it.", True),
+        ("assistant", "The username I have is a@example.com. Right?", False),
+        ("user", "Yes.", False),
+        ("assistant", "Your login is saved and stored encrypted.", False),
+        ("user", "Great, now order it.", False),
+    ]
+    for role, text, hide in convo:
+        stored = agent.keep_or_blank(state, role, text)
+        if hide:
+            assert stored == agent.BLANKED, f"written down: {role}: {text}"
+        else:
+            assert stored == text, f"blanked for no reason: {role}: {text}"
+    src = io.open("agent.py", encoding="utf-8").read()
+    ep = src[src.index("def _on_item(ev):"):][:1800]
+    assert "stored = keep_or_blank(secret, role, text)" in ep
+    assert "log_turn(call_id, who, stored)" in ep, \
+        "the call log still gets the raw words"
+    assert '"text": stored' in ep, "their memory still gets the raw words"
+
+
+@check("passwords and PINs already in the records can be blanked, and only them")
+def _():
+    """Before call 67's fix, a spelled password and every spoken PIN were
+    written to the call log, their memory and the live log. This cleans
+    them with the same rule the voice side now uses. Invented values."""
+    from fastapi.testclient import TestClient
+    cl = TestClient(main.app, raise_server_exceptions=False,
+                    base_url="https://t")
+    cl.post("/admin/login", json={"password": os.environ.get(
+        "ADMIN_PASSWORD", "changeme")})
+    convo = [
+        ("agent", "Can you please say your PIN?"),
+        ("caller", "Nine, three, eight, two."),
+        ("agent", "Thanks, the PIN is confirmed. What can I do?"),
+        ("caller", "Save my shop login."),
+        ("agent", "Please tell me the password, one character at a time."),
+        ("caller", "capital W, lowercase r, then 5 5"),
+        ("agent", "So far: capital W, lowercase r, 55."),
+        ("caller", "That's all."),
+        ("agent", "The username I have is b@example.com. Right?"),
+        ("caller", "Yes, now order the kettle."),
+    ]
+    db = main.Session()
+    call = main.Call(account_id=None, from_number="+15550100888")
+    db.add(call)
+    db.commit()
+    db.refresh(call)
+    cid = call.id
+    for who, text in convo:
+        db.add(main.CallTurn(call_id=cid, who=who, text=text))
+        db.add(main.Event(kind="call", ref=f"call {cid}",
+                          text=f"{who}: {text}", level="info"))
+    db.commit()
+    db.close()
+
+    dry = cl.post("/privacy/blank_secrets", params={"dry_run": 1}).json()
+    db = main.Session()
+    untouched = [t.text for t in db.query(main.CallTurn)
+                 .filter_by(call_id=cid).order_by(main.CallTurn.id).all()]
+    db.close()
+    assert untouched == [t for _, t in convo], "a dry run changed something"
+    assert dry["blanked"]["call_turns"] >= 4, dry
+
+    done = cl.post("/privacy/blank_secrets", params={"dry_run": 0}).json()
+    db = main.Session()
+    after = [t.text for t in db.query(main.CallTurn)
+             .filter_by(call_id=cid).order_by(main.CallTurn.id).all()]
+    log = [e.text for e in db.query(main.Event)
+           .filter_by(kind="call", ref=f"call {cid}")
+           .order_by(main.Event.id).all()]
+    db.close()
+    for n in (1, 5, 6, 7):
+        assert after[n] == agent.BLANKED, f"still written: {convo[n][1]}"
+    for n in (0, 2, 3, 4, 8, 9):
+        assert after[n] == convo[n][1], f"blanked for no reason: {convo[n][1]}"
+    assert not any("capital W" in e or "Nine, three" in e for e in log), \
+        "the live log still has it"
+    again = cl.post("/privacy/blank_secrets", params={"dry_run": 0}).json()
+    assert not any(again["blanked"].values()), \
+        f"running it twice changed more: {again}"
+    assert done["dry_run"] is False
+
+
+@check("a failed job is said in words the model can't turn around")
+def _():
+    """Call 67: told to say B&H's sign-in had failed, the voice model said
+    "it's still in progress", and the caller waited until he was hung up
+    on. A failure is now spoken with say(), like "Are you still there?"."""
+    a = agent.Assistant({"account_id": 1, "name": "T"}, "+1555", 1)
+    a.job_site = "B&H"
+    words = a._failure_words({"kind": "site_login", "reason": "bot_check"})
+    assert "B&H" in words and "human check" in words and "sign-in" in words
+    assert "progress" not in words
+    assert a._failure_words({"reason": "cancelled"}) == ""
+    src = io.open("agent.py", encoding="utf-8").read()
+    w = src[src.index("    async def _watch(self, kind, fetch, describe):"):]
+    w = w[:w.index("    def _start_watch(")]
+    assert "sess.say(said" in w, "a failure is still left to the model to phrase"
+    assert "never say it is still going" in w
+    assert "self.job_live = False" in w, "a finished job still counts as busy"
+    assert 'getattr(agent_obj, "job_live", False)' in src, \
+        "the silence watchdog still treats a failed job as running"
+
+
+@check("saved here is never mistaken for signed in, and history is used")
+def _():
+    """Call 67: "I'm already connected to your account" with nothing
+    signed in; and "can you remind me?" about what the history showed."""
+    src = io.open("agent.py", encoding="utf-8").read()
+    i = src.index("async def what_is_saved(")
+    assert "does not mean you are signed in" in src[i:i + 2000]
+    inst = agent.Assistant({"account_id": 1, "name": "T"}, "+1555", 1)
+    assert "never ask them to repeat it" in inst.instructions
+
+
 @check("the voice side says 'not that exact one' whenever it is true")
 def _():
     """The backend said "I could not find that exact one"; the voice tool
@@ -3222,6 +3391,147 @@ def _():
     assert "Say that FIRST" in body, "the near miss isn't said first"
     assert "shop: str" in body and "shop=shop" in body, \
         "a shop they name still goes in as part of the item"
+
+
+# -------------------------------------------------------------- sign-up
+print("new customers")
+
+
+@check("a new person signs up only with a code the office gave, once")
+def _():
+    """David: "how do I add a new customer - can they sign up by
+    themselves?" They couldn't: an unknown number was told to call the
+    office and hung up on. Now the office makes a code and they do the
+    rest by voice - but a code, used once, is the only way in."""
+    import signup
+    inv = signup.make_invite("check: freelancer", 14)
+    phone = "+1 (845) 555-0771"
+    assert len(inv["code"]) == 6 and inv["code"].isdigit(), inv
+    assert signup.check_invite(phone, "111111")["reason"] == "bad_code"
+    assert signup.check_invite(phone, inv["code"])["ok"]
+    assert signup.complete_signup(phone, inv["code"], "yossi", "ben-david",
+                                  "1234")["reason"] == "weak_pin"
+    assert signup.complete_signup(phone, inv["code"], "yossi", "",
+                                  "4729")["reason"] == "name_needed"
+    done = signup.complete_signup(phone, inv["code"], "yossi", "ben-david",
+                                  "4729")
+    assert done["ok"] and done["name"] == "Yossi Ben-David", done
+    assert signup.check_invite("+18455550772", inv["code"])["reason"] == \
+        "bad_code", "one code signed up two people"
+    assert signup.check_invite(phone, "222222")["reason"] == \
+        "already_customer"
+    assert signup.check_invite("", inv["code"])["reason"] == "no_number", \
+        "a hidden number was signed up - we could never know them again"
+    db = main.Session()
+    nums = [p.number for p in db.query(main.PhoneNumber)
+            .filter_by(account_id=done["account_id"]).all()]
+    stored = [r.code_hash for r in db.query(main.Invite).all()]
+    db.close()
+    assert nums == ["+18455550771"], nums
+    assert inv["code"] not in stored, "the invite code was stored as it is"
+    listed = signup.list_invites()
+    assert not any(inv["code"] in str(r) for r in listed), \
+        "the office list shows the code again"
+    assert listed[0]["state"] == "used" and \
+        listed[0]["name"] == "Yossi Ben-David", listed[0]
+
+
+@check("guessing invite codes is stopped")
+def _():
+    import signup
+    phone = "+18455550999"
+    for i in range(signup.TRIES_PER_PHONE):
+        signup.check_invite(phone, f"90000{i}")
+    assert signup.check_invite(phone, "900009")["reason"] == "too_many"
+
+
+@check("nobody gets a PIN anyone could guess - by phone or by hand")
+def _():
+    """The admin form filled in 1234 for every customer made by hand."""
+    import signup
+    for weak in ("1234", "4321", "0000", "7777", "123456", "6789"):
+        assert signup.weak_pin(weak), weak
+    for fine in ("4729", "2580", "1357", "8812"):
+        assert not signup.weak_pin(fine), fine
+    from fastapi.testclient import TestClient
+    cl = TestClient(main.app, raise_server_exceptions=False,
+                    base_url="https://t")
+    cl.post("/admin/login", json={"password": os.environ.get(
+        "ADMIN_PASSWORD", "changeme")})
+    bad = cl.post("/accounts", json={"name": "Weak Pin",
+                                     "phone": "+18455550881", "pin": "1234"})
+    empty = cl.post("/accounts", json={"name": "No Pin",
+                                       "phone": "+18455550882"})
+    good = cl.post("/accounts", json={"name": "Good Pin",
+                                      "phone": "+18455550883", "pin": "4729"})
+    assert bad.status_code == 400, "1234 was accepted"
+    assert empty.status_code == 400, "an account was made with no PIN"
+    assert good.status_code == 200, good.text[:200]
+    import admin_page
+    page = admin_page.ADMIN_HTML
+    assert 'id="k" value="1234"' not in page, "the form still fills in 1234"
+    assert "set themselves up by phone. This is" not in page, \
+        "the panel still says customers set themselves up with no code"
+    assert "makeInvite()" in page and "loadInvites()" in page
+
+
+@check("an unknown caller can sign up, and carries straight on as a customer")
+def _():
+    import asyncio
+    sent = []
+
+    async def fake_post(path, payload, params=None):
+        sent.append(path)
+        if path == "/signup/check":
+            return {"ok": True}
+        return {"ok": True, "account_id": 42, "name": "Yossi Ben-David"}
+
+    async def quiet(*a, **k):
+        return None
+
+    handed = {}
+
+    def on_up(acct):
+        handed["acct"] = acct
+        return agent.Assistant(acct, "+18455550199", 7)
+
+    real_post, real_log = agent.backend_post, agent.log_turn
+    agent.backend_post, agent.log_turn = fake_post, quiet
+    try:
+        s = agent.Signup("+18455550199", 7, on_up)
+
+        async def run():
+            early = await s.create_my_account(None, "Yossi", "Ben-David",
+                                              "4729", "yes")
+            await s.check_invite_code(None, "4 5 3 1 2 8")
+            unsure = await s.create_my_account(None, "Yossi", "Ben-David",
+                                               "4729", "")
+            done = await s.create_my_account(None, "Yossi", "Ben-David",
+                                             "4729", "yes, that's right")
+            return early, unsure, done
+        early, unsure, done = asyncio.run(run())
+    finally:
+        agent.backend_post, agent.log_turn = real_post, real_log
+    assert "invite code first" in early, "signed up with no code checked"
+    assert "/signup/complete" not in sent[:1], sent
+    assert "wait for a clear yes" in unsure, "signed up without a yes"
+    assert isinstance(done, agent.Assistant), \
+        "the full assistant didn't take the call over"
+    assert handed["acct"]["account_id"] == 42
+    assert "4729" not in early + unsure, "the PIN was written into a reply"
+
+    src = io.open("agent.py", encoding="utf-8").read()
+    ep = src[src.index("async def entrypoint("):]
+    assert "Signup(caller, call_id, signed_up)" in ep, \
+        "an unknown number is still just told to call the office"
+    assert "nonlocal account, agent_obj" in ep, \
+        "the log, memory and hang-up would still follow the sign-up agent"
+    i = ep.index("def signed_up(")
+    body = ep[i:i + 1500]
+    assert "fresh._hangup = agent_obj._hangup" in body, \
+        "after signing up, 'goodbye' could never hang up"
+    assert "fresh.verified = True" in body
+    assert ep.index("await session.start(") < ep.index("create_task(watchdog())")
 
 
 # ------------------------------------------------------------- everyday

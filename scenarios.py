@@ -420,6 +420,36 @@ def _():
         f"the live system would open {got!r} for Pomegranate")
 
 
+@scenario("sign-up: an unknown number with a wrong code is turned away",
+          "David - 'how do I add a new customer; can they sign up by "
+          "themselves?' - they can now, with an invite code")
+def _():
+    """Makes nothing: a made-up number and a code nobody was given."""
+    d = call("/signup/check", method="POST",
+             body={"phone": "+15550100123", "code": "000000"})
+    assert d.get("ok") is False and d.get("reason") in (
+        "bad_code", "too_many"), f"a code nobody was given got in: {d}"
+    listed = call("/invites")
+    assert isinstance(listed, list), listed
+
+
+@scenario("orders: ink and covers for a printer aren't priced as the printer",
+          "call 67 - the cheapest 'Epson ET-5850' was $10 of ink bottles "
+          "'for Epson ET-5850'")
+def _():
+    import re as _re
+    d = call("/price", item="Epson ET-5850")
+    if not d.get("offers"):
+        raise SetupProblem("the shopping search returned nothing to judge")
+    for o in d["offers"]:
+        t = (o.get("title") or "").lower()
+        assert not _re.search(r"\bfor\b[^,]{0,25}et.?5850", t), (
+            f"an accessory was priced as the printer: {o['title']} "
+            f"{o['price']}")
+        assert not _re.search(r"\b(compatible|replacement|refill)", t), (
+            f"an accessory was priced as the printer: {o['title']}")
+
+
 @scenario("browser: an address given in full is opened as it was said",
           "call 64 - he asked for khconnect.kioskhut.com, the live system "
           "opened www.khconnect.kioskhut.com.com, and he was told his own "
