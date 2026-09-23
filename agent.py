@@ -2573,6 +2573,30 @@ they go quiet, ask once whether they are still there, then wait.
         return said
 
     @function_tool
+    @auto_report("account")
+    async def add_another_phone(self, context: RunContext):
+        """They want to call from another phone as well - a home line, a
+        new mobile. Gives a one-time code to say when they call from it."""
+        if not self.verified:
+            return "Not verified yet. Ask for the PIN first."
+        try:
+            async with httpx.AsyncClient(timeout=20) as c:
+                r = await c.post(f"{BACKEND}/accounts/link_code", headers=AUTH,
+                                 params={"account_id": self.account_id})
+                d = r.json()
+        except Exception as e:
+            log.error(f"link code failed: {e}")
+            return "Couldn't make the code just now."
+        if not d.get("ok"):
+            return "Couldn't make the code just now."
+        spaced = " ".join(d["code"])
+        return (f"Read this code to them slowly, twice, digit by digit: "
+                f"{spaced}. Tell them: call this same number from the other "
+                f"phone within {d.get('hours', 24)} hours, say you have a "
+                f"code, read it out, and give your PIN - and that phone "
+                f"will know you from then on.")
+
+    @function_tool
     @auto_report("everyday")
     async def weather(self, context: RunContext, place: str = "",
                       days: int = 1):
@@ -3487,24 +3511,32 @@ from secrets_guard import keep_or_blank, BLANKED   # noqa: E402
 
 # ------------------------------------------------------------------ sign-up
 
+# How someone without a code reaches the office - set OFFICE_CONTACT in
+# Railway, e.g. "call Chesky at 347 555 0100". Without it they are told
+# to ask whoever told them about the service, which is at least true.
+OFFICE_CONTACT = os.environ.get("OFFICE_CONTACT", "").strip()
+
 SIGNUP_INSTRUCTIONS = """You answer the phone for a personal assistant
 service. This caller's number is not a customer yet. Speak English,
 warmly and slowly - many callers are elderly.
 
-People join with an invite code from the office: six digits.
+People join with a six-digit code.
 1. If they have a code, ask them to read it out and call check_invite_code
-   with the digits. If they don't have one, say they can get one from the
-   office, then say goodbye and call end_call.
-2. Once the code is good, ask for their first name and their last name.
-   Say the whole name back. If a name could be spelled more than one way,
-   ask them to spell it, and use their spelling exactly.
-3. Ask them to choose a PIN of four digits that they will remember - they
+   with the digits. If they don't have one: {no_code} Then say goodbye and
+   call end_call.
+2. If check_invite_code says the code ADDS THIS PHONE to an existing
+   account, ask for that account's PIN and call confirm_my_pin. Nothing
+   else is needed.
+3. Otherwise, once the code is good, ask for their first name and their
+   last name. Say the whole name back. If a name could be spelled more
+   than one way, ask them to spell it, and use their spelling exactly.
+4. Ask them to choose a PIN of four digits that they will remember - they
    will say it at the start of every call. Say it back digit by digit.
    Not 1234, and not the same digit four times.
-4. Say back the name and the PIN together and ask if that is right. When
+5. Say back the name and the PIN together and ask if that is right. When
    they say yes, call create_my_account with the words they used.
 Never discuss anything else before they are signed up. Never say the
-invite code back to them."""
+code back to them."""
 
 
 class Signup(Agent):
@@ -3514,10 +3546,16 @@ class Signup(Agent):
     existing account."""
 
     def __init__(self, caller_number: str, call_id, on_signed_up):
-        super().__init__(instructions=SIGNUP_INSTRUCTIONS)
+        no_code = (f"say they can get one from the office - {OFFICE_CONTACT}."
+                   if OFFICE_CONTACT else
+                   "say they can get one from whoever told them about this "
+                   "service.")
+        super().__init__(
+            instructions=SIGNUP_INSTRUCTIONS.replace("{no_code}", no_code))
         self.caller_number = caller_number
         self.call_id = call_id
         self.when_signed_up = on_signed_up
+        self.linking = False
         self.code = ""
         # read by the call's watchdog and hang-up, as on Assistant
         self.verified = False
@@ -3538,6 +3576,15 @@ class Signup(Agent):
             log.error(f"invite check failed: {e}")
             return "The check didn't go through. Ask them to try again."
         why = d.get("reason", "")
+        if d.get("ok") and d.get("link"):
+            self.code = digits
+            self.linking = True
+            await log_turn(self.call_id, "tool", "add-a-phone code accepted",
+                           "check_invite_code")
+            first = d.get("first_name") or "their"
+            return (f"This code adds this phone to {first}'s account. Ask "
+                    f"for the PIN of that account, then call confirm_my_pin. "
+                    f"Do not ask for a name or a new PIN.")
         if d.get("ok"):
             self.code = digits
             await log_turn(self.call_id, "tool", "invite code accepted",
@@ -3568,6 +3615,9 @@ class Signup(Agent):
         their name and PIN read back together. caller_said is their yes."""
         if not self.code:
             return "Check their invite code first."
+        if getattr(self, "linking", False):
+            return ("This code adds a phone to an account that already "
+                    "exists - ask for its PIN and call confirm_my_pin.")
         if not said_yes(caller_said):
             return ("Say back their full name and their PIN, digit by "
                     "digit, and wait for a clear yes.")
@@ -3599,6 +3649,41 @@ class Signup(Agent):
         return self.when_signed_up({
             "account_id": d["account_id"], "name": d["name"],
             "phones": [self.caller_number], "gmail": None, "mailboxes": []})
+
+    @function_tool
+    async def confirm_my_pin(self, context: RunContext, pin: str):
+        """Add this phone to their existing account, once they have given
+        that account's PIN. Only after check_invite_code said the code adds
+        this phone."""
+        if not (self.code and getattr(self, "linking", False)):
+            return "Check their code first."
+        try:
+            d = await backend_post("/signup/link", {
+                "phone": self.caller_number, "code": self.code, "pin": pin,
+                "call_id": self.call_id or 0})
+        except Exception as e:
+            log.error(f"adding a phone failed: {e}")
+            return "That didn't go through. Ask them to try again."
+        if not d.get("ok"):
+            return {
+                "wrong_pin": "That PIN doesn't match. Ask them to say it "
+                             "again, slowly.",
+                "too_many": "Too many tries. Say they should call from their "
+                            "usual phone, and say goodbye.",
+                "bad_code": "The code is no longer valid. Say they can ask "
+                            "for a new one from their usual phone.",
+            }.get(d.get("reason", ""), "That didn't work. Ask them to try "
+                                       "again.")
+        await log_turn(self.call_id, "tool", f"phone added for {d['name']}",
+                       "confirm_my_pin")
+        first = (d.get("name") or "").split(" ")[0]
+        return self.when_signed_up(
+            {"account_id": d["account_id"], "name": d["name"],
+             "phones": d.get("phones") or [self.caller_number],
+             "gmail": None, "mailboxes": []},
+            f"In English: say this phone is now on {first}'s account, so "
+            f"from now on they can call from either phone. Then ask what "
+            f"you can do for them today. Two short sentences.")
 
     @function_tool
     async def end_call(self, context: RunContext, reason: str = "finished"):
@@ -3639,7 +3724,7 @@ async def entrypoint(ctx: JobContext):
         vad=silero.VAD.load(),
     )
 
-    def signed_up(new_account: dict):
+    def signed_up(new_account: dict, welcome: str = ""):
         """Someone has just signed up on this call. From here the call is
         theirs. Everything below that follows the caller - the log, their
         memory, the silence watchdog, hanging up, the call record - reads
@@ -3650,11 +3735,12 @@ async def entrypoint(ctx: JobContext):
         fresh.verified = True          # they chose the PIN a moment ago
         fresh._hangup = agent_obj._hangup
         first = (new_account.get("name") or "").split(" ")[0]
-        fresh._welcome = (f"In English: welcome {first} warmly by first "
-                          f"name, say they are all set, and that from now "
-                          f"on they just call this number and say their "
-                          f"PIN. Then ask what you can do for them today. "
-                          f"Two short sentences.")
+        fresh._welcome = welcome or (
+            f"In English: welcome {first} warmly by first name, say they "
+            f"are all set, and that from now on they just call this number "
+            f"and say their PIN. Mention that if they like, you can connect "
+            f"their email so you can read it to them. Then ask what you can "
+            f"do for them today. Three short sentences.")
         agent_obj = fresh
         return fresh
 

@@ -450,6 +450,17 @@ def _():
             f"an accessory was priced as the printer: {o['title']}")
 
 
+@scenario("sign-up: adding a phone needs a real code and the right PIN",
+          "home line and mobile - one account could only ever have one "
+          "number")
+def _():
+    """Makes nothing: a made-up number, a code nobody was given."""
+    d = call("/signup/link", method="POST",
+             body={"phone": "+15550100124", "code": "000000", "pin": "5813"})
+    assert d.get("ok") is False and d.get("reason") in (
+        "bad_code", "too_many"), f"a phone was added with no real code: {d}"
+
+
 @scenario("browser: an address given in full is opened as it was said",
           "call 64 - he asked for khconnect.kioskhut.com, the live system "
           "opened www.khconnect.kioskhut.com.com, and he was told his own "

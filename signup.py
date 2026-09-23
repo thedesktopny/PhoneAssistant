@@ -62,6 +62,42 @@ def make_invite(note: str = "", days: int = 0) -> dict:
     return out
 
 
+LINK_HOURS = int(os.environ.get("LINK_CODE_HOURS", "24"))
+
+
+def make_link_code(account_id: int) -> dict:
+    """A code that adds a phone to THIS account. Asked for from a phone
+    already on the account, so the person asking is already known."""
+    db = Session()
+    acct = db.query(Account).filter_by(id=account_id).first()
+    if not acct:
+        db.close()
+        return {"ok": False, "reason": "no_account"}
+    live = {r.code_hash for r in db.query(Invite)
+            .filter(Invite.used_at.is_(None)).all()}
+    code = ""
+    for _ in range(50):
+        c = f"{secrets.randbelow(1000000):06d}"
+        if c[0] != "0" and _code_hash(c) not in live:
+            code = c
+            break
+    row = Invite(code_hash=_code_hash(code), account_id=acct.id,
+                 note=f"add a phone for {acct.name}"[:120],
+                 expires=datetime.utcnow() + timedelta(hours=LINK_HOURS))
+    db.add(row)
+    db.commit()
+    name = acct.name
+    db.close()
+    record_change(account_id, "account", "phone code made",
+                  "made a code to add another phone to this account")
+    return {"ok": True, "code": code, "hours": LINK_HOURS, "name": name}
+
+
+def _is_link(row) -> bool:
+    """An unused code that already names an account adds a phone to it."""
+    return bool(row and row.account_id and not row.used_at)
+
+
 def list_invites() -> list:
     """What the office can see: who each was for and what became of it.
     Never the code."""
@@ -79,6 +115,8 @@ def list_invites() -> list:
         else:
             state = "waiting"
         out.append({"id": r.id, "note": r.note or "", "state": state,
+                    "kind": "add a phone" if (r.note or "").startswith(
+                        "add a phone") else "new customer",
                     "made": local_str(r.made, "day"),
                     "expires": local_str(r.expires, "day"),
                     "used": local_str(r.used_at, "stamp") if r.used_at
@@ -140,6 +178,12 @@ def check_invite(phone: str, code: str) -> dict:
         emit("signup", _last10(phone)[-4:], "a wrong invite code was tried",
              "warn")
         return {"ok": False, "reason": "bad_code"}
+    if _is_link(row):
+        db = Session()
+        acct = db.query(Account).filter_by(id=row.account_id).first()
+        first = (acct.name or "").split(" ")[0] if acct else ""
+        db.close()
+        return {"ok": True, "link": True, "first_name": first}
     return {"ok": True}
 
 
@@ -182,6 +226,9 @@ def complete_signup(phone: str, code: str, first_name: str, last_name: str,
         db.close()
         return {"ok": False, "reason": "bad_code" if not row
                 else "already_customer"}
+    if _is_link(row):
+        db.close()
+        return {"ok": False, "reason": "link_code"}
     name = f"{first} {last}"
     acct = Account(name=name, pin=p)
     db.add(acct)
@@ -209,3 +256,91 @@ def complete_signup(phone: str, code: str, first_name: str, last_name: str,
     emit("signup", name[:40], f"new customer {name} (account {acct.id}) "
                               f"signed up by phone", "info", acct.id)
     return out
+
+
+def complete_link(phone: str, code: str, pin: str, call_id=None) -> dict:
+    """Add this phone to the account the code names, once the PIN matches.
+    A wrong PIN counts as a wrong guess, so the code can't be used to try
+    PINs until one fits."""
+    checked = check_invite(phone, code)
+    if not checked.get("ok") or not checked.get("link"):
+        return checked if not checked.get("ok") else \
+            {"ok": False, "reason": "not_link"}
+    db = Session()
+    row = _live_invite(db, code)
+    acct = db.query(Account).filter_by(id=row.account_id).first() \
+        if row else None
+    if not acct:
+        db.close()
+        return {"ok": False, "reason": "bad_code"}
+    said = _digits(pin)
+    if not said or not hmac.compare_digest(said, acct.pin or ""):
+        db.close()
+        _connect_too_many("invite:" + _last10(phone), TRIES_PER_PHONE,
+                          add=True)
+        return {"ok": False, "reason": "wrong_pin"}
+    number = ("+1" + _last10(phone) if len(_digits(phone)) <= 11
+              else phone)
+    db.add(PhoneNumber(number=number, account_id=acct.id))
+    if call_id:
+        call = db.query(Call).filter_by(id=call_id).first()
+        if call and not call.account_id:
+            call.account_id = acct.id
+    row.used_at = datetime.utcnow()
+    row.used_name = acct.name
+    row.used_phone = _last10(phone)
+    db.commit()
+    out = {"ok": True, "account_id": acct.id, "name": acct.name,
+           "phones": [p.number for p in db.query(PhoneNumber)
+                      .filter_by(account_id=acct.id).all()]}
+    db.close()
+    record_change(acct.id, "account", "phone added",
+                  f"added the phone ending {_last10(phone)[-4:]} by calling "
+                  f"from it with a one-time code and their PIN",
+                  call_id=call_id)
+    emit("signup", acct.name[:40], f"a phone ending {_last10(phone)[-4:]} "
+                                  f"was added to account {acct.id}", "info",
+         acct.id)
+    return out
+
+
+def add_phone(account_id: int, phone: str) -> dict:
+    """The office adding a number by hand."""
+    if len(_last10(phone)) < 10:
+        return {"ok": False, "reason": "no_number"}
+    db = Session()
+    if _registered(db, phone):
+        db.close()
+        return {"ok": False, "reason": "already_customer"}
+    if not db.query(Account).filter_by(id=account_id).first():
+        db.close()
+        return {"ok": False, "reason": "no_account"}
+    number = "+1" + _last10(phone) if len(_digits(phone)) <= 11 else phone
+    db.add(PhoneNumber(number=number, account_id=account_id))
+    db.commit()
+    db.close()
+    record_change(account_id, "account", "phone added",
+                  f"the office added the phone ending {_last10(phone)[-4:]}")
+    return {"ok": True, "phone": number}
+
+
+def remove_phone(account_id: int, phone: str) -> dict:
+    """The office taking a number off. The last number is never removed -
+    without one they could not be recognised at all."""
+    db = Session()
+    rows = db.query(PhoneNumber).filter_by(account_id=account_id).all()
+    match = [r for r in rows if _last10(r.number) == _last10(phone)]
+    if not match:
+        db.close()
+        return {"ok": False, "reason": "not_found"}
+    if len(rows) <= 1:
+        db.close()
+        return {"ok": False, "reason": "last_number"}
+    for r in match:
+        db.delete(r)
+    db.commit()
+    db.close()
+    record_change(account_id, "account", "phone removed",
+                  f"the office removed the phone ending "
+                  f"{_last10(phone)[-4:]}")
+    return {"ok": True}

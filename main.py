@@ -678,6 +678,46 @@ def signup_complete(b: SignupDone, request: Request):
                                   call_id=b.call_id or None)
 
 
+class LinkDone(BaseModel):
+    phone: str
+    code: str
+    pin: str
+    call_id: int = 0
+
+
+@app.post("/signup/link")
+def signup_link(b: LinkDone, request: Request):
+    """Add the phone they are calling from to their account."""
+    require_auth(request)
+    return signup.complete_link(b.phone, b.code, b.pin,
+                                call_id=b.call_id or None)
+
+
+@app.post("/accounts/link_code")
+def accounts_link_code(request: Request, account_id: int):
+    """A one-time code to add another phone - asked for by voice from a
+    phone already on the account."""
+    require_auth(request)
+    return signup.make_link_code(account_id)
+
+
+class PhoneBody(BaseModel):
+    account_id: int
+    phone: str
+
+
+@app.post("/accounts/phone")
+def accounts_phone_add(b: PhoneBody, request: Request):
+    require_auth(request)
+    return signup.add_phone(b.account_id, b.phone)
+
+
+@app.post("/accounts/phone/remove")
+def accounts_phone_remove(b: PhoneBody, request: Request):
+    require_auth(request)
+    return signup.remove_phone(b.account_id, b.phone)
+
+
 class NewAccount(BaseModel):
     name: str
     phone: str | None = None

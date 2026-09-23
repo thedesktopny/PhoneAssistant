@@ -236,13 +236,15 @@ Waiting for events…</pre>
     <div class="hint">Make a code and give it to them. They call
       +1 484 518 2072 from their own phone, say the code, say their name and
       choose their own PIN &mdash; and they are set up. Each code works once,
-      for 14 days. It is shown only now, so write it down or send it.</div>
+      for 14 days. It is shown only now, so write it down or send it.
+      Customers can add a second phone themselves: they ask for it by voice
+      and get their own code. You can also use "+ Phone" below.</div>
     <label>Who it's for (only you see this)</label>
     <input id="inv_note" placeholder="e.g. Yossi, freelancer">
     <button onclick="makeInvite()">Make a code</button>
     <div id="inv_new" style="font-size:30px;font-weight:bold;
       letter-spacing:6px;margin:10px 0"></div>
-    <table><thead><tr><th>For</th><th>Made</th><th>Status</th>
+    <table><thead><tr><th>For</th><th>Kind</th><th>Made</th><th>Status</th>
     <th>Signed up as</th><th></th></tr></thead>
     <tbody id="inv_rows"><tr><td colspan="5" class="hint">Loading&hellip;</td>
     </tr></tbody></table>
@@ -484,7 +486,9 @@ async function load(){
         '<td><button class="sec" onclick="copyLink('+a.account_id+
         ')">Link</button> '+
         '<button class="sec" onclick="copyLink('+a.account_id+')">Copy</button> '+
-        '<button class="sec" onclick="textLink('+a.account_id+')">Text</button>'+
+        '<button class="sec" onclick="textLink('+a.account_id+')">Text</button> '+
+        '<button class="sec" onclick="addPhone('+a.account_id+')">+ Phone</button> '+
+        '<button class="sec" onclick="removePhone('+a.account_id+')">- Phone</button>'+
         '</td></tr>'; }).join('');
   }catch(e){
     tb.innerHTML='<tr><td colspan="5" class="no">'+esc(e.message)+'</td></tr>'; }
@@ -904,6 +908,29 @@ function freshPin(){
     if(!same && !run) return p;
   }
 }
+async function addPhone(id){
+  const n = prompt('Their other phone number, e.g. +18455551234');
+  if(!n) return;
+  const d = await (await fetch('/accounts/phone', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({account_id: id, phone: n})})).json();
+  document.getElementById('msg').textContent = d.ok ? 'Phone added.' :
+    ({already_customer: 'That number is already on a customer.',
+      no_number: 'That is not a full phone number.'}[d.reason] || 'Not added.');
+  load();
+}
+async function removePhone(id){
+  const n = prompt('Which number should come off?');
+  if(!n) return;
+  const d = await (await fetch('/accounts/phone/remove', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({account_id: id, phone: n})})).json();
+  document.getElementById('msg').textContent = d.ok ? 'Phone removed.' :
+    ({last_number: 'That is their only number - it stays.',
+      not_found: 'That number is not on this customer.'}[d.reason] ||
+     'Not removed.');
+  load();
+}
 async function makeInvite(){
   const box = document.getElementById('inv_new');
   box.textContent = 'Making...';
@@ -927,14 +954,15 @@ async function loadInvites(){
   try{
     const d = await (await fetch('/invites')).json();
     if(!d.length){
-      tb.innerHTML = '<tr><td colspan="5" class="hint">No codes yet.</td></tr>';
+      tb.innerHTML = '<tr><td colspan="6" class="hint">No codes yet.</td></tr>';
       return; }
     tb.innerHTML = d.map(function(i){
       var who = i.name ? (esc(i.name) + ' (' + esc(i.phone.slice(-4)) +
         ', ' + esc(i.used) + ')') : '';
       var btn = i.state === 'waiting' ? '<button class="sec" ' +
         'onclick="cancelInvite(' + i.id + ')">Cancel</button>' : '';
-      return '<tr><td>' + esc(i.note || '-') + '</td><td>' + esc(i.made) +
+      return '<tr><td>' + esc(i.note || '-') + '</td><td>' +
+        esc(i.kind || '') + '</td><td>' + esc(i.made) +
         '</td><td>' + esc(i.state) + (i.state === 'waiting' ?
         ' until ' + esc(i.expires) : '') + '</td><td>' + who + '</td><td>' +
         btn + '</td></tr>'; }).join('');

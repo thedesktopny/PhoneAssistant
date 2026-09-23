@@ -3484,6 +3484,99 @@ def _():
     assert "makeInvite()" in page and "loadInvites()" in page
 
 
+@check("a customer can add a second phone themselves, proved by their PIN")
+def _():
+    """Home line and mobile: one account had one number and nobody could
+    add another. From the phone we know they get a one-time code; they
+    ring from the new phone, say it, and their PIN proves it is them."""
+    import signup
+    inv = signup.make_invite("check: second phone", 14)
+    home = "+1 (845) 555-0661"
+    made = signup.complete_signup(home, inv["code"], "rivka", "stein", "5813")
+    assert made["ok"], made
+    aid = made["account_id"]
+
+    link = signup.make_link_code(aid)
+    mobile = "+18455550662"
+    seen = signup.check_invite(mobile, link["code"])
+    assert seen.get("link") and seen.get("first_name") == "Rivka", seen
+    # a phone code can never make a brand-new account
+    assert signup.complete_signup(mobile, link["code"], "someone", "else",
+                                  "7391")["reason"] == "link_code"
+    assert signup.complete_link(mobile, link["code"], "1111")["reason"] == \
+        "wrong_pin"
+    done = signup.complete_link(mobile, link["code"], "5813")
+    assert done["ok"] and done["account_id"] == aid, done
+    assert "+18455550662" in done["phones"] and "+18455550661" in done["phones"]
+    assert signup.check_invite("+18455550663", link["code"])["reason"] == \
+        "bad_code", "the phone code worked twice"
+    kinds = {i["kind"] for i in signup.list_invites()}
+    assert {"add a phone", "new customer"} <= kinds, kinds
+
+    # the office can add and remove - but never the last number
+    assert signup.add_phone(aid, "+18455550664")["ok"]
+    assert signup.add_phone(aid, "+18455550664")["reason"] == "already_customer"
+    assert signup.remove_phone(aid, "+18455550664")["ok"]
+    assert signup.remove_phone(aid, "+18455550662")["ok"]
+    assert signup.remove_phone(aid, "+18455550661")["reason"] == \
+        "last_number", "a customer was left with no number at all"
+
+
+@check("a caller with a phone code is added by PIN, not signed up again")
+def _():
+    import asyncio
+    sent = []
+
+    async def fake_post(path, payload, params=None):
+        sent.append(path)
+        if path == "/signup/check":
+            return {"ok": True, "link": True, "first_name": "Rivka"}
+        if path == "/signup/link":
+            return ({"ok": False, "reason": "wrong_pin"}
+                    if payload["pin"] != "5813" else
+                    {"ok": True, "account_id": 9, "name": "Rivka Stein",
+                     "phones": ["+18455550661", "+18455550662"]})
+        return {"ok": False}
+
+    async def quiet(*a, **k):
+        return None
+
+    got = {}
+
+    def on_up(acct, welcome=""):
+        got["acct"], got["welcome"] = acct, welcome
+        return agent.Assistant(acct, "+18455550662", 7)
+
+    real_post, real_log = agent.backend_post, agent.log_turn
+    agent.backend_post, agent.log_turn = fake_post, quiet
+    try:
+        s = agent.Signup("+18455550662", 7, on_up)
+
+        async def run():
+            said = await s.check_invite_code(None, "5 5 5 1 2 3")
+            new_acct = await s.create_my_account(None, "X", "Y", "7391", "yes")
+            wrong = await s.confirm_my_pin(None, "1111")
+            right = await s.confirm_my_pin(None, "5813")
+            return said, new_acct, wrong, right
+        said, new_acct, wrong, right = asyncio.run(run())
+    finally:
+        agent.backend_post, agent.log_turn = real_post, real_log
+    assert "adds this phone to Rivka" in said, said
+    assert "already exists" in new_acct and "/signup/complete" not in sent, \
+        "a phone code was used to make a new account"
+    assert "doesn't match" in wrong, f"a wrong PIN was not refused: {wrong}"
+    assert isinstance(right, agent.Assistant),         f"the full assistant didn't take over: {right}"
+    assert "either phone" in got["welcome"], got["welcome"]
+    assert got["acct"]["account_id"] == 9, got
+
+    inst = agent.Assistant({"account_id": 1, "name": "T"}, "+1555", 1)
+    assert "add_another_phone" in [t.id for t in inst.tools],         "a customer can't ask to add a phone"
+    src = io.open("agent.py", encoding="utf-8").read()
+    assert 'os.environ.get("OFFICE_CONTACT"' in src, \
+        "someone with no code is still told to 'call the office' with no way to"
+    assert "their email so you can read it to them" in         src[src.index("def signed_up("):][:1500],         "a new customer isn't told they can connect their email"
+
+
 @check("an unknown caller can sign up, and carries straight on as a customer")
 def _():
     import asyncio
