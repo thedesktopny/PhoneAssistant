@@ -655,10 +655,10 @@ OTHER SITES
   save_site_login. It stays saved - never tell them to give it again
   unless the site itself rejected it. what_is_saved shows which sites;
   forget_site_login removes one. Tell them it is stored encrypted.
-- A password they cannot remember: reset_site_password. The site emails a
-  link to their own address, I read it, and I set and keep a new password.
-  Never ask them to invent one, never read one out, and never ask for the
-  old one.
+- A password they cannot remember: reset_site_password. If the code
+  comes to an email connected here I read it; if it is texted, they read
+  it out (submit_code). I set and keep the new password. Never ask them to
+  invent one, never read one out, and never ask for the old one.
 
 A WEB ADDRESS IS SPELLED BACK BEFORE ANYTHING OPENS IT
 A domain heard on the phone is half-heard: "kioskhut" came back to a
@@ -829,11 +829,12 @@ they go quiet, ask once whether they are still there, then wait.
                     return (f"Say you couldn't open that page: {msg}. You "
                             f"have NOTHING from it - do not describe what "
                             f"it said. Offer to try another source.")
-                if d.get("reason") == "code_to_phone":
-                    return (f"Say that the site will only send the reset by "
-                            f"text message, so it cannot be finished over "
-                            f"the phone by us, and that it is not their "
-                            f"fault. Offer to have the office help. "
+                if d.get("reason") == "link_unreadable":
+                    return (f"Say the site emailed a link rather than a "
+                            f"code, to an address that isn't connected here, "
+                            f"and a link can't be opened over the phone. "
+                            f"Offer to connect that address "
+                            f"(email_connect_code) and try again. "
                             f"Details: {msg}")
                 if d.get("reason") == "no_reset_mail":
                     return (f"Say nothing has arrived from the site yet, "
@@ -841,11 +842,9 @@ they go quiet, ask once whether they are still there, then wait.
                             f"offer to try again in a moment. Details: "
                             f"{msg}")
                 if d.get("reason") == "email_needed":
-                    return (f"Say plainly that you can only do this for an "
-                            f"email address of theirs that is connected "
-                            f"here, because the site emails the reset and "
-                            f"you have to read it. Offer to connect that "
-                            f"address now. Details: {msg}")
+                    return (f"Ask for the email address or username "
+                            f"they use on that site, then start the reset "
+                            f"again with it. Details: {msg}")
                 if d.get("reason") == "no_account":
                     return (f"Say the site says there is no account with "
                             f"that email address, and ask whether they may "
@@ -2128,19 +2127,22 @@ they go quiet, ask once whether they are still there, then wait.
     @auto_report("site_login")
     async def reset_site_password(self, context: RunContext, site: str,
                                   caller_said: str = "", email: str = ""):
-        """Recover a forgotten password on a shop or any other website. Use
-        it when they cannot remember a site's password, or when a sign-in
-        keeps being refused. The site sends a reset to their own email, we
-        read it, set a new password and save it - they never have to know
-        it or say it out loud. Get a clear yes first."""
+        """Recover a forgotten password on a shop or any other website, when
+        they can't remember it or a sign-in keeps being refused. email is
+        the address or username on that account, if they know it. If the
+        site's code goes to an email connected here we read it ourselves;
+        if it is texted, or goes to another address, they read it out and
+        you pass it with submit_code. We set and keep the new password -
+        they never need to know it. Get a clear yes first."""
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
         if not said_yes(caller_said):
-            return (f"Do not start yet. Say: 'I can get their {site} "
-                    f"password reset. {site.title()} will email a link to "
-                    f"their own address, I'll read it, and set a new "
-                    f"password that I keep for them - they will not need to "
-                    f"remember it. Shall I go ahead?' and wait for yes.")
+            return (f"Do not start yet. Say: 'I can reset your {site} "
+                    f"password. {site.title()} will send a code - if it "
+                    f"comes by text message I'll ask you to read it to me. "
+                    f"Then I'll set a new password and keep it for you, so "
+                    f"you won't need to remember it. Shall I go ahead?' and "
+                    f"wait for yes.")
         try:
             async with httpx.AsyncClient(timeout=25) as c:
                 r = await c.post(f"{BACKEND}/jobs/password-reset", headers=AUTH,
@@ -2150,8 +2152,7 @@ they go quiet, ask once whether they are still there, then wait.
                 if r.status_code >= 400:
                     why = (r.json() or {}).get("detail", "")
                     return (f"It could not be started: {why} Say that "
-                            f"plainly, and offer to connect their email "
-                            f"first if that is what is missing.")
+                            f"plainly.")
                 d = r.json()
         except Exception as e:
             log.error(f"password reset failed: {e}")
@@ -2159,11 +2160,13 @@ they go quiet, ask once whether they are still there, then wait.
         self.job_id = d.get("job_id")
         self.job_site = site
         self._watch_job(f"resetting the {site} password")
-        return (f"Resetting their {site} password, using {d.get('email')}. "
-                f"Tell them it takes a minute or two, that they do not need "
-                f"to do anything, and that the new password is kept for them "
-                f"so they never need to remember it. Never ask them to "
-                f"choose one, and never read a password out loud.")
+        how = ("I'll read the code from their email myself"
+               if d.get("mode") == "reads_mailbox" else
+               "if a code is sent, you'll ask them to read it out")
+        return (f"Resetting their {site} password, using {d.get('email')} - "
+                f"{how}. Tell them it takes a minute or two and that the new "
+                f"password is kept for them. Never ask them to choose one, "
+                f"and never read a password out loud.")
 
     @function_tool
     @auto_report("jobs")
@@ -2193,18 +2196,19 @@ they go quiet, ask once whether they are still there, then wait.
 
     @function_tool
     @auto_report("orders")
-    async def find_best_price(self, context: RunContext, item: str):
-        """Where an item can be bought cheapest. Reads the actual shop
-        pages and comes back with prices and shop names. Use whenever they
-        ask what something costs, where to get it, or which is cheapest -
-        not web_search, which only returns summaries."""
+    async def find_best_price(self, context: RunContext, item: str,
+                              shop: str = ""):
+        """Where an item can be bought cheapest, with prices and shop
+        names. item is just the thing ("Epson ET-5850"); if they name a
+        shop ("from B&H"), put it in shop. Use whenever they ask what
+        something costs or where to get it - not web_search."""
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
         # The quick way first: the shopping results carry a price per shop,
         # the same block Google puts at the top of its page. Reading four
         # shop pages for the same answer took 45 seconds of a phone call.
         try:
-            quick = await backend_get("/price", item=item,
+            quick = await backend_get("/price", item=item, shop=shop,
                                       account_id=self.account_id)
         except Exception as e:
             log.error(f"price lookup failed: {e}")
@@ -2218,12 +2222,27 @@ they go quiet, ask once whether they are still there, then wait.
             lines = [f"{o['shop'] or 'unknown shop'}: {o['price']}"
                      + (f" ({o['delivery']})" if o.get("delivery") else "")
                      + f" - {o['title'][:70]}" for o in offers[:6]]
-            return ("Prices found, cheapest first:\n" + "\n".join(lines)
-                    + "\nRead out the cheapest two or three with the shop "
-                      "names, say these come from shopping listings, and "
-                      "ask if they want you to open one and check it "
-                      "properly before ordering. If they ask for more "
-                      "detail on one, use look_it_up or do_on_website.")
+            head = "Prices found, cheapest first:"
+            if not quick.get("exact"):
+                # The listings are near misses. Reading them out as the
+                # thing they asked for is how the wrong shoe gets bought.
+                head = ("NONE of these is exactly what they asked for - "
+                        "they are the closest listings. Say that FIRST, "
+                        "then the prices:")
+            asked = quick.get("shop") or ""
+            there = quick.get("at_shop") or []
+            if asked and there:
+                head += (f"\nAt {asked}, which they asked about: "
+                         f"{there[0]['price']} ({there[0]['title'][:60]}).")
+            elif asked:
+                head += (f"\n{asked} is not among the listings - say so. "
+                         f"You can still check {asked} itself with "
+                         f"do_on_website, site=\"{asked}\".")
+            return (head + "\n" + "\n".join(lines)
+                    + "\nSay these come from shopping listings, and ask if "
+                      "they want you to open the shop and check it properly "
+                      "before ordering (do_on_website with that shop's "
+                      "name as site).")
         # nothing in the shopping results - fall back to reading pages
         try:
             async with httpx.AsyncClient(timeout=25) as c:

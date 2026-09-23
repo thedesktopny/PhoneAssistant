@@ -3083,6 +3083,82 @@ def _():
         "a runner is still building an address by hand instead of site_url()"
 
 
+@check("a shop's name becomes the shop's real address")
+def _():
+    """Call 65: "from B&H" opened https://www.b&h.com, which is not a
+    website, and the caller was told B&H "isn't reachable"."""
+    import browser
+    for said, want in (("B&H", "https://www.bhphotovideo.com"),
+                       ("b and h", "https://www.bhphotovideo.com"),
+                       ("B&H Photo-Video-Audio", "https://www.bhphotovideo.com"),
+                       ("Trader Joe's", "https://www.traderjoes.com"),
+                       ("Barnes & Noble", "https://www.barnesandnoble.com"),
+                       ("Home Depot", "https://www.homedepot.com"),
+                       ("Lowe's website", "https://www.lowes.com")):
+        got = browser.site_url(said)
+        assert got == want, f"{said!r} -> {got!r}, wanted {want!r}"
+    for said in ("B&H", "Macy's", "Stop & Shop", "Dick's", "A&P", "Joe's Deli",
+                 "some shop", "AT&T"):
+        host = browser.site_url(said).split("/")[2]
+        assert not any(ch in host for ch in "&' "), \
+            f"{said!r} became {host!r} - that can't be a web address"
+
+
+@check("the shop isn't part of the item's name, and a model number decides")
+def _():
+    """Call 65: "Epson ET-5850 printer from B&H" was reported as "not that
+    exact one" - "from" and "b&h" were counted as words of the printer's
+    name, and ET-5850 was split into "et" (dropped) and "5850". These are
+    the three real listings that came back."""
+    import search
+    real = [
+        {"source": "AllPrintHeads.com", "price": "$395.00",
+         "title": "Multifunction Printer Epson EcoTank ET-5850 25 ppm WiFi "
+                  "Black"},
+        {"source": "B&H Photo-Video-Audio", "price": "$699.99",
+         "title": "Epson EcoTank Pro All-in-One Supertank Printer ET-5850"},
+        {"source": "Sears", "price": "$1,438.44",
+         "title": "Epson EcoTank Pro ET-5850 All-in-One Cartridge-Free "
+                  "Supertank"},
+        {"source": "Somewhere", "price": "$299.00",
+         "title": "Epson EcoTank ET-4850 All-in-One Printer"},
+    ]
+    asked = []
+
+    def fake(q):
+        asked.append(q)
+        return {"shopping": real}
+
+    undo_key = everywhere("SERPER_API_KEY", "x")
+    undo_fn = everywhere("_serper_shopping", fake)
+    try:
+        d = search.shopping_prices("Epson ET-5850 printer from B&H")
+    finally:
+        undo_fn()
+        undo_key()
+    assert asked == ["Epson ET-5850 printer"], \
+        f"the shop went into the search as part of the item: {asked}"
+    assert d["exact"], f"the exact printer was called a near miss: {d['answer']}"
+    assert "could not find that exact" not in d["answer"], d["answer"]
+    assert not any("4850" in o["title"] for o in d["offers"]), \
+        "a different model was priced as the one they asked for"
+    assert d["shop"] == "B&H", d["shop"]
+    assert d["at_shop"] and d["at_shop"][0]["price"] == "$699.99", d["at_shop"]
+
+
+@check("the voice side says 'not that exact one' whenever it is true")
+def _():
+    """The backend said "I could not find that exact one"; the voice tool
+    built its own sentence from the prices and dropped it."""
+    src = io.open("agent.py", encoding="utf-8").read()
+    i = src.index("async def find_best_price(")
+    body = src[i:src.index("@function_tool", i)]
+    assert 'quick.get("exact")' in body, "whether it's exact is never read"
+    assert "Say that FIRST" in body, "the near miss isn't said first"
+    assert "shop: str" in body and "shop=shop" in body, \
+        "a shop they name still goes in as part of the item"
+
+
 # ------------------------------------------------------------- everyday
 print("everyday questions")
 
@@ -3471,28 +3547,24 @@ def _():
 print("password reset")
 
 
-@check("a password is only reset on a mailbox they have connected")
+@check("a reset with no address or username asks, before a browser opens")
 def _():
-    """The whole thing rests on reading the mail the site sends. If the
-    address is not one this customer has connected, we cannot read it -
-    and resetting it would be changing the password on an account whose
-    mail belongs to someone else. It must stop before a browser opens."""
+    """With nothing to type into "who is this account for", there is
+    nothing to do - and nothing worth spending a browser on."""
     opened = []
 
     def no_browser(*a, **k):
         opened.append(a)
-        raise AssertionError("a browser was opened for an unreadable mailbox")
+        raise AssertionError("a browser was opened with no account to reset")
 
     import json as _json
-    undo_boxes = everywhere("list_mailboxes",
-                            lambda aid: [{"email": "theirs@gmail.com"}])
+    undo_boxes = everywhere("list_mailboxes", lambda aid: [])
+    undo_logins = everywhere("list_site_logins", lambda aid: [])
     undo_open = everywhere("_open_with_session", no_browser)
     try:
         db = main.Session()
         job = main.Job(account_id=1, kind="password_reset", site="lowes",
-                       state="queued",
-                       payload=_json.dumps(
-                           {"email": "someone.else@gmail.com"}))
+                       state="queued", payload=_json.dumps({}))
         db.add(job)
         db.commit()
         db.refresh(job)
@@ -3505,10 +3577,47 @@ def _():
         db.close()
     finally:
         undo_open()
+        undo_logins()
         undo_boxes()
     assert not opened, "it opened a browser anyway"
-    assert state == "failed", f"state was {state!r}"
-    assert reason == "email_needed", f"reason was {reason!r}"
+    assert state == "failed" and reason == "email_needed", (state, reason)
+
+
+@check("an address we can't read is not refused - the caller reads the code")
+def _():
+    """David: "if it works with a text message on the phone, it shouldn't
+    be refused - we just don't have the email." The site only sends its
+    code to the real owner, so the site is the lock, not us. Refusing
+    every unconnected address protected nothing."""
+    from fastapi.testclient import TestClient
+    cl = TestClient(main.app, raise_server_exceptions=False,
+                    base_url="https://t")
+    cl.post("/admin/login", json={"password": os.environ.get(
+        "ADMIN_PASSWORD", "changeme")})
+    undo = everywhere("list_mailboxes",
+                      lambda aid: [{"email": "theirs@gmail.com"}])
+    try:
+        other = cl.post("/jobs/password-reset", params={
+            "account_id": 1, "site": "lowes", "check_only": 1,
+            "email": "old.address@yahoo.com"})
+        mine = cl.post("/jobs/password-reset", params={
+            "account_id": 1, "site": "lowes", "check_only": 1,
+            "email": "Theirs@Gmail.com"})
+    finally:
+        undo()
+    assert other.status_code == 200, f"refused: {other.text[:200]}"
+    assert other.json()["mode"] == "caller_reads_code", other.json()
+    assert mine.json()["mode"] == "reads_mailbox", mine.json()
+
+    src = source()
+    k = src.index("def _run_reset(")
+    body = src[k:k + 30000]
+    assert 'reason="code_to_phone"' not in body, \
+        "a texted code still ends the reset instead of asking the caller"
+    assert '"needs_code"' in body and "ask_caller(" in body, \
+        "the reset never hands a code request to the caller"
+    assert "code_tries >= 3" in body, \
+        "one misheard digit would end the reset - give three goes"
 
 
 @check("the new password never reaches a log, a job message or the model")
@@ -3734,7 +3843,8 @@ def _():
     for r in reasons:
         assert r in agent_src or r in generic, \
             f"nothing in agent.py knows what to say about {r!r}"
-    for must in ("email_needed", "no_reset_mail", "code_to_phone"):
+    for must in ("email_needed", "no_reset_mail", "link_unreadable",
+                 "no_code", "bad_code"):
         assert must in reasons, f"{must} is never reported"
 
 

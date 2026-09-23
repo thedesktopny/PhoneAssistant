@@ -1868,32 +1868,38 @@ def job_site_login(request: Request, account_id: int, site: str,
 
 @app.post("/jobs/password-reset")
 def job_password_reset(request: Request, account_id: int, site: str,
-                       email: str = "", call_id: int = 0):
+                       email: str = "", call_id: int = 0,
+                       check_only: int = 0):
     """Recover a forgotten password on a site.
 
-    The email address must be one the customer has connected, because the
-    whole thing rests on reading the mail the site sends. Checked here as
-    well as in the runner: a route is the door, and the door should not
-    open onto somebody else's mailbox."""
+    Any address or username on the account will do. The site only sends
+    its code to the real owner, so it is the site, not this door, that
+    stops a stranger: if the address is a mailbox they have connected we
+    read the code ourselves, and if not, they read it out. check_only says
+    which of the two it would be without starting anything."""
     require_auth(request)
-    if not BROWSERBASE_API_KEY:
-        raise HTTPException(400, "Browserbase isn't configured.")
     if is_blocked(site):
         raise HTTPException(400, BLOCKED_REPLY)
-    boxes = list_mailboxes(account_id)
-    if not boxes:
-        raise HTTPException(
-            400, "They have no mailbox connected, so the reset mail could "
-                 "not be read. Connect their email first.")
-    want = (email or "").strip().lower()
+    connected = [(b.get("email") or "").lower()
+                 for b in list_mailboxes(account_id)]
+    want = (email or "").strip()
     if not want:
-        want = (boxes[0].get("email") or "").lower()
-    if want not in [(b.get("email") or "").lower() for b in boxes]:
+        saved = next((r for r in list_site_logins(account_id)
+                      if r.get("site") == site.lower()), {})
+        want = saved.get("username") or (connected[0] if connected else "")
+    if not want:
         raise HTTPException(
-            400, f"{want} is not one of their connected mailboxes.")
+            400, "We don't know the email address or username on that "
+                 "account - ask them for it.")
+    mode = ("reads_mailbox" if want.lower() in connected
+            else "caller_reads_code")
+    if check_only:
+        return {"email": want, "mode": mode}
+    if not BROWSERBASE_API_KEY:
+        raise HTTPException(400, "Browserbase isn't configured.")
     jid = start_job(account_id, "password_reset", site,
                     call_id=call_id or None, payload={"email": want})
-    return {"job_id": jid, "state": "queued", "email": want}
+    return {"job_id": jid, "state": "queued", "email": want, "mode": mode}
 
 
 @app.post("/jobs/site-orders")
@@ -3244,11 +3250,12 @@ def ask_ai(request: Request, q: str, model: str = ""):
 
 
 @app.get("/price")
-def price_now(request: Request, item: str, account_id: int = 0):
+def price_now(request: Request, item: str, account_id: int = 0,
+              shop: str = ""):
     """Prices across shops in about two seconds, the way the top of a
     Google page shows them. No browser, so nothing can refuse us."""
     require_auth(request)
-    out = shopping_prices(item)
+    out = shopping_prices(item, shop=shop)
     if out.get("offers"):
         emit("price", item[:40],
              f"{len(out['offers'])} shops: {out.get('answer', '')[:120]}",

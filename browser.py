@@ -1489,6 +1489,36 @@ def _run_site_login(jid: int, account_id: int, site: str):
         _JOBS.pop(jid, None)
 
 
+# Shops whose name is not their address. Said on the phone as a name,
+# typed into an address bar as the name, they go nowhere: call 65 opened
+# https://www.b&h.com and was told the site "isn't reachable".
+SHOP_DOMAINS = {
+    "b&h": "bhphotovideo.com", "b & h": "bhphotovideo.com",
+    "b and h": "bhphotovideo.com", "bh": "bhphotovideo.com",
+    "b&h photo": "bhphotovideo.com", "bh photo": "bhphotovideo.com",
+    "b&h photo video": "bhphotovideo.com",
+    "b&h photo-video-audio": "bhphotovideo.com",
+    "at&t": "att.com", "h&m": "hm.com", "p.c. richard": "pcrichard.com",
+    "pc richard": "pcrichard.com", "pc richard and son": "pcrichard.com",
+    "dick's": "dickssportinggoods.com", "dicks": "dickssportinggoods.com",
+    "dick's sporting goods": "dickssportinggoods.com",
+    "the home depot": "homedepot.com", "home depot": "homedepot.com",
+    "sam's club": "samsclub.com", "sams club": "samsclub.com",
+    "bj's": "bjs.com", "bjs": "bjs.com",
+    "stop & shop": "stopandshop.com", "stop and shop": "stopandshop.com",
+    "micro center": "microcenter.com", "best buy": "bestbuy.com",
+    "bed bath & beyond": "bedbathandbeyond.com",
+    "barnes & noble": "barnesandnoble.com",
+    "crate & barrel": "crateandbarrel.com",
+}
+
+
+def _shop_key(name: str) -> str:
+    t = " ".join((name or "").lower().replace("\u2019", "'").split())
+    return _re_scrub.sub(r"\s+(website|web site|site|store|online|shop)$",
+                         "", t).strip()
+
+
 def site_url(site: str, path: str = "") -> str:
     """A web address from whatever the caller called the site.
 
@@ -1505,11 +1535,21 @@ def site_url(site: str, path: str = "") -> str:
         return ""
     if "://" in s:
         return s + path
+    known = SHOP_DOMAINS.get(_shop_key(s))
+    if known:
+        return "https://www." + known + path
     bits = s.split("/", 1)
     host = bits[0].lower()
     rest = ("/" + bits[1] if len(bits) > 1 else "") + path
-    if "." in host:
+    if "." in host and " " not in host:
         return "https://" + host + rest
+    # A name, not an address: "Trader Joe's" is traderjoes.com, "Barnes &
+    # Noble" is barnesandnoble.com. Nothing that can't be in an address
+    # is left in it.
+    host = _shop_key(host).replace("&", " and ").replace("'", "")
+    host = _re_scrub.sub(r"[^a-z0-9-]", "", host)
+    if not host:
+        return ""
     return "https://www." + host + ".com" + rest
 
 
@@ -3177,15 +3217,6 @@ PW_CHANGED = _re_scrub.compile(
     r"your new password|password change (complete|successful)|"
     r"you can now sign in|sign in with your new password)")
 
-# Wording that means the site is only willing to text them. The caller
-# may well have no texts at all, and we cannot read them if they do.
-PW_SAYS_MAIL = _re_scrub.compile(r"(?i)(e.?mail|inbox)")
-
-PW_BY_PHONE = _re_scrub.compile(
-    r"(?i)((text|sms|message) (message )?(sent|to your|has been sent)|"
-    r"we (sent|texted|will text)[^.]{0,40}(phone|mobile|number)|"
-    r"enter the code sent to [^.]{0,30}\d{2}|verify (your )?phone)")
-
 RESET_SYSTEM = """You are recovering a forgotten password on a website for
 a customer who is on the phone with us and has asked for this. You get the
 page text and numbered interactive elements. Reply with ONE JSON action and
@@ -3197,7 +3228,7 @@ Actions:
 {"action":"goto","url":"https://...","why":"..."}
 {"action":"scroll","why":"..."}
 {"action":"wait","why":"..."}
-{"action":"sent","how":"email|phone|unclear","why":"..."}
+{"action":"sent","how":"email|phone|unclear","expects":"code|link","why":"..."}
 {"action":"changed","answer":"...","why":"..."}
 {"action":"give_up","answer":"...","why":"..."}
 
@@ -3208,7 +3239,8 @@ never see them:
   ACCOUNT_EMAIL   - the email address on the account
   NEW_PASSWORD    - the new password. Type it into the new-password box AND
                     into any confirm-password box.
-  MAIL_CODE       - a code the site emailed, once we have read it
+  MAIL_CODE       - a code the site sent, by email or text, once we
+                    have it
   SAVED_USERNAME  - their username, if one is saved
 
 What happens in what order:
@@ -3216,11 +3248,13 @@ What happens in what order:
    password" link, usually on the sign-in page. If you cannot see one, use
    goto on the site's own sign-in page first.
 2. Type ACCOUNT_EMAIL into the box that asks who the account belongs to,
-   and submit it. If it insists on a phone number instead, give_up and say
-   so.
-3. When the page says it has sent something, reply with "sent" and say how
-   it was sent - email, phone, or unclear. Then stop. We read their email
-   ourselves and will bring you back to the page that the link opens.
+   and submit it. If it offers to send a code by email or by text, either
+   is fine. If it demands a phone number typed in, give_up and say so.
+3. When the page says it has sent something, reply with "sent": say how
+   it was sent (email, phone, or unclear), and whether the page now asks
+   for a code to be typed in (expects "code") or says to click a link in
+   the email (expects "link"). Then stop. We get the code or the link and
+   bring you back.
 4. On the page that sets a new password, type NEW_PASSWORD into the new
    password box and into the confirm box, then submit.
 5. When the site confirms the password is changed, reply "changed" with
@@ -3259,39 +3293,52 @@ def _run_reset(jid: int, account_id: int, site: str):
     call_id = row.call_id if row else None
     db.close()
 
-    email = (payload.get("email") or "").strip()
+    # Only the username, and only from the list that never opens the
+    # vault: replacing a password is no reason to decrypt the old one.
+    saved = next((r for r in list_site_logins(account_id)
+                  if r.get("site") == site.lower()), {})
+    email = (payload.get("email") or saved.get("username") or "").strip()
     if not email:
-        _job_set(jid, "failed", "No email address for the account.",
-                 reason="email_needed")
+        _job_set(jid, "failed",
+                 "We don't know the email address or username on that "
+                 "account. Ask them for it.", reason="email_needed")
         return
 
-    # The one hard rule. We can only reset a password if we can read the
-    # mail the site sends, and the only mailbox we may read is one this
-    # customer has connected themselves. Anything else would be resetting
-    # a password on somebody else's account.
+    # Who can see the code decides how this finishes - not whether it is
+    # allowed. The site only ever sends the code to the account's real
+    # owner, so a caller who can't see it gets nowhere and nothing
+    # changes. If the address is a mailbox they have connected, we read
+    # the mail ourselves; if not - a text message, an address that isn't
+    # connected here - they read the code out, like any sign-in code.
     boxes = []
     try:
         boxes = list_mailboxes(account_id)
     except Exception as e:
         emit("reset", f"job {jid}", f"could not list mailboxes: {e}", "warn",
              account_id)
-    match = next((b for b in boxes
-                  if (b.get("email") or "").lower() == email.lower()), None)
-    if not match:
-        _job_set(jid, "failed",
-                 f"{email} is not one of the mailboxes they have connected, "
-                 f"so the reset mail could not be read. Connect that "
-                 f"address first, or use one that is already connected.",
-                 reason="email_needed")
-        return
+    can_read = any((x.get("email") or "").lower() == email.lower()
+                   for x in boxes)
     # pick_connection matches an address exactly, so the mailbox we read
     # is the one the site is mailing and never a sibling account.
-    which = email
+    which = email if can_read else ""
+    code_tries = 0            # codes the site has refused
 
-    # Only the username, and only from the list that never opens the
-    # vault: replacing a password is no reason to decrypt the old one.
-    saved = next((r for r in list_site_logins(account_id)
-                  if r.get("site") == site.lower()), {})
+    def ask_caller(note: str) -> str:
+        """Wait for the caller to read a code out. The same hand-off as a
+        sign-in code: the voice side hears needs_code and asks."""
+        _job_set(jid, "needs_code", note)
+        waited = 0
+        while waited < 240:
+            time.sleep(3)
+            waited += 3
+            job = _JOBS.get(jid) or {}
+            if job.get("cancelled"):
+                return ""
+            if job.get("code"):
+                code = job["code"]
+                _JOBS[jid]["code"] = None
+                return code
+        return ""
     new_pw = _new_password()
     tries = 0                 # password shapes tried
     values = {"ACCOUNT_EMAIL": email, "NEW_PASSWORD": new_pw,
@@ -3373,18 +3420,6 @@ def _run_reset(jid: int, account_id: int, site: str):
                              reason=block_reason(wall["kind"]))
                     break
 
-                # The site only wants to text them. We cannot read texts,
-                # and many callers have none.
-                if stage == "asking" and PW_BY_PHONE.search(text or "") \
-                        and not PW_SAYS_MAIL.search(text or ""):
-                    _job_set(jid, "failed",
-                             f"{site.title()} will only send the reset by "
-                             f"text message, which we cannot read. They "
-                             f"would need someone with the phone in front "
-                             f"of them to finish it.",
-                             reason="code_to_phone")
-                    break
-
                 shot = page_shot(page) if BROWSER_VISION else ""
                 act = decide(page_url(page), text, items, history, shot)
                 a = act.get("action")
@@ -3401,33 +3436,79 @@ def _run_reset(jid: int, account_id: int, site: str):
 
                 if a == "sent":
                     how = (act.get("how") or "unclear").lower()
-                    if how == "phone":
-                        _job_set(jid, "failed",
-                                 f"{site.title()} sent the reset to their "
-                                 f"phone as a text, which we cannot read.",
-                                 reason="code_to_phone")
-                        break
-                    stage = "waiting_mail"
-                    _job_set(jid, "working",
-                             f"{site.title()} has sent the reset. Looking in "
-                             f"their email for it.")
+                    expects = (act.get("expects") or "code").lower()
+                    where = code_destination(text or "") or ""
                     got = {}
-                    for _ in range(10):            # up to ~90 seconds
-                        time.sleep(9)
-                        if (_JOBS.get(jid) or {}).get("cancelled"):
-                            break
-                        got = reset_from_email(account_id, site, mailed_at
-                                               or int(time.time() * 1000)
-                                               - 300000, which) or {}
-                        if got.get("link") or got.get("code"):
-                            break
+                    if how != "phone" and can_read:
+                        stage = "waiting_mail"
+                        _job_set(jid, "working",
+                                 f"{site.title()} has sent the reset. "
+                                 f"Looking in their email for it.")
+                        for _ in range(10):            # up to ~90 seconds
+                            time.sleep(9)
+                            if (_JOBS.get(jid) or {}).get("cancelled"):
+                                break
+                            got = reset_from_email(
+                                account_id, site, mailed_at
+                                or int(time.time() * 1000) - 300000,
+                                which) or {}
+                            if got.get("link") or got.get("code"):
+                                break
                     if not (got.get("link") or got.get("code")):
-                        _job_set(jid, "failed",
-                                 f"Nothing arrived in their {email} inbox "
-                                 f"from {site} within a minute and a half. "
-                                 f"It may still turn up - we can try again.",
-                                 reason="no_reset_mail")
-                        break
+                        # We can't read it - a text, or an address that
+                        # isn't connected here - or it hasn't come. A code
+                        # the caller can read out. A link they can't: a
+                        # web address is not something to spell down a
+                        # phone line, and they have nothing to open it on.
+                        if expects == "link" and how != "phone":
+                            if can_read:
+                                _job_set(jid, "failed",
+                                         f"{site.title()} said it emailed a "
+                                         f"link to {email}, but nothing "
+                                         f"arrived within a minute and a "
+                                         f"half. It may still turn up - we "
+                                         f"can try again.",
+                                         reason="no_reset_mail")
+                            else:
+                                _job_set(jid, "failed",
+                                         f"{site.title()} emailed a link to "
+                                         f"{email}, which isn't connected "
+                                         f"here, and a link can't be "
+                                         f"followed over the phone. "
+                                         f"Connecting that address would let "
+                                         f"us finish it.",
+                                         reason="link_unreadable")
+                            break
+                        if how == "phone":
+                            note = (f"{site.title()} sent a code "
+                                    + (where or "by text message to their "
+                                                "phone")
+                                    + ". Ask them to read it out, digit by "
+                                      "digit.")
+                        elif can_read:
+                            note = (f"Nothing from {site.title()} has "
+                                    f"reached their {email} inbox yet. If "
+                                    f"they can see a code from "
+                                    f"{site.title()} anywhere - a text "
+                                    f"message too - ask them to read it out.")
+                        else:
+                            note = (f"{site.title()} sent a code to {email}. "
+                                    f"That address isn't connected here, so "
+                                    f"ask whether they, or someone with "
+                                    f"them, can read it out, digit by digit.")
+                        stage = "setting"
+                        code = ask_caller(note)
+                        if not code:
+                            _job_set(jid, "failed",
+                                     "Timed out waiting for the code.",
+                                     reason="no_code")
+                            break
+                        values["MAIL_CODE"] = code
+                        emit("reset", site, "the caller read out the reset "
+                                            "code", "info", account_id)
+                        history.append("they read out the code - type "
+                                       "MAIL_CODE where it is asked for")
+                        continue
                     emit("reset", site,
                          "read the reset mail from their own inbox "
                          + ("(link)" if got.get("link") else "(code)"),
@@ -3545,6 +3626,32 @@ def _run_reset(jid: int, account_id: int, site: str):
                 except Exception as e:
                     history.append(f"{a} failed: {str(e)[:90]}")
                     continue
+
+                # A code the site refused: ask for the newest one, three
+                # goes in all, as a sign-in does. A misheard digit is the
+                # usual reason, and one wrong code used to end the job.
+                if a == "type" and act.get("text") == "MAIL_CODE":
+                    settle(page, 2500)
+                    if CODE_BAD.search(page_text(page, 1500) or ""):
+                        code_tries += 1
+                        if code_tries >= 3:
+                            _job_set(jid, "failed",
+                                     f"{site.title()} refused the code three "
+                                     f"times.", reason="bad_code")
+                            break
+                        again = ask_caller(
+                            f"{site.title()} didn't accept that code. Ask "
+                            f"them to read the newest code again, digit by "
+                            f"digit.")
+                        if not again:
+                            _job_set(jid, "failed",
+                                     "Timed out waiting for the code.",
+                                     reason="no_code")
+                            break
+                        values["MAIL_CODE"] = again
+                        history.append("that code was refused - they read "
+                                       "a new one; type MAIL_CODE again")
+                        continue
 
                 # Did the site refuse the password we chose? Try a shape
                 # it is more likely to accept rather than losing the job:

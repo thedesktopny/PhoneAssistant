@@ -94,7 +94,32 @@ def _money(text: str) -> float:
         return 9e9
 
 
-def shopping_prices(item: str, limit: int = 8) -> dict:
+# "Epson ET-5850 printer from B&H": where to buy it is not part of its
+# name. Counted as words of the title, "from" and "b&h" made the exact
+# printer read as a near miss (call 65).
+SHOP_PHRASE = _re_scrub.compile(
+    r"(?i)\s+(?:from|at)\s+(?:the\s+)?([a-z0-9&'.\- ]{2,40}?)"
+    r"(?:\s+(?:website|web site|site|store|online))?\s*$")
+# A model number is the strongest thing a title can agree on: ET-5850,
+# WH-1000XM5, 55UQ7590. Split on the hyphen, "et" was too short to count
+# and the printer's own name did the least work of any word.
+MODEL = _re_scrub.compile(r"(?i)\b(?=[a-z0-9-]*\d)(?=[a-z0-9-]*[a-z])"
+                          r"[a-z0-9]+(?:-[a-z0-9]+)*\b")
+
+
+def split_shop(item: str):
+    """"Epson ET-5850 printer from B&H" -> ("Epson ET-5850 printer", "B&H")."""
+    m = SHOP_PHRASE.search(item or "")
+    if not m:
+        return (item or "").strip(), ""
+    return item[:m.start()].strip(), m.group(1).strip()
+
+
+def _squash(text: str) -> str:
+    return _re_scrub.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+def shopping_prices(item: str, limit: int = 8, shop: str = "") -> dict:
     """What the shops are asking, from the search provider's shopping
     results - the same block Google puts at the top of the page. No
     browser, so no shop can refuse us, and it takes about two seconds."""
@@ -102,6 +127,8 @@ def shopping_prices(item: str, limit: int = 8) -> dict:
         return {"blocked": True, "answer": BLOCKED_REPLY, "offers": []}
     if not SERPER_API_KEY:
         return {"offers": [], "error": "shopping search isn't configured"}
+    item, said_shop = split_shop(item)
+    shop = (shop or said_shop).strip()
     try:
         d = _serper_shopping(item)
     except Exception as e:
@@ -131,8 +158,12 @@ def shopping_prices(item: str, limit: int = 8) -> dict:
              if len(w) > 2]
     wanted = [w for w in words if w not in GENERIC] or words
 
+    models = [_squash(m) for m in MODEL.findall(item) if len(_squash(m)) >= 4]
+
     def _fits(title: str) -> float:
         low = (title or "").lower()
+        if models and all(m in _squash(title) for m in models):
+            return 1.0
         if not wanted:
             return 1.0
         return sum(1 for w in wanted if w in low) / len(wanted)
@@ -171,8 +202,15 @@ def shopping_prices(item: str, limit: int = 8) -> dict:
         # listings came back, but for other things entirely. Saying
         # nothing here is how the wrong shoe gets priced as theirs.
         said = ("Nothing in the shopping listings is that exact item.")
+    at_shop = []
+    if shop:
+        want_shop = _squash(shop.replace("&", "and"))
+        at_shop = [o for o in kept
+                   if want_shop and (want_shop in _squash(
+                       (o["shop"] or "").replace("&", "and"))
+                       or _squash(o["shop"]).startswith(_squash(shop)))]
     return {"offers": kept, "answer": said, "checked": len(offers),
-            "exact": same_thing}
+            "exact": same_thing, "shop": shop, "at_shop": at_shop}
 
 
 def tool_web_search(query: str, near: str = "") -> dict:

@@ -394,6 +394,21 @@ def _():
         assert key in ("candle_minutes", "havdalah", "shema"), d
 
 
+@scenario("orders: 'from B&H' goes to B&H, and the exact item is exact",
+          "call 65 - the browser opened www.b&h.com (not a website), and "
+          "the exact Epson ET-5850 was called 'not that exact one'")
+def _():
+    got = call("/browser/address", site="B&H").get("url")
+    assert got == "https://www.bhphotovideo.com", \
+        f"the live system would open {got!r} for B&H"
+    d = call("/price", item="Epson ET-5850 printer from B&H")
+    if not d.get("offers"):
+        raise SetupProblem("the shopping search returned nothing to judge")
+    assert d.get("exact"), (
+        f"the exact printer is still called a near miss: {d.get('answer')}")
+    assert d.get("shop") == "B&H", f"the shop wasn't separated: {d}"
+
+
 @scenario("browser: an address given in full is opened as it was said",
           "call 64 - he asked for khconnect.kioskhut.com, the live system "
           "opened www.khconnect.kioskhut.com.com, and he was told his own "
@@ -411,28 +426,18 @@ def _():
         assert got == want, f"for {said!r} the live system opens {got!r}"
 
 
-@scenario("reset: a password is never reset on a mailbox we cannot read",
-          "built with the feature - a reset on an address we cannot read "
-          "would be changing the password on somebody else's account")
+@scenario("reset: an address we can't read is helped, not refused",
+          "David - 'if it works with a text message on the phone it "
+          "shouldn't be refused; we just don't have the email'")
 def _():
-    """Nothing here actually resets a password: that would change a real
-    account on a real shop. What it proves is that the live door is shut
-    to any address the customer has not connected, and that the route is
-    deployed at all."""
-    try:
-        call("/jobs/password-reset", method="POST", account_id=ACCOUNT,
-             site="lowes", email="not-their-address@example.com")
-        raise AssertionError(
-            "the live backend agreed to reset a password using an address "
-            "this customer has never connected")
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            raise AssertionError(
-                "/jobs/password-reset is not deployed - the voice agent's "
-                "reset_site_password tool would fail on a real call")
-        assert e.code == 400, f"expected a plain refusal, got {e.code}"
-        said = e.read().decode("utf-8", "ignore")
-        assert "connected" in said.lower(), said[:200]
+    """check_only: asks what the live system WOULD do and starts nothing.
+    Without it, this would open a real browser on a real shop."""
+    d = call("/jobs/password-reset", method="POST", account_id=ACCOUNT,
+             site="lowes", email="not-their-address@example.com",
+             check_only=1)
+    assert d.get("mode") == "caller_reads_code", (
+        f"the live system would not let the caller read the code: {d}")
+    assert "job_id" not in d, "check_only started a real job"
 
 
 @scenario("reset: a blocked subject is refused before a browser opens",
