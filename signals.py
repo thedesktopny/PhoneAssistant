@@ -40,11 +40,24 @@ BOT_CHECK_MARKS = _re_scrub.compile(
     r"unusual traffic from your|are you a robot|human verification)")
 
 
+# The badge that says a page is "protected by reCAPTCHA - Privacy - Terms"
+# sits in a frame on a great many shop pages and asks nothing of anyone.
+# Once frames were read, its words reached the page text and B&H's cart
+# was taken for a wall. It is a label, not a check.
+CAPTCHA_BADGE = _re_scrub.compile(
+    r"(?i)(protected by\s*(re\s*captcha|hcaptcha)|"
+    r"re\s*captcha\s*[-:]?\s*(privacy|terms)|privacy\s*-\s*terms)")
+
+
+def without_badges(text: str) -> str:
+    return CAPTCHA_BADGE.sub(" ", text or "")
+
+
 def looks_like_bot_check(text: str) -> bool:
     """The site is asking for a human. We do not try to get past these -
     we stop and say so. Recognising it early also saves burning every
     remaining step on a wall that will not move."""
-    return bool(text and BOT_CHECK_MARKS.search(text))
+    return bool(text and BOT_CHECK_MARKS.search(without_badges(text)))
 
 
 CODE_DEST = _re_scrub.compile(
@@ -163,7 +176,7 @@ def classify_block(text: str, url: str = "") -> dict:
     the first 4,000 characters: the runner saw the check, this looked only
     at the menu, and the wall was filed as "unknown". What is kept is the
     part around the check, not the first lines of the page."""
-    full = " ".join((text or "").split())
+    full = " ".join(without_badges(text).split())
     body = full[:4000]
     check = BOT_CHECK_MARKS.search(full)
     near = full[max(0, check.start() - 200):check.end() + 300] if check \

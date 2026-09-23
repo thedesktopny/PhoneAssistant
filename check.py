@@ -3494,6 +3494,25 @@ def _():
         "after a failure it can still offer things nobody has tried"
 
 
+@check("the 'protected by reCAPTCHA' badge is not a human check")
+def _():
+    """Reading frames put the reCAPTCHA badge's words into B&H's cart page
+    and the cart was taken for a wall - on every site with the badge, a
+    job would have stopped for nothing. The badge asks nothing."""
+    import signals
+    cart = ("Subtotal $699.99 Shipping FREE Est. Tax: $62.12 Total: $762.11 "
+            "Begin Checkout [inside a frame] Pay in 4 interest-free payments "
+            "with PayPal. [inside a frame] protected by reCAPTCHA Privacy - "
+            "Terms")
+    assert not signals.looks_like_bot_check(cart), "a badge stopped the job"
+    assert signals.classify_block(cart)["kind"] != "puzzle"
+    for real in ("Before we continue... Press & Hold to confirm you are a "
+                 "human (and not a bot).",
+                 "[inside a frame] I'm not a robot reCAPTCHA Privacy - Terms",
+                 "Please complete the captcha to continue"):
+        assert signals.looks_like_bot_check(real), f"missed a real check: {real}"
+
+
 @check("a human check inside a frame is named, and what it said is kept")
 def _():
     """B&H: the check was in a frame, whose words come after 4,000
