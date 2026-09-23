@@ -2562,7 +2562,8 @@ def browser_address(request: Request, site: str):
 
 @app.get("/browser/peek")
 def browser_peek(request: Request, url: str, account_id: int = 0,
-                 site: str = "", want: str = "", after: str = ""):
+                 site: str = "", want: str = "", after: str = "",
+                 wait: int = 0, shot: int = 0):
     """What the browser actually sees on one page: how much text, how many
     controls, and the first of each. Built while chasing "the page offers 6
     things you can use" on a shop full of products - guessing at that from
@@ -2582,6 +2583,23 @@ def browser_peek(request: Request, url: str, account_id: int = 0,
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
             do_goto(page, url, 5000)
             settle(page, 2500)
+            if wait:
+                settle(page, max(0, min(int(wait), 20)) * 1000)
+            # Every frame in the page and what it holds - a sign-in form
+            # or a "Press & Hold" check can live in one, where the page
+            # text never shows it.
+            frames = []
+            for fr in list(page.frames)[:12]:
+                info = page_eval(fr, """() => {
+                    const t = document.body ? document.body.innerText : '';
+                    return {text: t.slice(0, 240),
+                            inputs: document.querySelectorAll('input').length,
+                            press_hold: /press\\s*(&|and)\\s*hold/i.test(t),
+                            px_marker: !!document.querySelector(
+                                '#px-captcha, [id^="px-"], [class*="px-captcha"]')};
+                }""") or {}
+                frames.append({"url": (fr.url or "")[:160], **info})
+            out["frames"] = frames
             if after:
                 el = q(page, after)
                 if el:
@@ -2589,6 +2607,8 @@ def browser_peek(request: Request, url: str, account_id: int = 0,
                     settle(page, 2500)
                 out["clicked"] = bool(el)
             items, text = _page_snapshot(page, want=want)
+            if shot:
+                out["shot"] = page_shot(page)
             # counted in the page itself, so a missing product link can be
             # told apart from a page that never loaded
             out["raw"] = page_eval(page, """() => {
