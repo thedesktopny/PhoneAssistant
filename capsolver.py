@@ -1,198 +1,214 @@
 """
 CapSolver integration.
-Uses the CapSolver API to solve CAPTCHAs detected by signals.py.
-Requires CAPSOLVER_API_KEY in environment (Railway).
+Solves the CAPTCHAs signals.py can name, using the CapSolver API.
+Needs CAPSOLVER_API_KEY in the environment (Railway).
+
+Task types are CapSolver's own names:
+  reCAPTCHA v2  -> ReCaptchaV2TaskProxyLess  (isEnterprise when needed)
+  hCaptcha      -> AntiHcaptchaTaskProxyLess
+  Turnstile     -> AntiTurnstileTaskProxyLess
+  FunCaptcha    -> FunCaptchaTaskProxyLess
+PerimeterX and DataDome need proxies on CapSolver's side, which we do
+not have - they are refused here before any money is spent.
 """
 import os
+import re
 import json
 import time
 import urllib.request
-import urllib.parse
-from core import emit, _re_scrub
 
 CAPSOLVER_API_KEY = os.environ.get("CAPSOLVER_API_KEY", "")
 CAPSOLVER_API = "https://api.capsolver.com"
 
-def _api(endpoint: str, payload: dict) -> dict:
+
+def _api(endpoint, payload):
     payload["clientKey"] = CAPSOLVER_API_KEY
     req = urllib.request.Request(
         f"{CAPSOLVER_API}/{endpoint}",
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"}
-    )
+        headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read().decode())
 
-def _find_sitekey(page, patterns: list) -> str:
+
+def _frame_htmls(page):
+    """(url, html) for every frame, main page first. The captcha key
+    usually hides in a frame, not in the page itself."""
+    out = []
     try:
-        html = page.content()
+        frames = list(page.frames)
     except Exception:
-        html = ""
-    for pat in patterns:
-        m = _re_scrub.search(pat, html, _re_scrub.I)
+        frames = []
+    for fr in frames:
+        try:
+            out.append((fr.url or "", fr.content()))
+        except Exception:
+            continue
+    if not out:
+        try:
+            out.append((page.url or "", page.content()))
+        except Exception:
+            out.append(("", ""))
+    return out
+
+
+def _find_recaptcha(page):
+    """(sitekey, is_enterprise). Three hiding places: a data-sitekey
+    attribute, a grecaptcha.render(...) call, or the anchor iframe's
+    own URL - the last is the one most sites leave behind."""
+    for url, html in _frame_htmls(page):
+        ent = ("/recaptcha/enterprise" in url
+               or "recaptcha/enterprise.js" in html
+               or "grecaptcha.enterprise" in html)
+        m = re.search(r'recaptcha/(?:api2|enterprise)/(?:anchor|bframe|frame)'
+                      r'[^"\']*[?&]k=([0-9A-Za-z_-]{8,})', url)
+        if m:
+            return m.group(1), ent or "/enterprise/" in url
+        for pat in (r'data-sitekey=["\']([0-9A-Za-z_-]{8,})["\']',
+                    r'sitekey["\']?\s*:\s*["\']([0-9A-Za-z_-]{8,})["\']'):
+            m = re.search(pat, html)
+            if m:
+                return m.group(1), ent
+    for url, html in _frame_htmls(page):
+        m = re.search(r'recaptcha/(?:api|enterprise)\.js[^"\']*[?&]render='
+                      r'([0-9A-Za-z_-]{8,})', html)
+        if m:
+            return m.group(1), "enterprise" in m.group(0)
+    return "", False
+
+
+def _find_sitekey(page, pats):
+    for url, html in _frame_htmls(page):
+        for pat in pats:
+            m = re.search(pat, html)
+            if m:
+                return m.group(1)
+        m = re.search(r'[?&](?:sitekey|render)=([0-9A-Za-z_-]{8,})', url)
         if m:
             return m.group(1)
-    for sel in ('[data-sitekey]', '[data-pkey]', '[data-key]'):
-        try:
-            el = page.query_selector(sel)
-            if el:
-                return (el.get_attribute('data-sitekey') or 
-                        el.get_attribute('data-pkey') or 
-                        el.get_attribute('data-key'))
-        except Exception:
-            pass
     return ""
 
-def solve_captcha(page, vendor: str, url: str) -> dict:
-    # Early exit if the key is missing (e.g., in test environments)
+
+def solve_captcha(page, vendor, url):
     if not CAPSOLVER_API_KEY:
         return {"ok": False, "error": "CAPSOLVER_API_KEY not set"}
-        
-    task_type = ""
-    extra = {}
-    
+    if vendor == "perimeterx":
+        return {"ok": False,
+                "error": "PerimeterX needs a proxy on CapSolver's side"}
+    if vendor == "datadome":
+        return {"ok": False,
+                "error": "DataDome needs a proxy on CapSolver's side"}
+
+    task = {}
     if vendor == "recaptcha":
-        sitekey = _find_sitekey(page, [
-            r'data-sitekey=["\']([^"\']+)["\']',
-            r'sitekey["\']?\s*:\s*["\']([^"\']+)["\']',
-            r'render\?[^"]*render=([^&"\']+)'
-        ])
-        if not sitekey:
+        key, ent = _find_recaptcha(page)
+        if not key:
             return {"ok": False, "error": "reCAPTCHA sitekey not found"}
-        task_type = "reCaptchaTaskProxyLess"
-        extra = {"websiteURL": url, "websiteKey": sitekey}
-        
+        task = {"type": "ReCaptchaV2TaskProxyLess", "websiteURL": url,
+                "websiteKey": key, "isEnterprise": ent}
     elif vendor == "hcaptcha":
-        sitekey = _find_sitekey(page, [
-            r'data-sitekey=["\']([^"\']+)["\']',
-            r'sitekey["\']?\s*:\s*["\']([^"\']+)["\']'
-        ])
-        if not sitekey:
+        key = _find_sitekey(page, (
+            r'data-sitekey=["\']([0-9A-Za-z_-]{8,})["\']',
+            r'sitekey["\']?\s*:\s*["\']([0-9A-Za-z_-]{8,})["\']'))
+        if not key:
             return {"ok": False, "error": "hCaptcha sitekey not found"}
-        task_type = "hcaptchaTaskProxyLess"
-        extra = {"websiteURL": url, "websiteKey": sitekey}
-        
+        task = {"type": "AntiHcaptchaTaskProxyLess", "websiteURL": url,
+                "websiteKey": key}
     elif vendor == "cloudflare":
-        sitekey = _find_sitekey(page, [
-            r'data-sitekey=["\']([^"\']+)["\']',
-            r'sitekey["\']?\s*:\s*["\']([^"\']+)["\']'
-        ])
-        task_type = "antiCloudflareTask"
-        extra = {"websiteURL": url}
-        if sitekey:
-            extra["websiteKey"] = sitekey
-            
-    elif vendor == "perimeterx":
-        task_type = "antiPerimeterxTask"
-        extra = {"websiteURL": url}
-        
-    elif vendor == "datadome":
-        task_type = "antiDatadomeTask"
-        extra = {"websiteURL": url}
-        
+        key = _find_sitekey(page, (
+            r'data-sitekey=["\']([0-9A-Za-z_-]{8,})["\']',
+            r'sitekey["\']?\s*:\s*["\']([0-9A-Za-z_-]{8,})["\']'))
+        if not key:
+            return {"ok": False, "error": "Turnstile sitekey not found"}
+        task = {"type": "AntiTurnstileTaskProxyLess", "websiteURL": url,
+                "websiteKey": key}
     elif vendor == "arkose":
-        sitekey = _find_sitekey(page, [
+        key = _find_sitekey(page, (
             r'data-pkey=["\']([^"\']+)["\']',
-            r'pk["\']?\s*:\s*["\']([^"\']+)["\']',
-            r'pkey["\']?\s*:\s*["\']([^"\']+)["\']'
-        ])
-        task_type = "antiArkoseLabsTask"
-        extra = {"websiteURL": url}
-        if sitekey:
-            extra["websitePublicKey"] = sitekey
-            
+            r'p?key["\']?\s*:\s*["\']([^"\']+)["\']'))
+        if not key:
+            return {"ok": False, "error": "FunCaptcha public key not found"}
+        task = {"type": "FunCaptchaTaskProxyLess", "websiteURL": url,
+                "websitePublicKey": key}
     else:
         return {"ok": False, "error": f"Unsupported vendor: {vendor}"}
 
     try:
-        res = _api("createTask", {"task": {"type": task_type, **extra}})
-        if res.get("errorId") != 0:
-            return {"ok": False, "error": f"CapSolver createTask: {res.get('errorDescription')}"}
-        task_id = res.get("taskId")
+        res = _api("createTask", {"task": task})
     except Exception as e:
         return {"ok": False, "error": f"CapSolver API: {str(e)[:100]}"}
+    if res.get("errorId"):
+        return {"ok": False,
+                "error": f"CapSolver: {res.get('errorCode') or res.get('errorDescription')}"}
+    task_id = res.get("taskId")
 
     for _ in range(40):
         time.sleep(3)
         try:
             res = _api("getTaskResult", {"taskId": task_id})
-            status = res.get("status")
-            if status == "ready":
-                return {"ok": True, "solution": res.get("solution", {})}
-            elif status == "processing":
-                continue
-            else:
-                return {"ok": False, "error": f"CapSolver task: {status}"}
         except Exception as e:
             return {"ok": False, "error": f"CapSolver poll: {str(e)[:100]}"}
-            
+        if res.get("errorId"):
+            return {"ok": False,
+                    "error": f"CapSolver: {res.get('errorCode') or res.get('errorDescription')}"}
+        status = res.get("status")
+        if status == "ready":
+            return {"ok": True, "solution": res.get("solution") or {}}
+        if status != "processing":
+            return {"ok": False, "error": f"CapSolver task: {status}"}
     return {"ok": False, "error": "CapSolver timeout"}
 
-def inject_solution(page, vendor: str, solution: dict):
-    token = (solution.get("token") or solution.get("gRecaptchaResponse") or 
-             solution.get("response") or solution.get("captchaToken") or "")
-             
-    cookies = solution.get("cookies", {})
-    if cookies:
-        for k, v in cookies.items():
-            try:
-                page.context.add_cookies([{"name": k, "value": v, "url": page.url}])
-            except Exception:
-                pass
-                
-    if not token:
-        return
-        
-    js = ""
-    if vendor == "recaptcha":
-        js = """
-        () => {
-            let t = '%s';
-            document.querySelectorAll('[name="g-recaptcha-response"], #g-recaptcha-response')
-                .forEach(el => el.innerHTML = t);
-            if (window.___grecaptcha_cfg) {
-                for (let id in ___grecaptcha_cfg.clients) {
-                    let c = ___grecaptcha_cfg.clients[id];
-                    if (c && c.callback) c.callback(t);
-                }
-            }
-        }
-        """ % token
-    elif vendor == "hcaptcha":
-        js = """
-        () => {
-            let t = '%s';
-            document.querySelectorAll('[name="h-captcha-response"], #h-captcha-response')
-                .forEach(el => el.innerHTML = t);
-        }
-        """ % token
-    elif vendor == "cloudflare":
-        js = """
-        () => {
-            let t = '%s';
-            document.querySelectorAll('[name="cf-turnstile-response"], [name="cf_challenge_response"]')
-                .forEach(el => el.value = t);
-        }
-        """ % token
-    elif vendor == "perimeterx":
-        if token:
-            js = """
-            () => {
-                let t = '%s';
-                if (window._pxAppId) localStorage.setItem('_pxToken', t);
-            }
-            """ % token
-    elif vendor == "arkose":
-        js = """
-        () => {
-            let t = '%s';
-            document.querySelectorAll('[name="fc-token"], [name="arkoseToken"]')
-                .forEach(el => el.value = t);
-        }
-        """ % token
-        
-    if js:
+
+def inject_solution(page, vendor, solution):
+    token = (solution.get("gRecaptchaResponse")
+             or solution.get("token")
+             or solution.get("response")
+             or solution.get("captchaToken") or "")
+    for name, value in (solution.get("cookies") or {}).items():
         try:
-            page.evaluate(js)
+            page.context.add_cookies(
+                [{"name": name, "value": value, "url": page.url}])
         except Exception:
             pass
+    if not token:
+        return
+
+    if vendor == "recaptcha":
+        js = """(t) => {
+            document.querySelectorAll('textarea#g-recaptcha-response, [name="g-recaptcha-response"]')
+                .forEach(el => { el.value = t; el.innerHTML = t; });
+            const cfg = window.___grecaptcha_cfg;
+            if (cfg) for (const id in cfg.clients) {
+                const c = cfg.clients[id];
+                if (c && c.callback) { try { c.callback(t); } catch (e) {} }
+            }
+        }"""
+    elif vendor == "hcaptcha":
+        js = """(t) => {
+            document.querySelectorAll('textarea[name="h-captcha-response"], [name="h-captcha-response"]')
+                .forEach(el => { el.value = t; el.innerHTML = t; });
+        }"""
+    elif vendor == "cloudflare":
+        js = """(t) => {
+            document.querySelectorAll('[name="cf-turnstile-response"], [name="cf_challenge_response"]')
+                .forEach(el => { el.value = t; });
+        }"""
+    else:
+        js = ""
+    if js:
+        try:
+            page.evaluate(js, token)
+        except Exception:
+            pass
+        # a v2 token only counts once the form carrying it is submitted
+        time.sleep(1)
+        for sel in ('button[type="submit"]', 'input[type="submit"]',
+                    'button:has-text("Sign in")', 'button:has-text("Log in")',
+                    'button:has-text("Continue")'):
+            try:
+                el = page.query_selector(sel)
+                if el and el.is_visible():
+                    el.click(timeout=3000)
+                    break
+            except Exception:
+                continue
