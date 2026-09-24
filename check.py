@@ -3407,8 +3407,47 @@ def _():
     src = io.open("agent.py", encoding="utf-8").read()
     assert src.count("session.say(words") == 1 and "sess.say(" not in src, \
         "say() is called somewhere it will raise"
-    wd = src[src.index("async def watchdog("):]
-    assert 'speak_exactly(session, "Are you still there?")' in wd[:3000]
+    wd = src[src.index("async def watchdog("):
+              src.index("async def hangup_when_asked(")]
+    assert 'speak_exactly(session, "Are you still there?")' in wd, \
+        "the silence prompt no longer goes through speak_exactly"
+
+
+@check("the caller hears a word while a job runs, and only then")
+def _():
+    """Call 70: "Signing in now, about a minute", then eighty-one seconds
+    of nothing until the caller asked "Hello? Are you still here?" - and
+    the job ran for nearly two minutes. The watchdog measured only the
+    CALLER's silence; ours was never measured."""
+    src = io.open("agent.py", encoding="utf-8").read()
+    wd = src[src.index("async def watchdog("):
+             src.index("async def hangup_when_asked(")]
+    assert "HOLD_LINES" in wd and "speak_exactly(session, line)" in wd, \
+        "nothing is said while a job runs - the line goes dead"
+    assert "if not busy:" in wd and 'held["n"] = 0' in wd, \
+        "a holding line could be said when nothing is running"
+    assert 'now - last_heard["agent_done"] > HOLD_EVERY' in wd, \
+        "it should be OUR silence that is measured, not theirs"
+    assert 'held["n"] < len(HOLD_LINES)' in wd, \
+        "a stuck job would repeat 'still working' for the whole call"
+    assert 12 <= agent.HOLD_EVERY <= 30, \
+        f"{agent.HOLD_EVERY}s between holding lines is not a natural pause"
+    assert len(agent.HOLD_LINES) >= 3, agent.HOLD_LINES
+    for line in agent.HOLD_LINES:
+        low = line.lower()
+        assert len(line.split()) <= 14, f"too long to interrupt with: {line}"
+        assert not any(w in low for w in ("done", "finished", "signed in",
+                                          "success", "complete", "ready")), \
+            f"a holding line claims something finished: {line}"
+        assert any(w in low for w in ("still", "working", "going",
+                                      "trying")), line
+    # what these really take: a B&H sign-in ran 1m50 against "about a minute"
+    for tool in ("sign_in_to_site", "connect_email"):
+        i = src.find(f"async def {tool}(")
+        if i > 0:
+            body = src[i:i + 3000]
+            assert "about a minute" not in body, \
+                f"{tool} still promises about a minute"
 
 
 @check("how a job ended is written into the conversation, word for word")

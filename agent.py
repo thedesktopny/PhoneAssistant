@@ -39,6 +39,17 @@ MAX_CALL_SECONDS = int(os.environ.get("MAX_CALL_SECONDS", "900"))    # 15 min
 # Older callers take their time. Twenty seconds was short enough that the
 # "are you still there" prompt kept firing while somebody was thinking.
 SILENCE_WARN = int(os.environ.get("SILENCE_WARN", "35"))
+# How long WE may be silent while a job runs before saying something. A
+# caller with nothing to look at assumes the line has dropped.
+HOLD_EVERY = int(os.environ.get("HOLD_EVERY", "22"))
+# Said in order, then the last one repeats. Fixed words, so the model
+# cannot turn a holding line into a claim that something has finished.
+HOLD_LINES = (
+    "Still working on it.",
+    "Still going - it is taking a little longer than usual.",
+    "Still trying. I will tell you the moment I have an answer.",
+    "Still with you. This one is slow, but it is still running.",
+)
 SILENCE_HANGUP = int(os.environ.get("SILENCE_HANGUP", "45"))
 SERVICE_TOKEN = os.environ.get("SERVICE_TOKEN", "")
 # How long a lookup may hold the tool call open. While the model is inside
@@ -2234,7 +2245,7 @@ they go quiet, ask once whether they are still there, then wait.
         except Exception:
             self.job_username = ""
         self._watch_job(f"signing in to {site}")
-        return (f"Signing in to {site}. Tell them it takes about a minute, "
+        return (f"Signing in to {site}. Tell them it takes a minute or two, "
                 f"then call how_is_it_going.")
 
     @function_tool
@@ -2991,7 +3002,7 @@ they go quiet, ask once whether they are still there, then wait.
             return None
 
         self._start_watch("signin", fetch, describe)
-        return ("Sign-in started. Tell them it takes about a minute, then "
+        return ("Sign-in started. Tell them it takes a minute or two, then "
                 "call how_is_it_going.")
 
     async def _connect_state(self, context=None):
@@ -3921,6 +3932,7 @@ async def entrypoint(ctx: JobContext):
 
     async def watchdog():
         warned_at = 0.0
+        held = {"at": 0.0, "n": 0}
         while not hangup.is_set():
             await asyncio.sleep(5)
             now = time.monotonic()
@@ -3947,6 +3959,23 @@ async def entrypoint(ctx: JobContext):
                     pass
                 hangup.set()
                 return
+
+            # While something runs, the caller is owed a word now and
+            # then - it is OUR silence, not theirs. Measured from the last
+            # thing we said, so a real update resets it and nothing is
+            # said twice in a row. It stops after four: a job still going
+            # after a minute and a half is stuck, and repeating "still
+            # working" forever is worse than letting the silence show.
+            if not busy:
+                held["n"] = 0
+            elif (now - last_heard["agent_done"] > HOLD_EVERY
+                  and now - held["at"] > HOLD_EVERY
+                  and held["n"] < len(HOLD_LINES)):
+                held["at"] = now
+                line = HOLD_LINES[held["n"]]
+                held["n"] += 1
+                await speak_exactly(session, line)
+                continue
 
             # while a sign-in or order is running, silence is expected
             limit = SILENCE_HANGUP if not busy else SILENCE_HANGUP * 3
