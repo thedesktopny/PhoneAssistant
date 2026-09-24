@@ -23,6 +23,7 @@ from signals import (looks_like_bot_check, looks_signed_in,
                      classify_block, record_block, block_reason,
                      CODE_BAD, BOT_CHECK_MARKS, SIGNED_OUT_MARKS,
                      SIGNED_IN_MARKS, CODE_DEST, BLOCK_KINDS)
+from capsolver import solve_captcha, inject_solution
 from search import tool_web_search, official_site
 from google_tools import (code_from_email, gmail_client,
                           reset_from_email,
@@ -1905,14 +1906,23 @@ def _run_site_search(jid: int, account_id: int, site: str):
                 browser.close()
                 return
             if looks_like_bot_check(raw or ""):
-                wall = record_block(account_id, site, raw or "",
-                                    page_url(page), jid)
-                _job_set(jid, "failed",
-                         f"{site} refused us: {wall['what']}. "
-                         f"{wall['advice']}",
-                         reason=block_reason(wall["kind"]))
-                browser.close()
-                return
+                wall = record_block(account_id, site, raw or "", page_url(page), jid)
+                emit("captcha", f"job {jid}", f"Bot check ({wall['vendor']}). Trying CapSolver...", "info", account_id)
+                sol = solve_captcha(page, wall["vendor"], page_url(page))
+                if sol.get("ok"):
+                    inject_solution(page, wall["vendor"], sol["solution"])
+                    do_goto(page, page_url(page), 5000)
+                    settle(page, 3000)
+                    if not looks_like_bot_check(page_text(page, 2000)):
+                        emit("captcha", f"job {jid}", "CapSolver bypassed the check.", "info", account_id)
+                    else:
+                        _job_set(jid, "failed", f"{site} refused us: {wall['what']}. CapSolver: {sol.get('error', 'still blocked')}", reason=block_reason(wall["kind"]))
+                        browser.close()
+                        return
+                else:
+                    _job_set(jid, "failed", f"{site} refused us: {wall['what']}. CapSolver: {sol.get('error', 'failed')}", reason=block_reason(wall["kind"]))
+                    browser.close()
+                    return
             if not answer:
                 _job_set(jid, "failed",
                          f"The {site} search page opened but no results came "
@@ -2694,19 +2704,30 @@ def _run_browse(jid: int, account_id: int, site: str):
                     settle(page, 1500)
                     items, text = _page_snapshot(page, want=goal)
                 if looks_like_bot_check(text):
-                    wall = record_block(account_id, site_key, text,
-                                        page_url(page), jid)
+                    wall = record_block(account_id, site_key, text, page_url(page), jid)
+                    
+                    # Try the next source FIRST - faster than solving a captcha
                     if spares:
                         nxt = spares.pop(0)
-                        _job_set(jid, "working",
-                                 "that page wants a human check - trying "
-                                 "another source")
+                        _job_set(jid, "working", "that page wants a human check - trying another source")
                         do_goto(page, nxt, 4000)
                         continue
+                        
+                    # No spares left - try CapSolver as a last resort
+                    emit("captcha", f"job {jid}", f"Bot check ({wall['vendor']}). Trying CapSolver...", "info", account_id)
+                    sol = solve_captcha(page, wall["vendor"], page_url(page))
+                    if sol.get("ok"):
+                        inject_solution(page, wall["vendor"], sol["solution"])
+                        do_goto(page, page_url(page), 5000)
+                        settle(page, 3000)
+                        if not looks_like_bot_check(page_text(page, 2000)):
+                            emit("captcha", f"job {jid}", "CapSolver bypassed the check.", "info", account_id)
+                            continue
+                        else:
+                            emit("captcha", f"job {jid}", "CapSolver solved but still blocked.", "warn", account_id)
+                    
                     _job_set(jid, "failed",
-                             f"{site_key} refused us: {wall['what']}"
-                             + (f" ({wall['vendor']})" if wall["vendor"]
-                                else "") + f". {wall['advice']}",
+                             f"{site_key} refused us: {wall['what']}" + (f" ({wall['vendor']})" if wall["vendor"] else "") + f". CapSolver: {sol.get('error', 'failed')}",
                              reason=block_reason(wall["kind"]))
                     break
                 shot = page_shot(page) if BROWSER_VISION else ""
@@ -2776,15 +2797,21 @@ def _run_browse(jid: int, account_id: int, site: str):
                     # never name this 'q' - that shadows the page helper q()
                     question = act.get("question", "")[:300]
                     if looks_like_bot_check(question):
-                        wall = record_block(account_id, site_key,
-                                            question + " " + text,
-                                            page_url(page), jid)
+                        wall = record_block(account_id, site_key, question + " " + text, page_url(page), jid)
+                        # Try CapSolver (no spares available in ask_user context)
+                        emit("captcha", f"job {jid}", f"Bot check in ask_user ({wall['vendor']}). Trying CapSolver...", "info", account_id)
+                        sol = solve_captcha(page, wall["vendor"], page_url(page))
+                        if sol.get("ok"):
+                            inject_solution(page, wall["vendor"], sol["solution"])
+                            do_goto(page, page_url(page), 5000)
+                            settle(page, 3000)
+                            if not looks_like_bot_check(page_text(page, 2000)):
+                                emit("captcha", f"job {jid}", "CapSolver bypassed the check.", "info", account_id)
+                                continue
+                            else:
+                                emit("captcha", f"job {jid}", "CapSolver solved but still blocked.", "warn", account_id)
                         _job_set(jid, "failed",
-                                 f"{site_key} wants a human to complete a "
-                                 f"check by hand, which a caller on the "
-                                 f"phone cannot do for us: {wall['what']}"
-                                 + (f" ({wall['vendor']})"
-                                    if wall["vendor"] else ""),
+                                 f"{site_key} wants a human to complete a check by hand: {wall['what']}. CapSolver: {sol.get('error', 'failed')}" + (f" ({wall['vendor']})" if wall["vendor"] else ""),
                                  reason=block_reason(wall["kind"]))
                         break
                     _job_set(jid, "needs_input", question)
@@ -2796,26 +2823,15 @@ def _run_browse(jid: int, account_id: int, site: str):
                         if reply:
                             _JOBS[jid]["code"] = None
                             break
+                            
+                    # THIS WAS MISSING - stops the job if the caller doesn't answer
                     if not reply:
                         _job_set(jid, "failed", "No answer from the caller.")
                         break
+                        
                     history.append(f"asked: {question} -> they said: {reply}")
                     _job_set(jid, "working", "Carrying on.")
                     continue
-
-                if a in ("click", "type"):
-                    idx = _action_index(act)
-                    if idx < 0 or idx >= len(items):
-                        note = (f"There is no [{idx}] - the page offers "
-                                f"{len(items)} things you can use."
-                                + (" Nothing was found on the page at all; "
-                                   "it may still be loading, so wait or "
-                                   "scroll before choosing again."
-                                   if not items else ""))
-                        history.append(note)
-                        _job_set(jid, "working", note)
-                        settle(page, 2500)
-                        continue
 
                 try:
                     if a == "click":
@@ -3478,13 +3494,21 @@ def _run_reset(jid: int, account_id: int, site: str):
                 # A human check is a stop, not a puzzle. Never ask a
                 # caller with no screen to press and hold anything.
                 if looks_like_bot_check(text):
-                    wall = record_block(account_id, site.lower(), text,
-                                        page_url(page), jid)
+                    wall = record_block(account_id, site.lower(), text, page_url(page), jid)
+                    emit("captcha", f"job {jid}", f"Bot check in reset ({wall['vendor']}). Trying CapSolver...", "info", account_id)
+                    sol = solve_captcha(page, wall["vendor"], page_url(page))
+                    if sol.get("ok"):
+                        inject_solution(page, wall["vendor"], sol["solution"])
+                        do_goto(page, page_url(page), 5000)
+                        settle(page, 3000)
+                        if not looks_like_bot_check(page_text(page, 2000)):
+                            emit("captcha", f"job {jid}", "CapSolver bypassed the check.", "info", account_id)
+                            continue
+                        else:
+                            emit("captcha", f"job {jid}", "CapSolver solved but still blocked.", "warn", account_id)
+                    
                     _job_set(jid, "failed",
-                             f"{site.title()} put a human check in the way "
-                             f"of resetting the password: {wall['what']}"
-                             + (f" ({wall['vendor']})" if wall["vendor"]
-                                else "") + ". It cannot be done by phone.",
+                             f"{site.title()} put a human check in the way of resetting the password: {wall['what']}. CapSolver: {sol.get('error', 'still blocked')}" + (f" ({wall['vendor']})" if wall["vendor"] else "") + ". It cannot be done by phone.",
                              reason=block_reason(wall["kind"]))
                     break
 
