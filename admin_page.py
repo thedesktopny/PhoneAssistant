@@ -535,7 +535,7 @@ async function loadAlerts(){
         '</div>'; }).join('');
   }catch(e){}
 }
-async var chArea = "";
+var chArea = "";
 function loadChanges(){
   var sel = document.getElementById('charea');
   chArea = sel ? sel.value : "";
@@ -631,7 +631,7 @@ function loadReviews(){
       }).join('');
     });
 }
-function loadFu(){
+async function loadFu(){
   const tb = document.getElementById('furows');
   try{
     const d = await (await fetch('/followups?include_done='+

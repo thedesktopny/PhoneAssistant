@@ -3413,6 +3413,55 @@ def _():
         "the silence prompt no longer goes through speak_exactly"
 
 
+@check("the admin panel's script actually runs")
+def _():
+    """`async var chArea = "";` sat in the page for weeks. A browser stops
+    reading a script at a syntax error, so every button and table below
+    that line did nothing, and every Python check here passed happily:
+    they test the file, not the page it builds.
+
+    node is used when it is there - it is the same engine the browser
+    uses. Without it, the patterns that have actually broken this page."""
+    import re as _re
+    import shutil
+    import subprocess
+    import tempfile
+    import admin_page
+    page = admin_page.ADMIN_HTML
+    scripts = _re.findall(r"<script[^>]*>(.*?)</script>", page, _re.S)
+    assert scripts, "no script found in the admin page at all"
+    js = "\n".join(scripts)
+
+    for bad, why in (
+            (r"\basync\s+(var|const|let)\b", "async in front of a variable"),
+            (r"\basync\s+(if|for|while|return|switch)\b",
+             "async in front of a statement"),
+            (r"\bfunction\s*\(\s*\)\s*\{[^}]*\bawait\b",
+             "await inside a function that is not async")):
+        hit = _re.search(bad, js)
+        assert not hit, (f"{why}: ...{js[max(0, hit.start() - 60):hit.end() + 40]}...")
+
+    node = shutil.which("node")
+    if not node:
+        return                      # the patterns above are the fallback
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False,
+                                     encoding="utf-8") as f:
+        f.write(js)
+        path = f.name
+    try:
+        r = subprocess.run([node, "--check", path], capture_output=True,
+                           text=True, timeout=60)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    assert r.returncode == 0, (
+        "the admin page's script does not parse, so the browser stops "
+        "reading it there and everything below is dead:\n"
+        + (r.stderr or r.stdout)[:600])
+
+
 @check("a job that is getting nowhere stops instead of holding the caller")
 def _():
     """Call 70: twelve steps, a hundred and ten seconds, a sign-in that
