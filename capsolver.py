@@ -99,6 +99,26 @@ def solve_captcha(page, vendor, url):
         return {"ok": False,
                 "error": "DataDome needs a proxy on CapSolver's side"}
 
+    # --- AUTO-DETECT VENDOR IF UNKNOWN ---
+    # If signals.py couldn't name the vendor from the text, look at the HTML.
+    if not vendor:
+        recaptcha_key, _ = _find_recaptcha(page)
+        if recaptcha_key:
+            vendor = "recaptcha"
+        else:
+            generic_key = _find_sitekey(page, (
+                r'data-sitekey=["\']([0-9A-Za-z_-]{8,})["\']',
+                r'sitekey["\']?\s*:\s*["\']([0-9A-Za-z_-]{8,})["\']'))
+            if generic_key:
+                # Cloudflare Turnstile keys almost always start with "0x"
+                if generic_key.startswith("0x"):
+                    vendor = "cloudflare"
+                else:
+                    vendor = "hcaptcha"
+            else:
+                return {"ok": False, "error": "Could not auto-detect captcha vendor"}
+    # -------------------------------------
+
     task = {}
     if vendor == "recaptcha":
         key, ent = _find_recaptcha(page)
@@ -195,16 +215,19 @@ def inject_solution(page, vendor, solution):
         }"""
     else:
         js = ""
+        
     if js:
         try:
             page.evaluate(js, token)
         except Exception:
             pass
-        # a v2 token only counts once the form carrying it is submitted
+            
+        # A v2 token only counts once the form carrying it is submitted.
+        # We wait a second, then try to click the most likely submit button.
         time.sleep(1)
         for sel in ('button[type="submit"]', 'input[type="submit"]',
                     'button:has-text("Sign in")', 'button:has-text("Log in")',
-                    'button:has-text("Continue")'):
+                    'button:has-text("Continue")', 'button:has-text("Submit")'):
             try:
                 el = page.query_selector(sel)
                 if el and el.is_visible():
