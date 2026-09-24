@@ -829,6 +829,10 @@ they go quiet, ask once whether they are still there, then wait.
             return (f"I'm sorry - {site} put a human check on {where}, the "
                     f"press-and-hold kind, so I can't get through it for you "
                     f"by phone.{again}")
+        if reason == "took_too_long":
+            return (f"I'm sorry - I have been trying on {site} for two "
+                    f"minutes and I am not getting anywhere, so I stopped "
+                    f"rather than keep you holding.")
         if reason == "rate_limited":
             return (f"I'm sorry - {site} is turning us away for now. We can "
                     f"try again a little later.")

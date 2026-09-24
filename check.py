@@ -3413,6 +3413,61 @@ def _():
         "the silence prompt no longer goes through speak_exactly"
 
 
+@check("a job that is getting nowhere stops instead of holding the caller")
+def _():
+    """Call 70: twelve steps, a hundred and ten seconds, a sign-in that
+    was never going to happen. Circles were spotted at step 5 and it
+    carried on to step 12 - because spotting them CLEARED the record of
+    what it had been doing, so the evidence started again from nothing."""
+    import browser
+
+    # 1. the record is not wiped when a warning is given
+    src = source()
+    body = src[src.index("def _run_browse("):]
+    body = body[:body.index("\ndef ", 10)]
+    i = body.index("_going_in_circles(sigs)")
+    window = body[i:i + 1200]
+    assert "sigs.clear()" not in window, \
+        "spotting a loop still clears the evidence, so the limit is never hit"
+    assert "dead_ends >= 3" in body, "error pages are still ordinary steps"
+    assert "CALL_BUDGET" in body and "took_too_long" in body, \
+        "a caller can still be held for as long as the model likes"
+
+    # 2. with the record kept, the same action three times is caught and
+    #    stays caught - it took four warnings to stop before
+    sigs = []
+    fired = 0
+    for _ in range(6):
+        sigs.append("click:3:log in")
+        if browser._going_in_circles(sigs):
+            fired += 1
+    assert fired >= 3, f"only fired {fired} times across six repeats"
+
+    # 3. B&H's own error pages, and pages that are not errors
+    for dead in ("Page Not Found. Start Over",
+                 "404 - we can't find that page",
+                 "Sorry, the page you requested was not found"):
+        assert browser.DEAD_END.search(dead), f"missed an error page: {dead}"
+    for fine in ("Epson EcoTank Pro ET-5850 - $699.99 In Stock",
+                 "Sign in to your account",
+                 "Your cart has 1 item"):
+        assert not browser.DEAD_END.search(fine), \
+            f"an ordinary page was called an error page: {fine}"
+
+    # 4. what the caller hears when the two minutes are up
+    a = agent.Assistant({"account_id": 1, "name": "T"}, "+1555", 1)
+    a.job_site = "B&H"
+    words = a._failure_words({"kind": "site_login", "reason": "took_too_long"})
+    assert "two minutes" in words and "B&H" in words, words
+    assert "holding" in words, words
+
+    # 5. a job with nobody on the phone keeps its old, longer leash
+    assert "if call_id and time.time() - t0 > CALL_BUDGET" in body, \
+        "a background job would be cut off by a caller's clock"
+    assert 60 <= browser.CALL_BUDGET <= 180, \
+        f"{browser.CALL_BUDGET}s is not a sensible time to hold someone"
+
+
 @check("the caller hears a word while a job runs, and only then")
 def _():
     """Call 70: "Signing in now, about a minute", then eighty-one seconds

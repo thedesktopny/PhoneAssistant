@@ -2347,6 +2347,20 @@ def _stuck_note(n: int) -> str:
 
 
 STUCK_LIMIT = int(os.environ.get("BROWSE_STUCK_LIMIT", "4"))
+# How long a caller is left holding while one job works. Call 70 ran for
+# a minute and fifty seconds on a sign-in that was never going to
+# happen. Only applies while somebody is actually on the phone waiting;
+# a job with no call behind it keeps its step limit and no clock.
+CALL_BUDGET = int(os.environ.get("BROWSE_CALL_SECONDS", "120"))
+
+# A page that went nowhere: the address was wrong, or the site sent us to
+# its own error page. B&H answered two different sign-in addresses with
+# one of these, and each was treated as an ordinary step.
+DEAD_END = _re_scrub.compile(
+    r"(?i)(page (you requested |you.re looking for )?(was )?not found|"
+    r"404|we can.?t find (that|the) page|page (is )?unavailable|"
+    r"this page (does not|doesn.t) exist|start over|"
+    r"sorry.{0,30}(page|link).{0,30}(not|no longer))")
 
 
 def _task_shape(goal: str) -> dict:
@@ -2649,6 +2663,7 @@ def _run_browse(jid: int, account_id: int, site: str):
     history = []
     path_used = "agent"
     stuck = 0              # actions in a row that changed nothing
+    dead_ends = 0          # addresses that led to the site's error page
     sigs = []              # what it has been trying, to spot a loop
     try:
         with sync_playwright() as p:
@@ -2693,6 +2708,17 @@ def _run_browse(jid: int, account_id: int, site: str):
                 if (_JOBS.get(jid) or {}).get("cancelled"):
                     _job_set(jid, "failed", "The caller hung up.",
                              reason="cancelled")
+                    break
+                # Somebody is holding a phone. Two minutes of hold music
+                # is the most anyone should be asked for, whatever the
+                # model believes it is about to achieve.
+                if call_id and time.time() - t0 > CALL_BUDGET:
+                    _job_set(jid, "failed",
+                             f"It has been trying for two minutes without "
+                             f"getting there, so it stopped rather than "
+                             f"keep them holding. Last screen: {text[:150]}"
+                             if step else "It could not get started.",
+                             reason="took_too_long")
                     break
                 # A shop draws its results after the shell, and we were
                 # reading the page in between: "the page offers 9 things
@@ -2908,8 +2934,28 @@ def _run_browse(jid: int, account_id: int, site: str):
                                  f"getting anywhere. Last screen: "
                                  f"{text[:200]}", reason="stuck")
                         break
-                    sigs.clear()
+                    # The record of what it has been doing is NOT cleared.
+                    # Clearing it meant the evidence had to be gathered
+                    # again from nothing after every warning, so the limit
+                    # was never reached: call 70 noticed circles at step 5
+                    # and carried on to step 12.
                     continue
+
+                # A route that ends on the site's own error page is not a
+                # step forward, however new the address looked.
+                if DEAD_END.search(text or ""):
+                    dead_ends += 1
+                    history.append(
+                        f"That address went nowhere - the site answered "
+                        f"with an error page ({dead_ends} so far). Guessing "
+                        f"more addresses will not help: use something "
+                        f"visible on the page, or give_up.")
+                    if dead_ends >= 3:
+                        _job_set(jid, "failed",
+                                 f"Three of the addresses it tried went to "
+                                 f"the site's own error page, so it could "
+                                 f"not find the way in.", reason="stuck")
+                        break
 
                 # Did any of that actually do something? The first 200
                 # characters of a shop page are its menu and never change,
