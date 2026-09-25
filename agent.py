@@ -227,6 +227,13 @@ def auto_report(reason: str):
         @functools.wraps(fn)
         async def inner(*args, **kwargs):
             self = args[0] if args else None
+            # What has actually been done on this call, so a claim can be
+            # checked against it rather than believed.
+            if self is not None:
+                try:
+                    self.ran_tools.add(fn.__name__)
+                except AttributeError:
+                    self.ran_tools = {fn.__name__}
             try:
                 result = await fn(*args, **kwargs)
             except Exception as e:
@@ -402,6 +409,7 @@ class Assistant(Agent):
                  call_id: int | None = None, history: str = "",
                  known: str = ""):
         self.account = account
+        self.ran_tools = set()      # every tool that has really run
         self.call_id = call_id
         self.caller_number = caller_number
         self.account_id = account["account_id"]
@@ -3602,6 +3610,23 @@ they go quiet, ask once whether they are still there, then wait.
         return "Sent."
 
 
+# ------------------------------------------------------- claiming to have sent
+
+# Said in the first person, in the past: "I've sent you a link", "I texted
+# it to you". Not "the site sent a code" - that is somebody else sending,
+# and it may well be true.
+CLAIMED_SEND = re.compile(
+    r"(?i)\bi\s*(?:'ve|\u2019ve|\s+have)?\s*(?:just\s+)?"
+    r"(?:sent|texted|emailed|forwarded|messaged)\b")
+# The tools that really put something in front of somebody else.
+SEND_TOOLS = {"send_text", "text_setup_link", "send_password_link",
+              "send_email", "reply_to_email", "forward_email",
+              "send_drive_file", "email_connect_code", "card_setup_code",
+              "add_another_phone"}
+SENT_NOTHING = ("I am sorry - I have not actually sent that, and I should "
+                "not have said so.")
+
+
 # ------------------------------------------------------------------ speaking
 
 async def speak_exactly(session, words: str, mid_tool: bool = False) -> bool:
@@ -3686,6 +3711,7 @@ class Signup(Agent):
         super().__init__(
             instructions=SIGNUP_INSTRUCTIONS.replace("{no_code}", no_code))
         self.caller_number = caller_number
+        self.ran_tools = set()      # every tool that has really run
         self.call_id = call_id
         self.when_signed_up = on_signed_up
         self.linking = False
@@ -3827,6 +3853,47 @@ class Signup(Agent):
         return "Say a short goodbye now. Nothing else."
 
 
+def check_the_claim(session, agent_obj, said: str, call_id=None):
+    """Correct a claim to have sent something, there and then.
+
+    Call 76: "I've sent you a link", twice, with no sending tool run on
+    the call at all - a new customer waited for a text that was never
+    coming, and hung up. The after-call review caught it hours later,
+    which is no use to him. This catches it while he is still on the
+    line, and only when the record shows nothing was sent.
+    """
+    if not said or not CLAIMED_SEND.search(said):
+        return
+    ran = getattr(agent_obj, "ran_tools", set())
+    if ran & SEND_TOOLS:
+        return                      # something really was sent
+    if getattr(agent_obj, "owned_up", False):
+        return                      # say it once, not every turn
+    agent_obj.owned_up = True
+
+    async def own_up():
+        try:
+            await log_turn(call_id, "problem",
+                           "claimed to have sent something with no sending "
+                           "tool run on this call", "check_the_claim")
+            ctx = agent_obj.chat_ctx.copy()
+            ctx.add_message(role="system", content=(
+                "SYSTEM RECORD: you just said you had sent something, and "
+                "nothing on this call sent anything. Never say that again. "
+                "Texts may not be going out at all. To connect a mailbox, "
+                "offer email_connect_code for someone with internet, or "
+                "connect_email to do it here by voice."))
+            await agent_obj.update_chat_ctx(ctx)
+            await speak_exactly(session, SENT_NOTHING)
+        except Exception as e:
+            log.warning(f"could not own up to the claim: {e}")
+
+    try:
+        asyncio.create_task(own_up())
+    except Exception as e:
+        log.warning(f"could not start owning up: {e}")
+
+
 # ------------------------------------------------------------------ session
 
 @server.rtc_session(agent_name="phone-assistant")
@@ -3918,6 +3985,8 @@ async def entrypoint(ctx: JobContext):
                 # reading it back. The model still hears it; only the
                 # record is blank.
                 stored = keep_or_blank(secret, role, text)
+                if role != "user":
+                    check_the_claim(session, agent_obj, text, call_id)
                 asyncio.create_task(log_turn(call_id, who, stored))
                 if account:
                     asyncio.create_task(backend_post("/memory", {

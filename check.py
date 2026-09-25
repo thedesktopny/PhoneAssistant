@@ -3517,6 +3517,115 @@ def _():
         f"{browser.CALL_BUDGET}s is not a sensible time to hold someone"
 
 
+@check("claiming to have sent something is caught on the call, not hours later")
+def _():
+    """Call 76: "I've sent you a link", twice, with no sending tool run on
+    the whole call. A new customer waited for a text that was never coming
+    and hung up. The after-call review caught it; that is no use to him."""
+    said = agent.CLAIMED_SEND
+    for claim in ("I've sent you a link to connect your email.",
+                  "I have sent the link again.",
+                  "I just texted it to you.",
+                  "I emailed that to you a moment ago.",
+                  "I\u2019ve sent it to your phone."):
+        assert said.search(claim), f"missed a claim: {claim}"
+    for fine in ("Amazon sent a code to your phone.",
+                 "The site says it sent an email.",
+                 "Would you like me to text it to you?",
+                 "I'll send it once you say yes.",
+                 "They sent it yesterday."):
+        assert not said.search(fine), f"wrongly treated as a claim: {fine}"
+
+    spoke, facts = [], []
+
+    class Ctx:
+        def __init__(self):
+            self.items = []
+
+        def copy(self):
+            return self
+
+        def add_message(self, role, content):
+            facts.append(content)
+
+    class Fake:
+        llm = tts = None
+
+        def say(self, words, **k):
+            spoke.append(words)
+
+        def generate_reply(self, **k):
+            spoke.append(k.get("instructions", ""))
+
+    import asyncio
+
+    class Stand:
+        """Only what check_the_claim touches. A real Assistant cannot be
+        used: chat_ctx is read-only on a LiveKit agent (rule 4)."""
+
+        def __init__(self, ran):
+            self.ran_tools = set(ran)
+            self.chat_ctx = Ctx()
+            self.owned_up = False
+
+        async def update_chat_ctx(self, ctx, **k):
+            return None
+
+    def run_one(ran):
+        obj = Stand(ran)
+        real = agent.log_turn
+
+        async def quiet(*a, **k):
+            return None
+        agent.log_turn = quiet
+
+        async def drive():
+            # as a real call does it: from inside the running loop, then
+            # give the background correction a moment to finish
+            agent.check_the_claim(Fake(), obj,
+                                  "I've sent you a link to connect your "
+                                  "email.", 1)
+            await asyncio.sleep(0.05)
+        try:
+            asyncio.run(drive())
+        finally:
+            agent.log_turn = real
+        return obj
+
+    # nothing was sent: the caller is told, and the record is corrected
+    spoke.clear()
+    facts.clear()
+    obj = run_one([])
+    assert spoke, "a false claim went uncorrected"
+    assert agent.SENT_NOTHING in " ".join(spoke), spoke
+    assert any("nothing on this call sent anything" in f for f in facts), facts
+    assert any("email_connect_code" in f for f in facts), \
+        "it is not pointed at a way that works"
+    assert obj.owned_up is True
+
+    # something really was sent: leave it alone
+    spoke.clear()
+    facts.clear()
+    run_one(["send_text"])
+    assert not spoke, "it apologised for a text it really did send"
+
+    # and it owns up once, not on every turn
+    spoke.clear()
+    obj = run_one([])
+
+    async def again():
+        agent.check_the_claim(Fake(), obj, "I've sent it again.", 1)
+        await asyncio.sleep(0.05)
+    asyncio.run(again())
+    assert len(spoke) == 1, f"it apologised {len(spoke)} times"
+
+    src = io.open("agent.py", encoding="utf-8").read()
+    assert "self.ran_tools.add(fn.__name__)" in src, \
+        "tool calls are not recorded, so no claim can be checked"
+    assert "check_the_claim(session, agent_obj, text, call_id)" in src, \
+        "nothing checks what is said as it is said"
+
+
 @check("a text is never called sent when it cannot be delivered")
 def _():
     """Call 76: a new customer with no email was told twice "I've sent you
