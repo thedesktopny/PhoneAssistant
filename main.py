@@ -86,6 +86,16 @@ def tool_send_sms(to: str, message: str) -> dict:
     to = _digits_e164(to)
     if not SMS_PROVIDER or not SMS_FROM:
         return {"sent": False, "error": "SMS isn't configured."}
+    if not SMS_DELIVERS:
+        # Unregistered campaigns are accepted by the provider and dropped
+        # by the carriers. Saying "sent" here is how a caller ends up
+        # waiting for a text that was never going to arrive.
+        emit("sms", to[-4:], "not sent - texts are not being delivered yet "
+                             "(SMS_DELIVERS is off)", "warn")
+        return {"sent": False,
+                "error": "Texts are not being delivered yet - the phone "
+                         "number's messaging registration is still "
+                         "pending."}
 
     try:
         if SMS_PROVIDER == "twilio":

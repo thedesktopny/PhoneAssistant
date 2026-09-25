@@ -63,6 +63,12 @@ STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
 
 # SMS — set SMS_PROVIDER to "twilio" or "bulkvs"
 SMS_PROVIDER = os.environ.get("SMS_PROVIDER", "").lower()
+# A provider answering 200 means it took the message, not that anyone
+# received it. While the 10DLC campaign is unregistered nothing is
+# delivered, and a caller told "I've sent you a link" waits for a text
+# that will never come. Set SMS_DELIVERS=1 in Railway once registration
+# clears and a real text has actually arrived on a real phone.
+SMS_DELIVERS = os.environ.get("SMS_DELIVERS", "") in ("1", "true", "yes")
 SMS_FROM = os.environ.get("SMS_FROM", "")           # your sending number
 TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")

@@ -649,14 +649,22 @@ CONTACTS, FILES AND THE TO-DO LIST
 SHOPPING AND ORDERS
 1. What they want: item, how many, which site. Vague -> search_site or
    do_on_website, read the name and price, get a yes on the exact item.
-2. Address: what_is_saved, read it back; none -> save_address.
-3. Payment: what_is_saved shows their cards. None saved? If the site has one, use that.
+2. The MOMENT they say yes to an item, draft_order - before you ask for
+   anything else. That writes the item and price down. Until you do, the
+   order exists only in this conversation and it WILL be lost: a caller
+   gave his address and the whole order vanished into another search.
+3. Address: what_is_saved, read it back; none -> save_address. Never hold
+   an address in your head - save it, then it is theirs for next time.
+4. Payment: what_is_saved shows their cards. None saved? If the site has one, use that.
    Otherwise the best way is card_setup_code - someone with internet adds
    it on our secure page and the number is never said aloud. Only if
    nobody can help, take it by voice and save_card.
-4. draft_order, then read back item, quantity, price, address and card
-   ending, and ask exactly: "Should I place this order?" Wait.
-5. Only on a clear yes, confirm_order. "Cancel that" -> cancel_order.
+5. draft_order again with the address and card, then read back item,
+   quantity, price, address and card ending, and ask exactly: "Should I
+   place this order?" Wait.
+6. Only on a clear yes, confirm_order. "Cancel that" -> cancel_order.
+Never start a new search while an order is open. If the price needs
+checking, review_checkout reads the real basket back.
 
 CHECKING A BASKET BEFORE BUYING
 review_checkout reads the checkout page back - items, address, card,
@@ -710,6 +718,9 @@ do not say "I'm handling it". Call stop_that, say you have
 stopped, and offer to try later or have the office ring them.
 
 CONNECTING THEIR EMAIL (only if they have none linked)
+NEVER offer to text or email them a link. They are on the phone because
+they have no internet, and texts are not going out at all at the moment.
+There are two ways and no others.
 Ask FIRST whether someone with internet can help - a son, daughter,
 neighbour. If yes, email_connect_code and read out what it gives you: no
 password is ever said aloud. Only if nobody can help, take it on the call:
@@ -722,9 +733,11 @@ then stop and leave it with the office. Never repeat a password afterwards
 and never put one in a text.
 
 TEXTING
-send_text for an address, a number, a link, or anything long - say you are
-texting it rather than reading it out. Texts go to the number they called
-from unless they give another. The topic rules apply to texts exactly.
+send_text for an address, a number, a link, or anything long. Only say a
+text has gone AFTER the tool says it was sent - if it says it did not go
+out, say so plainly and read the thing out or offer another way. Texts go
+to the number they called from unless they give another. The topic rules
+apply to texts exactly.
 
 DISCONNECTING AND DELETING
 "Disconnect my work email" -> confirm which, then disconnect_email; access
@@ -1997,12 +2010,29 @@ they go quiet, ask once whether they are still there, then wait.
             "address_id": address_id or None, "card_id": card_id or None,
             "call_id": self.call_id})
         self.order_id = d.get("order_id")
-        return (f"Order {d.get('order_id')} drafted: {d.get('quantity')} x "
-                f"{d.get('item')} from {d.get('site')}"
+        self.order_item = f"{d.get('quantity')} x {d.get('item')}"
+        need = []
+        if not d.get("address"):
+            need.append("no address yet - what_is_saved, or ask and "
+                        "save_address")
+        if not d.get("card"):
+            need.append("no card yet - what_is_saved, or card_setup_code")
+        head = (f"Order {d.get('order_id')} written down: "
+                f"{d.get('quantity')} x {d.get('item')} from "
+                f"{d.get('site')}"
                 f"{', about $' + d['expected_price'] if d.get('expected_price') else ''}"
-                f". Ship to {d.get('address') or 'the site\'s saved address'}. "
-                f"Pay with {d.get('card') or 'the site\'s saved card'}. "
-                f"Read all of that back and ask: Should I place this order?")
+                f". Ship to {d.get('address') or 'not chosen yet'}. "
+                f"Pay with {d.get('card') or 'not chosen yet'}.")
+        if need:
+            # Half an order is not a thing to read back for a yes. Say
+            # what is still needed and go and get it.
+            return (head + " Still needed: " + "; ".join(need)
+                    + ". Do NOT read it back for a yes yet, and do NOT "
+                      "start another search - the item is safely written "
+                      "down. Get what is missing, then call draft_order "
+                      "again with it.")
+        return (head + " Read all of that back and ask: Should I place "
+                       "this order?")
 
     @function_tool
     @auto_report("orders")
@@ -3219,7 +3249,11 @@ they go quiet, ask once whether they are still there, then wait.
             return "The link didn't go out."
         if data.get("sent"):
             return ("Link sent. Tell them to tap it, sign in, then call back.")
-        return "The link didn't go out."
+        return ("The text did NOT go out: " + (data.get("error") or "")
+                + " Do NOT tell them you sent anything. A link is no use to "
+                + "someone with no internet anyway: offer email_connect_code "
+                + "for a son, daughter or neighbour to use, or connect_email "
+                + "to do it here on the call.")
 
     @function_tool
     @auto_report("search")

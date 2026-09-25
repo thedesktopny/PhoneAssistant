@@ -3517,6 +3517,65 @@ def _():
         f"{browser.CALL_BUDGET}s is not a sensible time to hold someone"
 
 
+@check("a text is never called sent when it cannot be delivered")
+def _():
+    """Call 76: a new customer with no email was told twice "I've sent you
+    a link". Texts do not leave this system - the number's messaging
+    registration is still pending - and the provider answering 200 was
+    being read as delivered."""
+    import main as _m
+    undo_on = everywhere("SMS_DELIVERS", False)
+    undo_p = everywhere("SMS_PROVIDER", "bulkvs")
+    undo_f = everywhere("SMS_FROM", "+14845182072")
+    try:
+        got = _m.tool_send_sms("+18455550101", "hello")
+    finally:
+        undo_f()
+        undo_p()
+        undo_on()
+    assert got.get("sent") is False, \
+        "a text was called sent while nothing is being delivered"
+    assert "pending" in (got.get("error") or ""), got
+
+    src = io.open("agent.py", encoding="utf-8").read()
+    i = src.index("async def text_setup_link(")
+    body = src[i:src.index("@function_tool", i)]
+    assert "did NOT go out" in body and "Do NOT tell them you sent" in body, \
+        "a failed text still comes back as something the model can gloss"
+    assert "email_connect_code" in body and "connect_email" in body, \
+        "nothing points at the two ways that actually work"
+    inst = agent.Assistant({"account_id": 1, "name": "T"}, "+1555", 1)
+    where = inst.instructions.index("CONNECTING THEIR EMAIL")
+    section = inst.instructions[where:where + 700]
+    assert "NEVER offer to text or email them a link" in section, \
+        "it may still offer a link to somebody with no internet"
+
+
+@check("an order is written down before anything else is asked for")
+def _():
+    """Call 78: he chose a $15.61 window kit, gave 91 Penn Street - and
+    the assistant ran a fresh price search, decided the item was not in
+    the listings, and the order was gone. Nothing was holding it."""
+    inst = agent.Assistant({"account_id": 1, "name": "T"}, "+1555", 1)
+    steps = inst.instructions[inst.instructions.index("SHOPPING AND ORDERS"):]
+    steps = steps[:steps.index("CHECKING A BASKET")]
+    assert "MOMENT they say yes to an item, draft_order" in steps, \
+        "the order is still only written down at the end"
+    assert steps.index("draft_order") < steps.index("save_address"), \
+        "the address is still taken before the order exists"
+    assert "Never start a new search while an order is open" in steps, steps
+
+    src = io.open("agent.py", encoding="utf-8").read()
+    i = src.index("async def draft_order(")
+    body = src[i:src.index("@function_tool", i)]
+    assert "Still needed" in body and "no address yet" in body, \
+        "a half-finished order does not say what it is missing"
+    assert "do NOT" in body and "another search" in body, \
+        "nothing stops it wandering back into a search"
+    assert "not chosen yet" in body, \
+        "a missing address still reads as the site's saved one"
+
+
 @check("the caller hears a word while a job runs, and only then")
 def _():
     """Call 70: "Signing in now, about a minute", then eighty-one seconds
