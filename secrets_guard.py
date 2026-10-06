@@ -20,7 +20,19 @@ SECRET_DONE = re.compile(r"(?i)\b(saved|stored|verified|confirmed|accepted|"
 # "capital", "lowercase", or a run of digits.
 SPELLING = re.compile(r"(?i)\b(capital|lowercase|lower case|uppercase|"
                       r"upper case|symbol|underscore|exclamation|hashtag|"
-                      r"at sign)\b|\b\w\b(?:[\s,.-]+\b\w\b){2,}|\d{2,}")
+                      r"at sign)\b|\b\w\b(?:[\s,.-]+\b\w\b){2,}|\d{2,}"
+                      # "the digit 9, the digit 6, the digit 3": the words
+                      # in between stopped the run of single characters
+                      # from being seen as one (calls 82 and 83)
+                      r"|(?:\b(?:digit|letter|character|number)s?\b[\s:,.-]*"
+                      r"\S{1,3}[\s:,.-]*"
+                      r"(?:\b(?:the|then|and|a|is|next|last|first)\b"
+                      r"[\s:,.-]*)*){2,}"
+                      # "three sixes at the end" - the shape of it is
+                      # nearly as good as the thing itself. Not "one
+                      # character at a time", which is the question.
+                      r"|\b(?:two|three|four|five|six|seven|eight|nine|"
+                      r"ten)\s+(?:more\s+)?\w+s\b")
 BLANKED = "[a password or PIN was being given here - not recorded]"
 # Said while they are still giving it. Call 67: "take your time and let
 # me know the next characters" has no "password" in it, the old rule
@@ -63,7 +75,15 @@ def keep_or_blank(state: dict, role: str, text: str) -> str:
         return text
     if asks:
         state["on"], state["turns"] = True, 0
-        return text                          # the question itself is safe
+        # The question itself is safe - "what is your password?" - but a
+        # read-back says the word AND the thing: "let me confirm the
+        # password: the digit nine, the digit six...". Anything here
+        # carrying digits or single characters is the thing, not the
+        # question (calls 82 and 83).
+        if re.search(r"\d", text) or re.search(r"\b\w\b[\s,.-]+\b\w\b",
+                                               text):
+            return BLANKED
+        return text
     if state["on"] and STILL_GIVING.search(text):
         return text                          # "take your time" - still on
     # "Got it." - a short acknowledgement is not the end. Call 68: the

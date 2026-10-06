@@ -35,7 +35,9 @@ BACKEND = os.environ["BACKEND_URL"].rstrip("/")
 
 # How long a call may run, and how long silence is tolerated, in seconds.
 # All three can be changed from Railway without touching the code.
-MAX_CALL_SECONDS = int(os.environ.get("MAX_CALL_SECONDS", "900"))    # 15 min
+MAX_CALL_SECONDS = int(os.environ.get("MAX_CALL_SECONDS", "1800"))  # 30 min
+# Said two minutes before the end, so nobody is cut off mid-sentence.
+NEARLY_UP = int(os.environ.get("NEARLY_UP_SECONDS", "120"))
 # Older callers take their time. Twenty seconds was short enough that the
 # "are you still there" prompt kept firing while somebody was thinking.
 SILENCE_WARN = int(os.environ.get("SILENCE_WARN", "35"))
@@ -4039,6 +4041,7 @@ async def entrypoint(ctx: JobContext):
 
     async def watchdog():
         warned_at = 0.0
+        warned_time = {"said": False}
         held = {"at": 0.0, "n": 0}
         while not hangup.is_set():
             await asyncio.sleep(5)
@@ -4053,17 +4056,27 @@ async def entrypoint(ctx: JobContext):
                         or getattr(agent_obj, "job_live", False)
                         or getattr(agent_obj, "order_id", None))
 
+            # A warning first. Call 83 ended mid-search with nothing
+            # said at all: the goodbye was handed to a model that was
+            # busy elsewhere, and the line simply went dead.
+            if (total > MAX_CALL_SECONDS - NEARLY_UP
+                    and not warned_time["said"]):
+                warned_time["said"] = True
+                await speak_exactly(
+                    session, "We are coming up to the limit on how long one "
+                             "call can run. We have about two minutes left. "
+                             "If we run out, call me straight back and I "
+                             "will carry on from here.")
+
             if total > MAX_CALL_SECONDS:
                 agent_obj.hangup_reason = "reached the maximum call length"
-                try:
-                    await session.generate_reply(
-                        instructions=("In English: say the call has reached "
-                                      "its time limit, they can call back "
-                                      "any time, then say goodbye. Two "
-                                      "sentences."))
-                    await asyncio.sleep(5)
-                except Exception:
-                    pass
+                # Fixed words, and said BEFORE anything is torn down.
+                await speak_exactly(
+                    session, "That is the limit on how long one call can "
+                             "run, so I have to let you go. Call me straight "
+                             "back and I will carry on from where we are. "
+                             "Goodbye for now.")
+                await asyncio.sleep(6)
                 hangup.set()
                 return
 

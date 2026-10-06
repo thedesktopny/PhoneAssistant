@@ -35,7 +35,8 @@ def call_state(account_id: int, call_id: int = 0) -> dict:
     now = datetime.now(_tz())
     out = {"now": f"{now:%A, %B} {now.day} at {_clock(now)}",
            "account_id": account_id, "running": [], "finished": [],
-           "mailboxes": [], "saved_logins": [], "cards": [], "addresses": []}
+           "mailboxes": [], "logins_saved_for_these_shops_only": [],
+           "cards": [], "addresses": []}
     db = Session()
     acct = db.query(Account).filter_by(id=account_id).first()
     out["name"] = acct.name if acct else ""
@@ -63,7 +64,9 @@ def call_state(account_id: int, call_id: int = 0) -> dict:
             "email": c.email, "label": c.label or "",
             "connected_days_ago": round(days, 1),
             "probably_expired": days >= 7})
-    out["saved_logins"] = [
+    # Named so nobody reads this as a menu: these open those shops, and
+    # are no use anywhere else (call 83).
+    out["logins_saved_for_these_shops_only"] = [
         s.site for s in db.query(SiteLogin)
                           .filter_by(account_id=account_id).all()]
     out["cards"] = [f"{c.brand} ending {c.last4}"
@@ -99,6 +102,15 @@ Rules:
 - Money and sending: never say anything is sent, ordered or charged unless
   the facts show it happened.
 - If the right next step needs a tool the assistant has, name it.
+- The facts list everything about this caller, not everything that
+  matters now. Use only what the situation is about. Their saved logins,
+  cards and addresses are each for ONE purpose: a login opens that shop
+  and nothing else, and no login is ever needed to read a public page.
+  Call 83: a caller looking for a minivan was asked which saved login to
+  use, Amazon or Walmart. Never ask for something the task does not need.
+- Never ask the caller to choose between things that make no difference
+  to them. Decide it yourself, or ask about the thing they actually
+  want.
 
 Answer as JSON only:
 {"say": "<the words to speak, at most 45 words>",

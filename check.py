@@ -3279,6 +3279,17 @@ def _():
         ("assistant", "Got it.", False),
         ("user", "Six, two, nine, four.", True),
         ("assistant", "Thanks, your PIN is verified.", False),
+        # calls 82 and 83: the read-back carried the password itself
+        ("assistant", "Please say the password one character at a time.",
+         False),
+        ("user", "capital K, then 9 6 3 2", True),
+        ("assistant", "I read three sixes at the end. Could you say it "
+                      "again?", True),
+        ("assistant", "Let me confirm the password one more time: the "
+                      "digit 9, the digit 6, the digit 3, the digit 2. Is "
+                      "every character right?", True),
+        ("user", "Yes.", True),
+        ("assistant", "Thanks, the password is saved.", False),
         # call 57: given before it was asked for
         ("user", "The username is c@example.com.", False),
         ("user", "And the password is capital T lowercase v", True),
@@ -3702,6 +3713,45 @@ def _():
         "nothing stops it wandering back into a search"
     assert "not chosen yet" in body, \
         "a missing address still reads as the site's saved one"
+
+
+@check("nobody is cut off mid-sentence when the call runs long")
+def _():
+    """Call 83: fifteen minutes, cut off while it was checking another car
+    site. Nothing was said at all - the goodbye was handed to a model busy
+    elsewhere and the line simply went dead."""
+    src = io.open("agent.py", encoding="utf-8").read()
+    wd = src[src.index("async def watchdog("):
+             src.index("async def hangup_when_asked(")]
+    assert "NEARLY_UP" in wd and 'warned_time["said"]' in wd, \
+        "there is still no warning before the limit"
+    i = wd.index("MAX_CALL_SECONDS - NEARLY_UP")
+    j = wd.index("if total > MAX_CALL_SECONDS:")
+    assert i < j, "the warning must come before the hang-up"
+    end = wd[j:j + 1200]
+    assert "speak_exactly(" in end, \
+        "the goodbye is still a suggestion to a busy model"
+    assert "generate_reply" not in end, end[:200]
+    assert "carry on from where we are" in end,         "it does not tell them how to carry on"
+    assert agent.MAX_CALL_SECONDS >= 1200, \
+        f"{agent.MAX_CALL_SECONDS}s is not long enough for real work"
+    assert 60 <= agent.NEARLY_UP <= 300, agent.NEARLY_UP
+
+
+@check("a saved login is never offered where it makes no sense")
+def _():
+    """Call 83: "which saved login should I use first, Amazon or Walmart?"
+    asked in the middle of looking for a minivan. The advisor is handed
+    every fact about the caller and read that list as a menu."""
+    import advisor
+    state = advisor.call_state(1)
+    assert "saved_logins" not in state, \
+        "the list is still named as if it were a choice to offer"
+    assert "logins_saved_for_these_shops_only" in state, state.keys()
+    p = advisor.ADVISOR_SYSTEM
+    assert "no login is ever needed to read a public page" in p, \
+        "nothing tells it a login belongs to one shop only"
+    assert "Never ask for something the task does not need" in p
 
 
 @check("the caller hears a word while a job runs, and only then")
