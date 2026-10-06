@@ -53,6 +53,10 @@ HOLD_LINES = (
     "Still with you. This one is slow, but it is still running.",
 )
 SILENCE_HANGUP = int(os.environ.get("SILENCE_HANGUP", "45"))
+# keep_looking: how many sites one search may go through, and how long
+# any one of them may take before it is left for the next.
+HUNT_MAX_SITES = int(os.environ.get("HUNT_MAX_SITES", "6"))
+HUNT_SITE_SECONDS = int(os.environ.get("HUNT_SITE_SECONDS", "170"))
 SERVICE_TOKEN = os.environ.get("SERVICE_TOKEN", "")
 # How long a lookup may hold the tool call open. While the model is inside
 # a tool call it cannot speak, which is the only reliable way found to stop
@@ -219,6 +223,32 @@ async def ask_advisor(account_id, call_id, situation: str,
     return out
 
 
+def note_tool_ran(agent_obj, name: str):
+    """What has actually been done on this call, and when - so a claim
+    can be checked against it rather than believed."""
+    try:
+        agent_obj.ran_tools.add(name)
+    except AttributeError:
+        agent_obj.ran_tools = {name}
+    try:
+        agent_obj.tool_at[name] = time.monotonic()
+    except AttributeError:
+        agent_obj.tool_at = {name: time.monotonic()}
+
+
+def note_amounts(agent_obj, text) -> None:
+    """Remember every money amount that came from somewhere real - a page,
+    a tool, the caller. A price the assistant says that is in none of them
+    was made up (call 83)."""
+    if not isinstance(text, str) or not re.search(r"\d", text):
+        return
+    found = amounts_in(text, bare=True)
+    try:
+        agent_obj.known_amounts |= found
+    except AttributeError:
+        agent_obj.known_amounts = set(found)
+
+
 def auto_report(reason: str):
     """Log any tool failure for staff, without the model being asked to.
 
@@ -232,12 +262,11 @@ def auto_report(reason: str):
             # What has actually been done on this call, so a claim can be
             # checked against it rather than believed.
             if self is not None:
-                try:
-                    self.ran_tools.add(fn.__name__)
-                except AttributeError:
-                    self.ran_tools = {fn.__name__}
+                note_tool_ran(self, fn.__name__)
             try:
                 result = await fn(*args, **kwargs)
+                if self is not None:
+                    note_amounts(self, result)
             except Exception as e:
                 await report_problem(
                     getattr(self, "account_id", None),
@@ -689,6 +718,8 @@ OTHER SITES
 - do_on_website works on sites we have never set up: give it a plain
   goal and the site. "Check my Verizon bill" -> goal="find the current
   balance and due date", site="verizon". It never buys or pays.
+- "Don't come back till you find it": do_on_website with then_try, once.
+  Never ask "shall I try another?" in between.
 - A signed-in site: check_site_orders for "where's my order", search_site
   for "do they have X". If it says signed out, offer sign_in_to_site.
 - Saving a login: site, username, password spelled slowly, read back, then
@@ -880,6 +911,11 @@ they go quiet, ask once whether they are still there, then wait.
             last = key
             line = describe(d)
             said = ""
+            if isinstance(line, tuple):
+                note_amounts(self, line[1])
+                await speak_exactly(getattr(self, "session", None), line[1])
+                line = None
+            note_amounts(self, d.get("message"))
             if state in ("done", "failed") and kind == "job":
                 await self._record_outcome(d)
             if state == "failed" and kind == "job":
@@ -960,11 +996,16 @@ they go quiet, ask once whether they are still there, then wait.
                     # through another round trip to hear it. Prices are
                     # read as written: call 68 said $849.99 for "$699.99,
                     # down from $849.99".
-                    return (f"Tell them this now. Read every price exactly "
-                            f"as written - when two are given, the first is "
-                            f"today's price. Say model numbers one character "
-                            f"at a time, like 'E T, five eight five zero'. "
-                            f"{msg}")
+                    # Call 83: the search finished with CarMax at $13,599,
+                    # and six seconds later the caller heard three other
+                    # cars at prices no page had shown. Nothing may be
+                    # added to what was found.
+                    return (f"Tell them this now, keeping every name and "
+                            f"price exactly as written, and add NOTHING - no "
+                            f"other items, prices or shops of your own. When "
+                            f"two prices are given, the first is today's. "
+                            f"Say model numbers one character at a time, "
+                            f"like 'E T, five eight five zero'. Found: {msg}")
                 return ("Say it's done, then get the details with "
                         "get_site_result.")
             if st == "failed":
@@ -1870,6 +1911,7 @@ they go quiet, ask once whether they are still there, then wait.
         """Record something for staff to follow up on: a failure, a request
         you can't handle, or anything the caller asks to be passed on.
         Reason is a short label like signin_failed, complaint, request."""
+        note_tool_ran(self, "leave_note_for_office")
         try:
             await backend_post("/followups", {
                 "account_id": self.account_id,
@@ -2140,14 +2182,22 @@ they go quiet, ask once whether they are still there, then wait.
     @function_tool
     @auto_report("browse")
     async def do_on_website(self, context: RunContext, goal: str,
-                            site: str = "", url: str = ""):
+                            site: str = "", url: str = "",
+                            then_try: str = ""):
         """Do something on any website, described in plain English. Works on
         sites we've never configured. It reads pages and decides its own
         steps. It will never buy or pay for anything. site is the shop as
         they said it ("B&H") - it is looked up like a search would; for a
-        small local shop add the area ("Pomegranate Brooklyn")."""
+        small local shop add the area ("Pomegranate Brooklyn").
+        then_try: when they say "don't come back until you find it" or
+        "go from one site to the next", the other sites to go on to,
+        comma-separated ("Carvana, CarMax, CarsDirect"). It goes through
+        them without coming back in between, until one has everything in
+        goal - so put every requirement in goal."""
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
+        if then_try.strip():
+            return await self._keep_looking(goal, site, then_try)
         try:
             async with httpx.AsyncClient(timeout=25) as c:
                 r = await c.post(f"{BACKEND}/jobs/browse", headers=AUTH,
@@ -2167,6 +2217,154 @@ they go quiet, ask once whether they are still there, then wait.
         self._watch_job(goal)
         return ("On it. Tell them it takes up to a minute and stay with "
                 "them, then call get_site_result.")
+
+    async def _keep_looking(self, goal: str, site: str, then_try: str):
+        names = [x.strip() for x in re.split(r"[,;\n]",
+                                             f"{site},{then_try}")
+                 if x.strip()][:HUNT_MAX_SITES]
+        for old in getattr(self, "_watchers", []):
+            if not old.done():
+                old.cancel()
+        self.job_question = goal
+        self.job_live = True
+        self.hunt_task = asyncio.create_task(self._hunt(goal, names))
+        self._watchers = [self.hunt_task]
+        await log_turn(self.call_id, "tool",
+                       f"keep looking for: {goal[:150]} on "
+                       f"{', '.join(names)}", "do_on_website")
+        return (f"Going through {len(names)} sites one after another: "
+                f"{', '.join(names)}. Tell them in one sentence that you "
+                f"will go from site to site and only come back when you "
+                f"find one with everything, or have tried them all. Then "
+                f"stop talking. You will be told the result - do not start "
+                f"another site yourself.")
+
+    async def _hunt(self, goal: str, names: list):
+        """Call 83: "don't come back to me till you find a car that has all
+        the features" - and it came back after every blocked site, asking
+        whether to try another, four times. Each site was its own job, and
+        each failure was announced, by design. This runs them as one: a
+        site that blocks us or has no match is noted, and the next one
+        starts. It speaks only to say it is still looking, and at the end.
+        Whether a site had it is the job's reason code, "met" - never a
+        reading of its answer."""
+        sess = getattr(self, "session", None)
+        tried = []                  # (site, "blocked" | "no_match" | "failed")
+        closest = ""
+        jid = None
+        try:
+            for i, site in enumerate(names):
+                if i:
+                    await speak_exactly(sess, f"Still looking. Trying {site} "
+                                              f"now.")
+                try:
+                    async with httpx.AsyncClient(timeout=25) as c:
+                        r = await c.post(
+                            f"{BACKEND}/jobs/browse", headers=AUTH,
+                            params={"account_id": self.account_id,
+                                    "goal": goal, "site": site, "url": "",
+                                    "call_id": self.call_id or 0})
+                        started = r.json()
+                except Exception as e:
+                    log.error(f"keep_looking could not start {site}: {e}")
+                    tried.append((site, "failed"))
+                    continue
+                if started.get("blocked"):
+                    await speak_exactly(sess, "I am not allowed to talk to "
+                                              "you about this.")
+                    return
+                jid = started.get("job_id")
+                self.job_id, self.job_site = jid, site
+                d, t0, nudged = {}, time.monotonic(), False
+                while time.monotonic() - t0 < HUNT_SITE_SECONDS:
+                    await asyncio.sleep(4)
+                    try:
+                        d = await backend_get("/jobs/status", job_id=jid)
+                    except Exception:
+                        continue
+                    note_amounts(self, d.get("message"))
+                    if d.get("state") in ("done", "failed", "cancelled"):
+                        break
+                    if not nudged and time.monotonic() - t0 > 70:
+                        nudged = True
+                        await speak_exactly(sess, "Still looking.")
+                else:
+                    await self._cancel_job(jid, "keep_looking moved on")
+                    tried.append((site, "failed"))
+                    continue
+                state, reason = d.get("state"), d.get("reason") or ""
+                msg = (d.get("message") or "")[:1200]
+                if state == "done" and reason == "met":
+                    await self._record_outcome(d)
+                    said = sess.generate_reply(instructions=(
+                        f"You found it, on {site}. Tell them now, keeping "
+                        f"every name and price exactly as written and "
+                        f"adding NOTHING of your own: {msg}"))
+                    if inspect.isawaitable(said):
+                        await said
+                    return
+                if state == "done":
+                    tried.append((site, "no_match"))
+                    closest = closest or f"On {site}: {msg}"
+                elif reason in ("bot_check", "ip_blocked", "site_refused",
+                                "rate_limited"):
+                    tried.append((site, "blocked"))
+                else:
+                    tried.append((site, "failed"))
+            # every site tried, and none had everything
+            await self._hunt_report(sess, goal, tried, closest)
+        except asyncio.CancelledError:
+            if jid:
+                await self._cancel_job(jid, "keep_looking stopped")
+            raise
+        finally:
+            self.job_live = False
+
+    async def _cancel_job(self, jid, why: str):
+        try:
+            async with httpx.AsyncClient(timeout=10) as c:
+                await c.post(f"{BACKEND}/jobs/cancel", headers=AUTH,
+                             params={"job_id": jid, "why": why[:120]})
+        except Exception as e:
+            log.warning(f"could not cancel job {jid}: {e}")
+
+    async def _hunt_report(self, sess, goal, tried, closest):
+        """The end of a search with no full match - in fixed words, built
+        from what each site really did, so nothing is added."""
+        def names(kind):
+            got = [s for s, k in tried if k == kind]
+            if len(got) > 1:
+                return ", ".join(got[:-1]) + " and " + got[-1]
+            return got[0] if got else ""
+        n = len(tried)
+        words = (f"I have been through {n} site{'s' if n != 1 else ''} and "
+                 f"none had everything you asked for. ")
+        if names("blocked"):
+            words += f"{names('blocked')} would not let us in. "
+        if names("no_match"):
+            words += f"{names('no_match')} had nothing with all of it. "
+        if names("failed"):
+            words += f"{names('failed')} did not work. "
+        if closest:
+            words += f"The closest I found: {closest} "
+        words += "Would you like the office to look further for you?"
+        note_amounts(self, words)
+        per_site = "; ".join(f"{s}: {k}" for s, k in tried)
+        try:
+            ctx = self.chat_ctx.copy()
+            ctx.add_message(role="system", content=(
+                f"SYSTEM RECORD: the search of several sites for "
+                f"'{goal[:200]}' ended with no full match. Per site: "
+                f"{per_site}. {closest} Nothing "
+                f"else was found. Never describe a result that is not "
+                f"here."))
+            await self.update_chat_ctx(ctx)
+        except Exception as e:
+            log.warning(f"could not record the search: {e}")
+        await log_turn(self.call_id, "tool",
+                       f"search of several sites ended: {per_site}",
+                       "do_on_website")
+        await speak_exactly(sess, words)
 
     @function_tool
     @auto_report("browse")
@@ -2345,6 +2543,9 @@ they go quiet, ask once whether they are still there, then wait.
         you, changes their mind, or cannot do what a site is asking for -
         a code they can't reach, a check they can't do. Work for the old
         question is worth nothing, and waiting for it wastes their call."""
+        hunt = getattr(self, "hunt_task", None)
+        if hunt and not hunt.done():
+            hunt.cancel()
         jid = getattr(self, "job_id", None)
         if not jid:
             return ("Nothing is running. Do not say you are waiting for "
@@ -3023,9 +3224,10 @@ they go quiet, ask once whether they are still there, then wait.
         def describe(d):
             st, msg = d.get("state", ""), d.get("message", "")
             if st == "needs_tap":
-                return (f"Say this once, then stop talking: {msg} Do not ask "
-                        f"them to confirm and do not repeat it. Stay silent "
-                        f"until I give you the next update.")
+                # Fixed words, spoken TO the caller. Call 82 heard the
+                # assistant read out "Tell them to tap Yes" - talking about
+                # him, in front of him.
+                return ("exact", msg)
             if st == "consenting":
                 return None
             if st == "verifying":
@@ -3061,8 +3263,8 @@ they go quiet, ask once whether they are still there, then wait.
         state = d.get("state", "")
         msg = d.get("message", "")
         if state == "needs_tap":
-            return msg + (" Keep checking. If they can't do it, "
-                          "call try_another_way.")
+            return (f'Say this to them, word for word: "{msg}" Then wait. '
+                    f"If they can't do it, call try_another_way.")
         if state == "needs_code":
             return ("Google sent them a verification code. Ask them to read "
                     "it out, then call submit_code.")
@@ -3628,6 +3830,72 @@ SEND_TOOLS = {"send_text", "text_setup_link", "send_password_link",
 SENT_NOTHING = ("I am sorry - I have not actually sent that, and I should "
                 "not have said so.")
 
+# Said in the first person, in the past, about getting SOMEBODY ELSE to
+# send: "We've asked Google to send a text code" (call 82) - with the
+# sign-in already over and no tool run at all. He waited for a text that
+# was never asked for.
+CLAIMED_ASK = re.compile(
+    r"(?i)\b(?:i|we)\s*(?:'ve|’ve|\s+have)?\s*(?:just\s+)?"
+    r"(?:(?:asked|requested|told|got)\s+(?!you\b|me\b)(?:\w+\s+){0,3}?"
+    r"to\s+(?:re)?(?:send|text|email|call)\b"
+    r"|requested\s+(?:a|an|another|the)\s+(?:new\s+|fresh\s+)?"
+    r"(?:code|link|text|email|prompt)\b)")
+# The tools that really ask somebody else for something, and how recently
+# one must have run for the claim to be about it.
+ASK_TOOLS = {"connect_email", "try_another_way", "sign_in_to_site",
+             "reset_site_password", "do_on_website", "answer_website_question",
+             "submit_code", "leave_note_for_office", "check_site_orders",
+             "search_site"} | SEND_TOOLS
+ASK_RECENT = 90
+ASKED_NOTHING = ("I am sorry - I said that had been asked for, and it has "
+                 "not been. Nothing is on its way to you.")
+
+# A money amount as said: "$13,599", "$38,935.00", "$ 12.5".
+AMOUNT = re.compile(r"\$\s?(\d[\d,]*(?:\.\d{1,2})?)")
+BARE_NUMBER = re.compile(r"\b(\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?\b")
+MADE_UP_PRICE = ("I am sorry - I just gave you a price I did not read "
+                 "anywhere. Please ignore it. I will only give you prices "
+                 "I have read on a real page.")
+
+
+def _amount(raw: str):
+    try:
+        return round(float(raw.replace(",", "")), 2)
+    except ValueError:
+        return None
+
+
+def amounts_in(text: str, bare: bool = False) -> set:
+    """The money amounts in some text. bare=True also takes plain numbers,
+    for sources (a page, the caller) that do not always write the $."""
+    if not text:
+        return set()
+    pat = BARE_NUMBER if bare else AMOUNT
+    out = {_amount(m.group(1)) for m in pat.finditer(text)}
+    return {a for a in out if a is not None}
+
+
+def invented_amounts(said: str, known: set) -> set:
+    """Amounts said that come from nowhere. Allowed: anything known, a
+    sum or difference of two known amounts (a total with delivery), or
+    within 2% of a known one (rounding). Call 83's $34,500, $37,000 and
+    $35,000 were none of these - the page had said $38,935 and $13,599."""
+    out = set()
+    known = {k for k in known if k}
+    if len(known) <= 300:
+        ks = list(known)
+        combos = {a + b for a in ks for b in ks} | \
+                 {abs(a - b) for a in ks for b in ks}
+    else:
+        combos = set()
+    for a in amounts_in(said):
+        if a < 1 or a in known or round(a, 2) in combos:
+            continue
+        if any(abs(a - k) <= 0.02 * k for k in known):
+            continue
+        out.add(a)
+    return out
+
 
 # ------------------------------------------------------------------ speaking
 
@@ -3855,6 +4123,26 @@ class Signup(Agent):
         return "Say a short goodbye now. Nothing else."
 
 
+def _own_up(session, agent_obj, call_id, problem: str, record: str,
+            words: str):
+    """Say sorry in fixed words, and put the truth in the record so it is
+    not said again."""
+    async def own_up():
+        try:
+            await log_turn(call_id, "problem", problem, "check_the_claim")
+            ctx = agent_obj.chat_ctx.copy()
+            ctx.add_message(role="system", content="SYSTEM RECORD: " + record)
+            await agent_obj.update_chat_ctx(ctx)
+            await speak_exactly(session, words)
+        except Exception as e:
+            log.warning(f"could not own up to the claim: {e}")
+
+    try:
+        asyncio.create_task(own_up())
+    except Exception as e:
+        log.warning(f"could not start owning up: {e}")
+
+
 def check_the_claim(session, agent_obj, said: str, call_id=None):
     """Correct a claim to have sent something, there and then.
 
@@ -3863,37 +4151,95 @@ def check_the_claim(session, agent_obj, said: str, call_id=None):
     coming, and hung up. The after-call review caught it hours later,
     which is no use to him. This catches it while he is still on the
     line, and only when the record shows nothing was sent.
+
+    Call 82: "We've asked Google to send a text code" - the sign-in had
+    already failed and no tool ran. Asking somebody else counts only if a
+    tool that can ask ran in the last minute and a half, or a job is
+    still running.
     """
-    if not said or not CLAIMED_SEND.search(said):
+    if not said:
         return
-    ran = getattr(agent_obj, "ran_tools", set())
-    if ran & SEND_TOOLS:
-        return                      # something really was sent
-    if getattr(agent_obj, "owned_up", False):
-        return                      # say it once, not every turn
-    agent_obj.owned_up = True
+    if CLAIMED_SEND.search(said):
+        ran = getattr(agent_obj, "ran_tools", set())
+        if ran & SEND_TOOLS:
+            return                      # something really was sent
+        if getattr(agent_obj, "owned_up", False):
+            return                      # say it once, not every turn
+        agent_obj.owned_up = True
+        _own_up(session, agent_obj, call_id,
+                "claimed to have sent something with no sending tool run "
+                "on this call",
+                "you just said you had sent something, and nothing on this "
+                "call sent anything. Never say that again. Texts may not be "
+                "going out at all. To connect a mailbox, offer "
+                "email_connect_code for someone with internet, or "
+                "connect_email to do it here by voice.",
+                SENT_NOTHING)
+        return
+    if CLAIMED_ASK.search(said):
+        now = time.monotonic()
+        at = getattr(agent_obj, "tool_at", {}) or {}
+        if any(now - at.get(t, -1e9) <= ASK_RECENT for t in ASK_TOOLS):
+            return
+        if getattr(agent_obj, "job_live", False):
+            return
+        if getattr(agent_obj, "owned_up_ask", False):
+            return
+        agent_obj.owned_up_ask = True
+        _own_up(session, agent_obj, call_id,
+                "claimed to have asked for something to be sent, with no "
+                "tool run and nothing running",
+                "you just said something had been asked for, and no tool "
+                "asked for anything and nothing is running. Never say a "
+                "thing has been asked for unless a tool did it just now. A "
+                "Google sign-in that has failed is over: to try again, run "
+                "connect_email - try_another_way only works while a "
+                "sign-in is still waiting.",
+                ASKED_NOTHING)
 
-    async def own_up():
-        try:
-            await log_turn(call_id, "problem",
-                           "claimed to have sent something with no sending "
-                           "tool run on this call", "check_the_claim")
-            ctx = agent_obj.chat_ctx.copy()
-            ctx.add_message(role="system", content=(
-                "SYSTEM RECORD: you just said you had sent something, and "
-                "nothing on this call sent anything. Never say that again. "
-                "Texts may not be going out at all. To connect a mailbox, "
-                "offer email_connect_code for someone with internet, or "
-                "connect_email to do it here by voice."))
-            await agent_obj.update_chat_ctx(ctx)
-            await speak_exactly(session, SENT_NOTHING)
-        except Exception as e:
-            log.warning(f"could not own up to the claim: {e}")
 
+def check_the_prices(session, agent_obj, said: str, call_id=None):
+    """Correct a price that came from nowhere, there and then.
+
+    Call 83: the search ended with CarMax at $13,599 and Car and Driver
+    at $38,935. Six seconds later the caller heard a Kia Carnival at
+    $34,500, a Pacifica at $37,000 and an Odyssey at $35,000 - none of
+    them on any page - and then the real answer, and could not tell which
+    to believe. A price is real only if a tool, a page or the caller gave
+    it."""
+    if not said or "$" not in said:
+        return
+    known = set(getattr(agent_obj, "known_amounts", set()) or set())
+    # whatever is already in its own record counts too: tool results,
+    # SYSTEM RECORD lines, what the caller said, its instructions
     try:
-        asyncio.create_task(own_up())
-    except Exception as e:
-        log.warning(f"could not start owning up: {e}")
+        known |= amounts_in(getattr(agent_obj, "instructions", "") or "",
+                            bare=True)
+        for item in agent_obj.chat_ctx.items:
+            if getattr(item, "role", None) == "assistant":
+                continue
+            text = (getattr(item, "text_content", None)
+                    or getattr(item, "output", None)
+                    or getattr(item, "arguments", None) or "")
+            if isinstance(text, str):
+                known |= amounts_in(text, bare=True)
+    except Exception:
+        pass
+    made_up = invented_amounts(said, known)
+    if not made_up:
+        return
+    n = getattr(agent_obj, "price_corrections", 0)
+    if n >= 2:
+        return                          # not every turn of a bad call
+    agent_obj.price_corrections = n + 1
+    shown = ", ".join(f"${a:,.2f}".replace(".00", "") for a in sorted(made_up))
+    _own_up(session, agent_obj, call_id,
+            f"said prices no tool or page gave: {shown}",
+            f"you just said {shown}. No page, tool or caller gave that. It "
+            f"was made up, and the caller has been told to ignore it. Only "
+            f"ever give a price that is written in a tool result or a "
+            f"SYSTEM RECORD, exactly as written.",
+            MADE_UP_PRICE)
 
 
 # ------------------------------------------------------------------ session
@@ -3987,8 +4333,11 @@ async def entrypoint(ctx: JobContext):
                 # reading it back. The model still hears it; only the
                 # record is blank.
                 stored = keep_or_blank(secret, role, text)
-                if role != "user":
+                if role == "user":
+                    note_amounts(agent_obj, text)
+                else:
                     check_the_claim(session, agent_obj, text, call_id)
+                    check_the_prices(session, agent_obj, text, call_id)
                 asyncio.create_task(log_turn(call_id, who, stored))
                 if account:
                     asyncio.create_task(backend_post("/memory", {
@@ -4137,6 +4486,10 @@ async def entrypoint(ctx: JobContext):
         def _gone(p):
             agent_obj.hangup_reason = "caller hung up"
             hangup.set()
+            # nothing keeps running after the caller hangs up
+            hunt = getattr(agent_obj, "hunt_task", None)
+            if hunt and not hunt.done():
+                hunt.cancel()
     except Exception as e:
         log.warning(f"could not watch for disconnect: {e}")
 

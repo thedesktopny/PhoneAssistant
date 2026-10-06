@@ -507,6 +507,34 @@ def _():
         assert "not allowed to talk to you about this" in said, wrong
 
 
+@scenario("browser: a finished search says whether it found everything",
+          "call 83 - 'don't come back till you find a car with all the "
+          "features'; nothing could tell a full match from a near one")
+def _():
+    """One small real job on a page that never changes. Before the fix a
+    finished job carried no code at all, so a search going site to site
+    could not know when to stop."""
+    import time as _t
+    d = call("/jobs/browse", method="POST", account_id=ACCOUNT,
+             goal="What is the main heading on this page?",
+             site="", url="https://example.com", call_id=0)
+    jid = d.get("job_id")
+    assert jid, f"no job started: {d}"
+    st = {}
+    for _ in range(50):
+        _t.sleep(4)
+        st = call("/jobs/status", job_id=jid)
+        if st.get("state") in ("done", "failed"):
+            break
+    if st.get("state") == "failed":
+        raise SetupProblem(f"the page could not be read: {st.get('message')}")
+    assert st.get("state") == "done", f"never finished: {st}"
+    assert st.get("reason") in ("met", "not_met"), (
+        f"a finished job still carries no found/not-found code: {st}")
+    assert st.get("reason") == "met", (
+        f"the heading was right there and it was called not found: {st}")
+
+
 # --------------------------------------------------------------- result
 
 print()

@@ -3650,10 +3650,360 @@ def _():
     assert len(spoke) == 1, f"it apologised {len(spoke)} times"
 
     src = io.open("agent.py", encoding="utf-8").read()
-    assert "self.ran_tools.add(fn.__name__)" in src, \
+    assert "note_tool_ran(self, fn.__name__)" in src and \
+        "agent_obj.ran_tools.add(name)" in src, \
         "tool calls are not recorded, so no claim can be checked"
     assert "check_the_claim(session, agent_obj, text, call_id)" in src, \
         "nothing checks what is said as it is said"
+
+
+@check("Google's tap prompt is said TO the caller, in fixed words")
+def _():
+    """Call 82: "Google sent a prompt to their phone. Tell them to tap Yes"
+    - read out word for word to the man holding the phone. It was an
+    instruction to the assistant, and he heard himself talked about."""
+    b = io.open("browser.py", encoding="utf-8").read()
+    taps = [b[i:i + 400] for i in range(len(b))
+            if b.startswith('_ob_set(sid, "needs_tap"', i)]
+    assert len(taps) >= 3, f"found {len(taps)} tap prompts"
+    import re as _re
+    for t in taps:
+        t = _re.sub(r'"\s*\n\s*f?"', "", t)      # join the pieces
+        said = t[:t.index(")") + 1] if ")" in t else t
+        assert "your phone" in said, f"not said to the caller: {said[:160]}"
+        for wrong in ("Tell them", "their phone", "them to"):
+            assert wrong not in said, f"talks about the caller: {said[:160]}"
+    a = io.open("agent.py", encoding="utf-8").read()
+    i = a.index('if st == "needs_tap":')
+    assert 'return ("exact", msg)' in a[i:i + 400], \
+        "the tap prompt is still handed to the model to phrase"
+    w = a[a.index("async def _watch(self"):a.index("def _start_watch(")]
+    assert "isinstance(line, tuple)" in w and "speak_exactly(" in w, \
+        "the watcher cannot say fixed words"
+
+
+@check("a claim that something was asked for is caught when nothing asked")
+def _():
+    """Call 82: "We've asked Google to send a text code" - the sign-in had
+    already failed and no tool ran. He waited for a text nobody asked
+    for."""
+    import asyncio
+    import time as _t
+    ask = agent.CLAIMED_ASK
+    for claim in ("We\u2019ve asked Google to send a text code.",
+                  "We've asked Google to send a text code.",
+                  "I have requested a new code from Amazon.",
+                  "I've asked the office to call you back."):
+        assert ask.search(claim), f"missed a claim: {claim}"
+    for fine in ("I asked you to read the code out.",
+                 "Google sent a code to your phone.",
+                 "Shall I ask Google to send a text code?",
+                 "The office will call you tomorrow."):
+        assert not ask.search(fine), f"wrongly treated as a claim: {fine}"
+
+    spoke, facts = [], []
+
+    class Ctx:
+        items = []
+
+        def copy(self):
+            return self
+
+        def add_message(self, role, content):
+            facts.append(content)
+
+    class Fake:
+        llm = tts = None
+
+        def generate_reply(self, **k):
+            spoke.append(k.get("instructions", ""))
+
+    class Stand:
+        def __init__(self, tool_at, live=False):
+            self.ran_tools = set(tool_at)
+            self.tool_at = dict(tool_at)
+            self.job_live = live
+            self.chat_ctx = Ctx()
+
+        async def update_chat_ctx(self, ctx, **k):
+            return None
+
+    async def say(obj, words):
+        agent.check_the_claim(Fake(), obj, words, 1)
+        await asyncio.sleep(0.05)
+
+    real_log = agent.log_turn
+
+    async def no_log(*a, **k):
+        return None
+    agent.log_turn = no_log
+    try:
+        # call 82: connect_email ran minutes ago, the sign-in is over
+        old = Stand({"connect_email": _t.monotonic() - 400})
+        asyncio.run(say(old, "We've asked Google to send a text code."))
+        assert spoke and agent.ASKED_NOTHING in spoke[0], spoke
+        assert any("connect_email" in f for f in facts), facts
+        spoke.clear()
+        asyncio.run(say(old, "We've asked Google to send it again."))
+        assert not spoke, "it apologised twice"
+        # a tool really asked, just now: leave it alone
+        asyncio.run(say(Stand({"try_another_way": _t.monotonic()}),
+                        "We've asked Google to send a text code."))
+        assert not spoke, "it apologised for something that was asked for"
+        # a sign-in is still running: leave it alone
+        asyncio.run(say(Stand({}, live=True),
+                        "I've asked Google to send a code."))
+        assert not spoke, "it apologised while a sign-in was running"
+    finally:
+        agent.log_turn = real_log
+    src = io.open("agent.py", encoding="utf-8").read()
+    i = src.index("async def leave_note_for_office(")
+    assert 'note_tool_ran(self, "leave_note_for_office")' in \
+        src[i:i + 800], "a note to the office is not counted as asking"
+
+
+@check("a price no page gave is caught on the call")
+def _():
+    """Call 83: the search found CarMax at $13,599 and Car and Driver at
+    $38,935. Six seconds later the caller heard a Kia Carnival at $34,500,
+    a Pacifica at $37,000 and an Odyssey at $35,000 - on no page at all -
+    and then the real answer."""
+    import asyncio
+    found = ("Cheapest price shown is CarMax at $13,599 for a Kia Sedona. "
+             "The others I found are Car and Driver at $38,935 for a 2026 "
+             "Kia Carnival, and AutoFinder at $40,100 for a Ram ProMaster "
+             "City.")
+    made_up = ("1. A Kia Carnival, lower-range model, around $34,500 at a "
+               "dealer near the New York area. 2. A Chrysler Pacifica, base "
+               "model, starting at about $37,000. 3. A Honda Odyssey, "
+               "entry-level trim, around $35,000.")
+    known = agent.amounts_in(found, bare=True)
+    assert agent.invented_amounts(made_up, known) == {34500, 37000, 35000}
+    for fine in ("the lowest price is at CarMax for a Kia Sedona at "
+                 "$13,599, and a 2026 Kia Carnival at $38,935.",
+                 "That is about $39,000.",
+                 "With $40,100 and $13,599 together, that is $53,699."):
+        assert not agent.invented_amounts(fine, known), fine
+
+    spoke, facts = [], []
+
+    class Out:
+        role = None
+        text_content = None
+
+        def __init__(self, output):
+            self.output = output
+
+    class Ctx:
+        def __init__(self, items):
+            self.items = items
+
+        def copy(self):
+            return self
+
+        def add_message(self, role, content):
+            facts.append(content)
+
+    class Fake:
+        llm = tts = None
+
+        def generate_reply(self, **k):
+            spoke.append(k.get("instructions", ""))
+
+    class Stand:
+        instructions = "You are a phone assistant."
+
+        def __init__(self, known=(), items=()):
+            self.known_amounts = set(known)
+            self.chat_ctx = Ctx(list(items))
+
+        async def update_chat_ctx(self, ctx, **k):
+            return None
+
+    async def say(obj, words):
+        agent.check_the_prices(Fake(), obj, words, 1)
+        await asyncio.sleep(0.05)
+
+    real_log = agent.log_turn
+
+    async def no_log(*a, **k):
+        return None
+    agent.log_turn = no_log
+    try:
+        obj = Stand(known)
+        asyncio.run(say(obj, made_up))
+        assert spoke and agent.MADE_UP_PRICE in spoke[0], spoke
+        assert any("$34,500" in f for f in facts), facts
+        spoke.clear()
+        asyncio.run(say(Stand(known), "CarMax has a Kia Sedona at $13,599."))
+        assert not spoke, "a real price was called made up"
+        # a price in a tool result already in its record counts
+        asyncio.run(say(Stand((), [Out("Total: $212.47 with delivery")]),
+                        "The total is $212.47."))
+        assert not spoke, "a price from a tool result was called made up"
+    finally:
+        agent.log_turn = real_log
+    src = io.open("agent.py", encoding="utf-8").read()
+    assert "note_amounts(self, result)" in src, \
+        "tool results are not read for prices"
+    assert "note_amounts(agent_obj, text)" in src, \
+        "a price the caller says is not counted as real"
+    assert "check_the_prices(session, agent_obj, text, call_id)" in src, \
+        "nothing checks what is said"
+
+
+@check("'don't come back until you find it' - one search, site after site")
+def _():
+    """Call 83: "don't come back to me till you find a car that has all the
+    features" - and it came back after every blocked site to ask whether
+    to try another. Here: two blocked sites, one without leather, then one
+    with everything. The caller hears 'still looking' and the find -
+    never a question in between, never a failure."""
+    import asyncio
+    import types
+    b = io.open("browser.py", encoding="utf-8").read()
+    assert '"met":true' in b and 'reason="met" if act.get("met") is True' \
+        in b, "a browse job does not say whether it found everything"
+
+    script = {
+        "TrueCar": {"state": "failed", "reason": "bot_check",
+                    "message": "press and hold"},
+        "Edmunds": {"state": "failed", "reason": "ip_blocked",
+                    "message": "403"},
+        "CarGurus": {"state": "done", "reason": "not_met",
+                     "message": "A 2019 Honda Odyssey at $24,990. Leather "
+                                "is not listed."},
+        "Carvana": {"state": "done", "reason": "met",
+                    "message": "A 2020 Kia Sedona EX at $21,590 with 8 "
+                               "seats, leather seats and a sunroof."},
+    }
+    jobs, cancelled, spoke, facts = {}, [], [], []
+
+    class Resp:
+        def __init__(self, d):
+            self.d = d
+
+        def json(self):
+            return self.d
+
+    class Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, headers=None, params=None, **k):
+            if url.endswith("/jobs/browse"):
+                jid = len(jobs) + 1
+                jobs[jid] = params["site"]
+                return Resp({"job_id": jid})
+            if url.endswith("/jobs/cancel"):
+                cancelled.append(params["job_id"])
+            return Resp({})
+
+    async def status(path, **params):
+        site = jobs[params["job_id"]]
+        return dict(script.get(site) or {"state": "working"}, kind="browse")
+
+    class Sess:
+        llm = tts = None
+
+        def generate_reply(self, **k):
+            spoke.append(k.get("instructions", ""))
+
+    class Ctx:
+        items = []
+
+        def copy(self):
+            return self
+
+        def add_message(self, role, content):
+            facts.append(content)
+
+    class Stand:
+        account_id = call_id = 1
+        session = Sess()
+        chat_ctx = Ctx()
+        job_live = True
+
+        async def update_chat_ctx(self, ctx, **k):
+            return None
+
+        async def _record_outcome(self, d):
+            facts.append("recorded " + d.get("reason", ""))
+
+    for name in ("_hunt", "_hunt_report", "_cancel_job"):
+        setattr(Stand, name, getattr(agent.Assistant, name))
+
+    async def fast(*a, **k):
+        await real_sleep(0)
+    real_sleep = asyncio.sleep
+
+    async def no_log(*a, **k):
+        return None
+    saved = (agent.httpx, agent.backend_get, agent.log_turn, agent.asyncio)
+    agent.httpx = types.SimpleNamespace(AsyncClient=Client)
+    agent.backend_get = status
+    agent.log_turn = no_log
+    agent.asyncio = types.SimpleNamespace(
+        sleep=fast, CancelledError=asyncio.CancelledError,
+        create_task=asyncio.create_task)
+    try:
+        obj = Stand()
+        asyncio.run(obj._hunt("minivan, 8 seats, leather, sunroof",
+                              ["TrueCar", "Edmunds", "CarGurus", "Carvana",
+                               "CarMax"]))
+        assert list(jobs.values()) == ["TrueCar", "Edmunds", "CarGurus",
+                                       "Carvana"], jobs
+        heard = " | ".join(spoke)
+        assert "21,590" in spoke[-1], f"the find was not told: {heard}"
+        for wrong in ("another", "Would you like", "human check",
+                      "blocking", "Shall I"):
+            assert wrong not in " ".join(spoke[:-1]), \
+                f"it came back to ask before it was done: {heard}"
+        assert obj.job_live is False, "still marked busy after it ended"
+
+        # nothing anywhere: one report, from what each site really did
+        jobs.clear()
+        spoke.clear()
+        facts.clear()
+        script["Carvana"] = dict(script["CarGurus"])
+        asyncio.run(Stand()._hunt("minivan", ["TrueCar", "Edmunds",
+                                              "Carvana"]))
+        last = spoke[-1]
+        assert "TrueCar and Edmunds would not let us in" in last, last
+        assert "Carvana had nothing with all of it" in last, last
+        assert "24,990" in last and "office" in last, last
+        assert any("ended with no full match" in f for f in facts), facts
+
+        # stopped part-way: the job running is cancelled too
+        jobs.clear()
+        script["Slow"] = None
+
+        async def stop_it():
+            t = asyncio.create_task(Stand()._hunt("minivan", ["Slow"]))
+            for _ in range(20):
+                await real_sleep(0)
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+        asyncio.run(stop_it())
+        assert cancelled, "stopping the search left its job running"
+    finally:
+        (agent.httpx, agent.backend_get, agent.log_turn,
+         agent.asyncio) = saved
+    src = io.open("agent.py", encoding="utf-8").read()
+    i = src.index("async def stop_that(")
+    assert "hunt.cancel()" in src[i:i + 900], "stop_that leaves it running"
+    i = src.index("def _gone(p):")
+    assert "hunt.cancel()" in src[i:i + 500], \
+        "it keeps searching after the caller hangs up"
 
 
 @check("a text is never called sent when it cannot be delivered")

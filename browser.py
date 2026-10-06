@@ -888,20 +888,22 @@ def _run_signin(sid: int, account_id: int, email: str):
                 if wants_tap(page):
                     num = wait_for_tap_number(page)
                     if num:
+                        # Spoken to the caller word for word, so it is
+                        # written TO them. Call 82 heard "Tell them to tap
+                        # Yes" - an instruction meant for the assistant.
                         _ob_set(sid, "needs_tap",
-                                f"Google sent a prompt to their phone. Tell "
-                                f"them to tap Yes and choose the number "
-                                f"{num}.")
+                                f"Google has sent a message to your phone. "
+                                f"Tap Yes on it, then choose the number "
+                                f"{num}.", reason="tap_number")
                     else:
                         emit("signin", f"signin {sid}",
                              f"No number found on the tap screen. Screen "
                              f"text: {screen(page)[:400]}", "warn")
                         _ob_set(sid, "needs_tap",
-                                "Google sent a prompt to their phone. Tell "
-                                "them to tap Yes, and to read out the number "
-                                "shown on their own phone if it asks for one. "
-                                "If they already missed it, use "
-                                "try_another_way.")
+                                "Google has sent a message to your phone. "
+                                "Tap Yes on it. If it asks you to choose a "
+                                "number, tell me the numbers you see.",
+                                reason="tap")
                     waited = 0
                     switched = False
                     while waited < 200:
@@ -917,8 +919,9 @@ def _run_signin(sid: int, account_id: int, email: str):
                             num = tap_number(page)
                             if num:
                                 _ob_set(sid, "needs_tap",
-                                        f"The number is {num}. Tell them to "
-                                        f"choose {num} on their phone.")
+                                        f"The number to choose on your "
+                                        f"phone is {num}.",
+                                        reason="tap_number")
                         if (_PENDING.get(sid) or {}).get("other_way"):
                             _PENDING[sid]["other_way"] = False
                             if pick_another_method(page):
@@ -1971,7 +1974,11 @@ Actions:
 {"action":"ask_user","question":"...","why":"..."}   when you need a code,
                                                       a choice, or anything
                                                       only they can answer
-{"action":"done","answer":"what to say out loud","why":"..."}
+{"action":"done","answer":"what to say out loud","met":true,"why":"..."}
+                      met: true only if what you found has EVERY thing the
+                      goal asks for, each one seen on a page. Anything not
+                      confirmed - met is false, and the answer says what
+                      was missing.
 Any action may also carry "found":"..." - a fact this page told you that
 the goal needs: a price, a size, what something is made of. It is kept and
 given back to you on every later step, so once you have written something
@@ -2806,7 +2813,11 @@ def _run_browse(jid: int, account_id: int, site: str):
                         _job_set(jid, "working", "checking that before "
                                                  "saying it")
                         continue
-                    _job_set(jid, "done", answer)
+                    # A code, not prose, says whether it was found: someone
+                    # searching site after site (call 83) stops on "met".
+                    _job_set(jid, "done", answer,
+                             reason="met" if act.get("met") is True
+                             else "not_met")
                     outcome = "ok"
                     if recorded:
                         _save_recipe(site_key, task, goal, recorded)
