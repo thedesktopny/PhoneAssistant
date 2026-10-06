@@ -299,6 +299,18 @@ Waiting for events…</pre>
 </section>
 
 <section class="page" id="p-sites">
+  <div class="card"><h2>Watch a browser working</h2>
+    <div class="hint">Every browser running right now. "Watch" opens the
+      real screen as it works - useful while a sign-in or an order is
+      going on. "Replay" shows the recording afterwards. Anyone with a
+      link can watch, so don't pass them on.</div>
+    <button class="sec" onclick="loadLive()">Refresh</button>
+    <a class="sec" href="https://www.browserbase.com/sessions"
+       target="_blank" rel="noopener">Open Browserbase</a>
+    <table><thead><tr><th>Started</th><th>Session</th><th></th></tr></thead>
+    <tbody id="liverows"><tr><td colspan="3" class="hint">Press
+    Refresh.</td></tr></tbody></table>
+  </div>
   <div class="card"><h2>What customers ask for, by site</h2>
     <div class="hint">Last 30 days. "Learned" means it ran from saved steps
       with no thinking; "fell back" means the saved steps broke and it
@@ -947,6 +959,31 @@ async function makeInvite(){
 async function cancelInvite(id){
   await fetch('/invites/cancel?invite_id=' + id, {method:'POST'});
   loadInvites();
+}
+async function loadLive(){
+  const tb = document.getElementById('liverows');
+  if(!tb) return;
+  tb.innerHTML = '<tr><td colspan="3" class="hint">Looking...</td></tr>';
+  try{
+    const d = await (await fetch('/browser/live')).json();
+    if(d.error){
+      tb.innerHTML = '<tr><td colspan="3" class="no">' + esc(d.error) +
+        '</td></tr>';
+      return; }
+    if(!d.sessions || !d.sessions.length){
+      tb.innerHTML = '<tr><td colspan="3" class="hint">No browser is ' +
+        'running right now. Start a job and press Refresh.</td></tr>';
+      return; }
+    tb.innerHTML = d.sessions.map(function(s){
+      var watch = s.watch ? '<a class="sec" target="_blank" ' +
+        'rel="noopener" href="' + esc(s.watch) + '">Watch</a> ' : '';
+      return '<tr><td>' + esc(s.started || '') + '</td><td>' +
+        esc((s.id || '').slice(0, 10)) + '</td><td>' + watch +
+        '<a class="sec" target="_blank" rel="noopener" href="' +
+        esc(s.replay) + '">Replay</a></td></tr>'; }).join('');
+  }catch(e){
+    tb.innerHTML = '<tr><td colspan="3" class="no">' + esc(e.message) +
+      '</td></tr>'; }
 }
 async function loadInvites(){
   const tb = document.getElementById('inv_rows');

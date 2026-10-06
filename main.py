@@ -2852,6 +2852,87 @@ def models_list(request: Request):
     return out
 
 
+@app.get("/browser/live")
+def browser_live(request: Request, limit: int = 10):
+    """Browsers running right now, each with a link to watch it.
+
+    Browserbase's live view is a web page showing the real browser as it
+    works. Anyone with the link can watch, so these are only handed out
+    behind the admin password, and they stop working when the session
+    ends."""
+    require_auth(request)
+    if not BROWSERBASE_API_KEY:
+        return {"sessions": [], "error": "Browserbase isn't configured."}
+    head = {"X-BB-API-Key": BROWSERBASE_API_KEY}
+
+    def ask(path):
+        req = urllib.request.Request(
+            "https://api.browserbase.com/v1" + path, headers=head)
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read().decode())
+
+    out = []
+    try:
+        rows = ask(f"/sessions?projectId={BROWSERBASE_PROJECT_ID}"
+                   f"&status=RUNNING")
+    except Exception as e:
+        return {"sessions": [], "error": f"Browserbase: {str(e)[:200]}"}
+    if isinstance(rows, dict):
+        rows = rows.get("data") or rows.get("sessions") or []
+    for s in rows[:max(1, min(int(limit or 10), 25))]:
+        sid = s.get("id") or ""
+        row = {"id": sid, "started": s.get("createdAt", ""),
+               "status": s.get("status", ""),
+               "replay": f"https://www.browserbase.com/sessions/{sid}"}
+        try:
+            d = ask(f"/sessions/{sid}/debug")
+            row["watch"] = (d.get("debuggerFullscreenUrl")
+                            or d.get("debuggerUrl") or "")
+        except Exception as e:
+            row["watch"] = ""
+            row["note"] = str(e)[:120]
+        out.append(row)
+    return {"sessions": out, "count": len(out),
+            "dashboard": "https://www.browserbase.com/sessions"}
+
+
+@app.get("/browser/session")
+def browser_session(request: Request, session_id: str):
+    """One browser session: how to watch or replay it, and its own log."""
+    require_auth(request)
+    if not BROWSERBASE_API_KEY:
+        raise HTTPException(400, "Browserbase isn't configured.")
+    head = {"X-BB-API-Key": BROWSERBASE_API_KEY}
+    out = {"id": session_id,
+           "replay": f"https://www.browserbase.com/sessions/{session_id}"}
+
+    def ask(path):
+        req = urllib.request.Request(
+            "https://api.browserbase.com/v1" + path, headers=head)
+        with urllib.request.urlopen(req, timeout=25) as r:
+            return json.loads(r.read().decode())
+
+    try:
+        d = ask(f"/sessions/{session_id}/debug")
+        out["watch"] = d.get("debuggerFullscreenUrl") or d.get("debuggerUrl")
+    except Exception as e:
+        out["watch"] = ""
+        out["watch_error"] = str(e)[:200]
+    try:
+        logs = ask(f"/sessions/{session_id}/logs")
+        if isinstance(logs, dict):
+            logs = logs.get("data") or []
+        # Only what a person can use: when, what happened, and where.
+        out["log"] = [{"at": l.get("timestamp", ""),
+                       "what": l.get("method") or l.get("event") or "",
+                       "where": str(l.get("pageId") or "")[:12]}
+                      for l in (logs or [])[-80:]]
+    except Exception as e:
+        out["log"] = []
+        out["log_error"] = str(e)[:200]
+    return out
+
+
 @app.get("/browser/account")
 def browser_account(request: Request):
     """Ask Browserbase for a plain browser and report exactly what it says.

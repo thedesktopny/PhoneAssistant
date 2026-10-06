@@ -3413,6 +3413,25 @@ def _():
         "the silence prompt no longer goes through speak_exactly"
 
 
+@check("the panel can watch a browser while it works")
+def _():
+    """Until now a wall could only be deduced from a job's steps after the
+    fact. Browserbase keeps a live view of a running browser and a
+    recording of a finished one; both are one click away now."""
+    paths = {r.path for r in main.app.routes}
+    assert "/browser/live" in paths and "/browser/session" in paths, paths
+    import admin_page
+    page = admin_page.ADMIN_HTML
+    assert "loadLive()" in page and "liverows" in page,         "the panel has no way to list running browsers"
+    assert "Watch a browser working" in page
+    assert "browserbase.com/sessions" in page,         "no link to the recordings"
+    src = io.open("main.py", encoding="utf-8").read()
+    i = src.index("def browser_live(")
+    body = src[i:i + 2500]
+    assert "require_auth(request)" in body,         "a live view of a customer's browser behind no password"
+    assert "status=RUNNING" in body, "it would list finished sessions too"
+
+
 @check("the admin panel's script actually runs")
 def _():
     """`async var chArea = "";` sat in the page for weeks. A browser stops
