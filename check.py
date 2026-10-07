@@ -4559,7 +4559,7 @@ def _():
     # the runner: a done basket makes the order ready at that total
     i = src.index("def _run_browse(")
     run = src[i:src.index("\ndef ", i + 10)]
-    assert 'payload.get("order_id")' in run and '"ready"' in run
+    assert 'payload.get("order_id")' in run and "_basket_matches(" in run
     # and placing it stops if the total is not the one they said yes to
     i = src.index("def _run_checkout(")
     co = src[i:src.index("\ndef ", i + 10)]
@@ -4726,6 +4726,121 @@ def _():
         "the basket job still stops to ask which address"
     i = src.index("    async def search_site(")
     assert "INSIDE one product" in src[i:i + 900]
+
+
+@check("an unfinished order is remembered on the next call")
+def _():
+    """Call 90: "I'd like to order the same thing I tried earlier" - "I
+    only keep track during each call; once the call ends the details
+    aren't stored." Two orders sat in the database, one read back at
+    $39.16. Then it searched B&H, which nobody had mentioned."""
+    src = io.open("agent.py", encoding="utf-8").read()
+    i = src.index("async def entrypoint(")
+    body = src[i:]
+    assert 'backend_get("/orders"' in body and "UNFINISHED ORDERS" in body, \
+        "unfinished orders are not loaded at the start of a call"
+    assert body.index("UNFINISHED ORDERS") < body.index(
+        "agent_obj = Assistant(account, caller, call_id, history, known)"), \
+        "the orders are loaded after the assistant is built"
+    inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                           "+1555", 1)
+    assert "Never say details are not stored" in inst.instructions
+    tools = {getattr(t, "__name__", ""): t for t in inst.tools}
+    assert "never your" in (tools["search_site"].__doc__ or ""), \
+        "search_site may still pick a shop nobody named"
+    import advisor
+    assert "orders_in_progress" in advisor.call_state(1)
+    assert "orders_in_progress" in advisor.ADVISOR_SYSTEM
+
+
+@check("a basket already holding the item is put right, not doubled")
+def _():
+    """Call 90: the labels were already in the Amazon cart from the call
+    before. The basket job added them again, the review page said
+    quantity 3 at $113.97 for an order of one, and the caller was asked
+    'Should I place this order?'."""
+    import browser
+    g = browser.PREPARE_GOAL
+    assert "Open the basket FIRST" in g and "do not add it again" in g, \
+        "the basket job still adds the item without looking"
+    assert '"quantity"' in g and '"other_items"' in g
+    assert browser._basket_matches.__doc__
+    src = io.open("browser.py", encoding="utf-8").read()
+    i = src.index("def _run_browse(")
+    run = src[i:src.index("\ndef ", i + 10)]
+    assert "_basket_matches(" in run, \
+        "the review page is called ready whatever it shows"
+    m = io.open("main.py", encoding="utf-8").read()
+    i = m.index("def order_prepare(")
+    assert '"check"' in m[i:i + 900], "a 'check' order can never be re-run"
+    a = io.open("agent.py", encoding="utf-8").read()
+    i = a.index("async def _prepare_order(")
+    body = a[i:a.index("    @function_tool", i)]
+    assert '== "check"' in body and "Do NOT ask to place it" in body, \
+        "a basket that does not match is still offered for a yes"
+    # the state decision itself
+    real = browser.Session
+
+    class Row:
+        quantity = 1
+
+    class Q:
+        def __init__(self, *a):
+            pass
+
+        def filter_by(self, **k):
+            return self
+
+        def first(self):
+            return Row()
+
+    class Db:
+        def query(self, *a):
+            return Q()
+
+        def close(self):
+            pass
+    browser.Session = Db
+    try:
+        assert browser._basket_matches(1, {"quantity": 3}) == (
+            "check", "The basket has 3 of this item; they asked for 1.")
+        assert browser._basket_matches(1, {"quantity": 1,
+                                           "other_items": True})[0] == "check"
+        assert browser._basket_matches(1, {"quantity": "1"}) == ("ready", "")
+        assert browser._basket_matches(1, {})[0] == "ready"
+    finally:
+        browser.Session = real
+
+
+@check("an order waiting for a yes does not count as work in progress")
+def _():
+    """Call 90: "Still with you. This one is slow" five seconds after the
+    checkout had been read back - and later, with the hold lines used up,
+    108 seconds of dead air and "Are you still there?" while a job ran."""
+    src = io.open("agent.py", encoding="utf-8").read()
+    wd = src[src.index("async def watchdog("):
+             src.index("async def hangup_when_asked(")]
+    i = wd.index("busy = bool(")
+    assert '"order_id"' not in wd[i:i + 200], \
+        "an open order keeps the watchdog 'busy' for the rest of the call"
+
+
+@check("a basket job starts in the basket")
+def _():
+    """Call 90: "change the quantity from 3 to 1" went to Orders, Awaiting
+    delivery, Buy it again - two minutes, never the cart."""
+    import browser
+    assert browser.CART_PAGES["amazon"].endswith("/gp/cart/view.html")
+    assert browser.CART_GOAL.search("change the quantity in the cart")
+    assert browser.CART_GOAL.search("remove the extra labels from my basket")
+    assert not browser.CART_GOAL.search("list the options for this item")
+    src = io.open("browser.py", encoding="utf-8").read()
+    i = src.index("def _run_browse(")
+    run = src[i:src.index("\ndef ", i + 10)]
+    assert "CART_PAGES.get(site" in run and 'payload.get("order_id")' in \
+        run[run.index("CART_PAGES.get(site") - 200:run.index(
+            "CART_PAGES.get(site")], \
+        "a cart goal still starts on the home page"
 
 
 @check("a text is never called sent when it cannot be delivered")

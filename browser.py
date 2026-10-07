@@ -1817,6 +1817,22 @@ ORDER_PAGES = {
     "temu": "https://www.temu.com/orders.html",
 }
 
+# Where a shop keeps the basket. A goal about the basket starts here:
+# call 90 asked Amazon to change a quantity and the job wandered through
+# Orders and Buy Again for two minutes without once opening the cart.
+CART_PAGES = {
+    "amazon": "https://www.amazon.com/gp/cart/view.html",
+    "walmart": "https://www.walmart.com/cart",
+    "target": "https://www.target.com/cart",
+    "bestbuy": "https://www.bestbuy.com/cart",
+    "homedepot": "https://www.homedepot.com/mycart/home",
+    "lowes": "https://www.lowes.com/cart",
+    "costco": "https://www.costco.com/CheckoutCartDisplayView",
+    "chewy": "https://www.chewy.com/app/cart",
+    "etsy": "https://www.etsy.com/cart",
+}
+CART_GOAL = _re_scrub.compile(r"(?i)\b(cart|basket)\b")
+
 SEARCH_PAGES = {
     "walmart": "https://www.walmart.com/search?q=",
     "amazon": "https://www.amazon.com/s?k=",
@@ -2685,6 +2701,9 @@ def _run_browse(jid: int, account_id: int, site: str):
                 _job_set(jid, "opening", f"Looking up: {goal[:90]}")
         except Exception as e:
             emit("browse", f"job {jid}", f"search first failed: {e}", "warn")
+    if not start and site and CART_GOAL.search(goal) \
+            and not payload.get("order_id"):
+        start = CART_PAGES.get(site, "")
     if not start:
         start = site_url(site) or "https://www.google.com"
     # Other pages to try if this one turns out to refuse robots. A
@@ -2895,8 +2914,15 @@ def _run_browse(jid: int, account_id: int, site: str):
                     if payload.get("order_id"):
                         total = str(act.get("total") or "").strip()[:20]
                         if _money_of(total):
-                            _order_set(payload["order_id"], "ready",
-                                       answer[:600], final_total=total)
+                            # Ready only when the basket holds what was
+                            # asked for: this item, this many, nothing
+                            # else. Otherwise "check": read back, never
+                            # placed, until it is put right (call 90).
+                            state, why = _basket_matches(
+                                payload["order_id"], act)
+                            _order_set(payload["order_id"], state,
+                                       (why + " " if why else "")
+                                       + answer[:600], final_total=total)
                         else:
                             _order_set(payload["order_id"], "draft",
                                        "Reached the checkout but the total "
@@ -3131,17 +3157,21 @@ ITEM: {item}
 QUANTITY: {quantity}
 EXPECTED: about {price}
 
-1. Find exactly this item - the same product AND the same option (size,
-   pack, count, colour). If there is no clear match, give_up; never
-   substitute.
-2. Set the quantity, then Add to Cart.
-3. Open the basket, Proceed to checkout, and stop on the page with the
-   final button that places the order. You may NOT press it - nothing can
-   be bought here.
-4. Finish with done. In answer, read back: every item in the order with
-   its quantity and price - say clearly if anything else is in the basket
-   - the delivery address, the payment card, and the order total. Put the
-   order total, as it is written, in "total".
+1. Open the basket FIRST. If this exact item (same option) is already in
+   it, do not add it again - set its quantity to QUANTITY. Call 90: it
+   was already there from an earlier try, was added again, and the review
+   page showed quantity 3 at $113.97 for an order of one.
+2. Not there: find exactly this item - the same product AND the same
+   option (size, pack, count, colour). No clear match: give_up, never
+   substitute. Set the quantity, then Add to Cart.
+3. Anything else in the basket: leave it, and report it.
+4. Proceed to checkout, and stop on the page with the final button that
+   places the order. You may NOT press it - nothing can be bought here.
+5. Finish with done. In answer, read back: every item in the order with
+   its quantity and price, the delivery address, the payment card, and
+   the order total. Put the order total, as it is written, in "total";
+   this item's quantity on the review page in "quantity"; and
+   "other_items": true if anything else is in the basket.
 If the site asks which address or card, keep the one already selected
 and carry on - you read it back at the end, and they can change it then.
 Call 89 stopped to ask, and the question reached the caller too late.
@@ -3199,6 +3229,26 @@ def _money_of(text) -> float:
         return float(m.group(0).replace(",", "")) if m else 0.0
     except ValueError:
         return 0.0
+
+
+def _basket_matches(oid: int, act: dict):
+    """'ready' when the review page shows the order as asked for; 'check'
+    and the reason when it does not."""
+    db = Session()
+    row = db.query(Order).filter_by(id=oid).first()
+    want = int(row.quantity or 1) if row else 1
+    db.close()
+    got = act.get("quantity")
+    try:
+        got = int(str(got).strip()) if got not in (None, "") else None
+    except ValueError:
+        got = None
+    if act.get("other_items") is True:
+        return "check", "The basket holds other things besides this item."
+    if got is not None and got != want:
+        return "check", (f"The basket has {got} of this item; they asked "
+                         f"for {want}.")
+    return "ready", ""
 
 
 def _order_set(oid: int, state: str, message: str = "", **fields):

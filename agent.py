@@ -490,7 +490,8 @@ RECENT HISTORY — what was SAID on earlier calls and texts
 That is a record of conversation, NOT a record of facts. Never carry
 on anything from it until they ask. When they
 mean "what I asked for last time", tell them what it shows they asked for
-- never ask them to repeat it. What you said before may have been wrong. If they ask the same thing again, assume the last answer was wrong
+- never ask them to repeat it. You DO keep records: unfinished orders are
+listed above. Never say details are not stored. What you said before may have been wrong. If they ask the same thing again, assume the last answer was wrong
 and get it right this time.
 
 HOW YOU TALK
@@ -2165,6 +2166,18 @@ they go quiet, ask once whether they are still there, then wait.
                         f"the card and the total {d.get('order_total')} - "
                         f"then ask exactly: Should I place this order? "
                         f"Nothing has been bought. {msg}")
+            if st == "done" and d.get("order_state") == "check":
+                # The basket is not the order they asked for. It cannot be
+                # placed as it stands (call 90: quantity 3, total $113.97,
+                # for an order of one).
+                return (f"The {site} basket does NOT match what they asked "
+                        f"for, so it cannot be placed as it is. Tell them "
+                        f"exactly what is in it and what they asked for, "
+                        f"and ask whether to put it right. If yes: "
+                        f"do_on_website on {site} to set the quantity or "
+                        f"remove the other items, then draft_order again "
+                        f"to re-check. Do NOT ask to place it. Nothing has "
+                        f"been bought. {msg}")
             if st == "done":
                 return (f"Say you got to the {site} checkout but could not "
                         f"read the total, so nothing will be placed, and "
@@ -2536,8 +2549,10 @@ they go quiet, ask once whether they are still there, then wait.
     @function_tool
     @auto_report("site_read")
     async def search_site(self, context: RunContext, site: str, query: str):
-        """Search a site for a product on the caller's behalf. This reads
-        the results list only. To hear the options INSIDE one product -
+        """Search a site for a product on the caller's behalf. site is one
+        they named on THIS call, or an unfinished order's shop - never your
+        own pick (call 90 searched B&H unasked). This reads the results
+        list only. To hear the options INSIDE one product -
         pack sizes, counts, colours - do_on_website on that product: "go
         into the MUNBYN 220-sheet labels and list every option with its
         price" (calls 86, 89: "go into the item, you'll see the 4-pack")."""
@@ -4437,6 +4452,28 @@ async def entrypoint(ctx: JobContext):
                 for r in rows)
         except Exception as e:
             log.warning(f"history load failed: {e}")
+        # Orders written down and not placed are this system's own
+        # records. Call 90: "you don't have my history?" - "once the call
+        # ends, the details aren't stored". They were, in two places.
+        try:
+            orders = await backend_get("/orders",
+                                       account_id=account["account_id"],
+                                       limit=5)
+            open_orders = [o for o in orders if o.get("state") in
+                           ("draft", "preparing", "ready", "check")][:3]
+            if open_orders:
+                known = (known + "\n\nUNFINISHED ORDERS - real records of "
+                         "this system, from the last few calls:\n"
+                         + "\n".join(
+                             f"- order {o['order_id']} on {o['site']}: "
+                             f"{o.get('quantity') or 1} x {o['item']}"
+                             + (f", read back at {o['final_total']}"
+                                if o.get("final_total") else "")
+                             + f" ({o['state']}, {o.get('at', '')}). "
+                             f"Not placed."
+                             for o in open_orders))
+        except Exception as e:
+            log.warning(f"orders load failed: {e}")
         agent_obj = Assistant(account, caller, call_id, history, known)
     else:
         # A number we don't know: they can sign up with an invite code.
@@ -4531,9 +4568,12 @@ async def entrypoint(ctx: JobContext):
             # job_live, not job_id: job_id stays set after a job ends so
             # its result can be fetched, and a failed job used to count as
             # "busy" - tripling the silence allowed after nothing was left.
+            # Not order_id: an order waiting for the caller's yes is not
+            # work in progress. With it, call 90 heard "still with you,
+            # this one is slow" five seconds after the checkout was read
+            # back, and the hold lines were used up before the next job.
             busy = bool(getattr(agent_obj, "onboard_sid", None)
-                        or getattr(agent_obj, "job_live", False)
-                        or getattr(agent_obj, "order_id", None))
+                        or getattr(agent_obj, "job_live", False))
 
             # A warning first. Call 83 ended mid-search with nothing
             # said at all: the goodbye was handed to a model that was

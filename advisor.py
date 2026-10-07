@@ -69,6 +69,16 @@ def call_state(account_id: int, call_id: int = 0) -> dict:
     out["logins_saved_for_these_shops_only"] = [
         s.site for s in db.query(SiteLogin)
                           .filter_by(account_id=account_id).all()]
+    # This system's own record of orders not yet placed: "the same as
+    # before" is the newest of these (call 90).
+    out["orders_in_progress"] = [
+        {"order": o.id, "site": o.site, "item": o.item,
+         "quantity": o.quantity, "state": o.state,
+         "total_read_back": o.final_total or ""}
+        for o in (db.query(Order).filter_by(account_id=account_id)
+                    .filter(Order.state.in_(["draft", "preparing", "ready",
+                                             "check"]))
+                    .order_by(Order.id.desc()).limit(3).all())]
     out["cards"] = [f"{c.brand} ending {c.last4}"
                     for c in db.query(PaymentCard)
                                .filter_by(account_id=account_id).all()]
@@ -108,6 +118,8 @@ Rules:
   and nothing else, and no login is ever needed to read a public page.
   Call 83: a caller looking for a minivan was asked which saved login to
   use, Amazon or Walmart. Never ask for something the task does not need.
+- orders_in_progress are this system's own records. "The same as
+  before" means the newest of them. Never say nothing was recorded.
 - Never ask the caller to choose between things that make no difference
   to them. Decide it yourself, or ask about the thing they actually
   want.

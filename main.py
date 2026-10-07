@@ -3406,7 +3406,7 @@ def order_prepare(request: Request, order_id: int):
         raise HTTPException(400, "Browserbase isn't configured.")
     db = Session()
     row = db.query(Order).filter_by(id=order_id).first()
-    if not row or row.state not in ("draft", "ready", "failed"):
+    if not row or row.state not in ("draft", "ready", "check", "failed"):
         db.close()
         raise HTTPException(400, "Order isn't in a state to prepare.")
     # One basket job per shop at a time: two put the item in the cart
