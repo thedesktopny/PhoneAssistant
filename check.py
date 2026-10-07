@@ -4219,6 +4219,149 @@ def _():
                   api_key="x")
 
 
+@check("a question is answered from pages, with the site named - no browser")
+def _():
+    """Calls 42-62: one fridge question, twenty browser jobs, a human
+    check on Frigidaire's own site, and four different sets of buttons.
+    A question is read from the search engine's copy of the pages; the
+    answer says which site, and carries a freshness code."""
+    import find
+    pages = [{"title": "Shabbat Mode - Frigidaire Support",
+              "url": "https://www.frigidaire.com/support/x", "site":
+              "frigidaire.com", "text": "To turn on Sabbath mode press "
+              "and hold the Lock button for 5 seconds. Updated Mar 3, "
+              "2026.", "date": ""},
+             {"title": "fridge tips", "url": "https://forum.example/y",
+              "site": "forum.example", "text": "my cousin says hold the "
+              "plus button", "date": ""}]
+    asked = []
+
+    def fake_pages(q):
+        asked.append(q)
+        return pages
+
+    def fake_chat(messages, model="", **k):
+        assert "frigidaire.com" in messages[-1]["content"]
+        return {"choices": [{"message": {"content":
+                '{"answer": "Frigidaire\'s own site says to press and hold '
+                'the Lock button for five seconds.", "found": true, '
+                '"used": [1]}'}}]}
+    undo = everywhere("_pages_for", fake_pages)
+    undo2 = everywhere("_openai_chat", fake_chat)
+    undo3 = everywhere("OPENAI_API_KEY", "x")
+    try:
+        out = find.find_out("how do I turn on Sabbath mode on the "
+                            "Frigidaire PRDF1922AF", 1, 1)
+    finally:
+        undo()
+        undo2()
+        undo3()
+    assert asked, "no pages were looked for"
+    assert out["found"] is True and out["how"] == "search", out
+    assert out["sources"] and out["sources"][0]["site"] == "frigidaire.com"
+    assert out["freshness"] == "dated" and out["as_of"] == "Mar 3, 2026", out
+    assert "took_ms" in out
+    assert "frigidaire" in out["answer"].lower()
+    src = io.open("find.py", encoding="utf-8").read()
+    for word in ("sync_playwright", "connect_over_cdp", "page.goto"):
+        assert word not in src, f"find.py drives a browser: {word}"
+    # questions that need a page behind them, and ones that don't
+    for q in ("how much is the Epson ET-5850 at Best Buy",
+              "PRDF1922AF shabbos mode", "cheapest ecco new jersey shoes",
+              "what time does Costco in Brooklyn open",
+              "which minivans have leather seats and a sunroof"):
+        assert find.needs_source(q), f"would answer from memory: {q}"
+    for q in ("how do you make a cup of tea", "what is a sukkah",
+              "how many ounces in a pound"):
+        assert not find.needs_source(q), f"would search for: {q}"
+
+
+@check("a question with nothing behind it says so, and is never filled in")
+def _():
+    """The pages did not answer. found is false, the answer says what
+    they do cover, and nothing is made up to fill the gap."""
+    import find
+
+    def fake_chat(messages, model="", **k):
+        return {"choices": [{"message": {"content":
+                '{"answer": "The pages cover the dishwasher, not the '
+                'fridge.", "found": false, "used": []}'}}]}
+    undo = everywhere("_pages_for", lambda q: [
+        {"title": "t", "url": "https://a.com/x", "site": "a.com",
+         "text": "dishwasher cycle guide", "date": ""}])
+    undo2 = everywhere("_openai_chat", fake_chat)
+    undo3 = everywhere("OPENAI_API_KEY", "x")
+    try:
+        out = find.find_out("PRDF1922AF ice maker button", 1, 1)
+        none = find.find_out("PRDF1922AF ice maker button", 1, 1)
+    finally:
+        undo()
+        undo2()
+        undo3()
+    assert out["found"] is False and out["sources"] == [], out
+    assert out["freshness"] == "indexed"
+    undo = everywhere("_pages_for", lambda q: [])
+    undo3 = everywhere("OPENAI_API_KEY", "x")
+    try:
+        none = find.find_out("PRDF1922AF ice maker button", 1, 1)
+    finally:
+        undo()
+        undo3()
+    assert none["found"] is False and none["reason"] == "no_pages", none
+    assert none["freshness"] == "none"
+
+
+@check("a blocked subject is refused before any page is looked for")
+def _():
+    import find
+
+    def boom(q):
+        raise AssertionError("a search ran for a blocked subject")
+    undo = everywhere("_pages_for", boom)
+    undo2 = everywhere("_openai_chat", boom)
+    undo3 = everywhere("OPENAI_API_KEY", "x")
+    try:
+        out = find.find_out("what are today's sports scores", 1, 1)
+    finally:
+        undo()
+        undo2()
+        undo3()
+    assert out.get("blocked") and out["answer"] == main.BLOCKED_REPLY, out
+    # and pages that turn out to be about one are refused too
+    undo = everywhere("_pages_for", lambda q: [
+        {"title": "latest news and politics", "url": "https://n.com/x",
+         "site": "n.com", "text": "election news sports gossip", "date": ""}])
+    undo3 = everywhere("OPENAI_API_KEY", "x")
+    try:
+        out = find.find_out("PRDF1922AF latest", 1, 1)
+    finally:
+        undo()
+        undo3()
+    assert out.get("blocked"), out
+
+
+@check("/find is on the backend, needs the token, and jobs show their goal")
+def _():
+    from fastapi.testclient import TestClient
+    c = TestClient(main.app, raise_server_exceptions=False, base_url="https://t")
+    if getattr(main, "SERVICE_TOKEN", ""):
+        assert c.get("/find", params={"q": "x"}).status_code in (401, 403)
+    c.headers["Authorization"] = f"Bearer {main.SERVICE_TOKEN}" \
+        if getattr(main, "SERVICE_TOKEN", "") else ""
+    undo = everywhere("_pages_for", lambda q: [])
+    undo3 = everywhere("OPENAI_API_KEY", "x")
+    try:
+        r = c.get("/find", params={"q": "PRDF1922AF manual"})
+    finally:
+        undo()
+        undo3()
+    assert r.status_code == 200 and r.json()["reason"] == "no_pages", r.text
+    src = io.open("main.py", encoding="utf-8").read()
+    i = src.index('@app.get("/jobs")')
+    assert '"goal": goal' in src[i:i + 1200], \
+        "the jobs list still hides what each job was asked to do"
+
+
 @check("a text is never called sent when it cannot be delivered")
 def _():
     """Call 76: a new customer with no email was told twice "I've sent you

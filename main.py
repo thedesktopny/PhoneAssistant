@@ -47,6 +47,7 @@ from ai import (_openai_chat, _summarise_page)
 from signals import (BLOCK_KINDS, BLOCK_MARKS, BLOCK_REASONS, BLOCK_VENDORS, BOT_CHECK_MARKS, CODE_BAD, CODE_DEST, SIGNED_IN_MARKS, SIGNED_OUT_MARKS, block_reason, classify_block, code_destination, looks_like_bot_check, looks_signed_in, looks_signed_out, record_block)
 from payments import (CHARGE_LIMIT_CENTS, StripeError, StripeNeedsRawCardAccess, stripe_card_page_url, stripe_charge, stripe_customer_for, stripe_hold_card, stripe_save_finished)
 from payments import (_card_brand, _luhn_ok, _stripe, _stripe_call)
+from find import find_out, needs_source
 from advisor import (ADVISOR_SYSTEM, PROFILE_SYSTEM, REVIEW_SYSTEM, WORKING_CLAIMS, advise, call_state, learn_about_caller, profile_for, review_call)
 from google_tools import (CODE_DIGITS, CODE_MAIL, CONNECT_CODE_HOURS, CONNECT_MAX_FAILS, CONNECT_MAX_FAILS_IP, CONVERTIBLE, DOC, DRIVE_KINDS, DRIVE_MAX_BYTES, MESSAGE_ACTIONS, PERSON_FIELDS, SEND_MAX_BYTES, SHEET, SLIDES, code_from_email, document_text, gmail_client, google_client, list_mailboxes, pick_connection, tool_attachment_text, tool_attachments, tool_cancel_event, tool_contact_add, tool_contacts_search, tool_create_event, tool_doc_add, tool_doc_create, tool_doc_replace, tool_draft_email, tool_drive_editable_copy, tool_drive_read, tool_drive_save_pdf, tool_drive_search, tool_email_drive_file, tool_find_contact, tool_find_free, tool_forward_email, tool_list_events, tool_mark_all_read, tool_mark_read, tool_message_action, tool_read_email, tool_reply_email, tool_search_email, tool_send_email, tool_sheet_add_row, tool_sheet_create, tool_sheet_read, tool_sheet_update, tool_task_add, tool_task_done, tool_tasks_list, tool_unread_summary)
 from google_tools import (_as_pdf, _cal, _category, _col_letters, _column_number, _connect_code, _connect_code_ok, _connect_too_many, _drive_kind, _drive_meta, _extract_body, _flow, _google_time, _headers_of, _made, _must_be, _person, _sheet_values, _spoken_date, _tab_range, _upload, _walk_parts)
@@ -2526,11 +2527,17 @@ def jobs_list(request: Request, limit: int = 30):
     db = Session()
     rows = db.query(Job).order_by(Job.id.desc()).limit(limit).all()
     names = {a.id: a.name for a in db.query(Account).all()}
-    out = [{"job_id": r.id, "who": names.get(r.account_id) or "?",
-            "kind": r.kind, "site": r.site, "state": r.state,
-            "message": r.message, "history": r.history or "",
-            "at": local_str(r.at) if r.at else ""}
-           for r in rows]
+    out = []
+    for r in rows:
+        try:
+            goal = (json.loads(r.payload or "{}").get("goal") or "")[:200]
+        except Exception:
+            goal = ""
+        out.append({"job_id": r.id, "who": names.get(r.account_id) or "?",
+                    "kind": r.kind, "site": r.site, "state": r.state,
+                    "reason": r.reason or "", "goal": goal,
+                    "message": r.message, "history": r.history or "",
+                    "at": local_str(r.at) if r.at else ""})
     db.close()
     return out
 
@@ -3571,6 +3578,14 @@ def price_now(request: Request, item: str, account_id: int = 0,
 def web_search(request: Request, q: str, near: str = ""):
     require_auth(request)
     return tool_web_search(q, near)
+
+
+@app.get("/find")
+def find(request: Request, q: str, account_id: int = 0, call_id: int = 0):
+    """Find something out without a browser: pages read from the search
+    engine's copy, the site named, the age given as a code. See find.py."""
+    require_auth(request)
+    return find_out(q, account_id, call_id)
 
 
 @app.get("/cal/events")
