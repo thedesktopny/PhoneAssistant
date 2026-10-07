@@ -4455,6 +4455,81 @@ def _():
     assert "real total from" in body
 
 
+@check("a real price with cents is never called made up")
+def _():
+    """Call 86: Amazon's search said "$17.59" and "$9.99". The guard kept
+    only 17 and 9, called the real prices made up twice, and the caller -
+    who had just heard them - said "I actually do see the prices"."""
+    import asyncio
+    found = ("The best matches for Munbyn 4x6 packaging stickers include: "
+             "MUNBYN Thermal Direct Shipping Labels (Pack of 500) for $17.59, "
+             "originally $26.38. MUNBYN 4x6 Thermal Printer Labels (220 "
+             "Sheets) for $9.99, originally $16.99.")
+    said = ("I found two options. One is a pack of 500 MUNBYN Thermal Direct "
+            "Shipping Labels for $17.59, and another is 220 sheets of MUNBYN "
+            "4x6 Thermal Printer Labels for $9.99.")
+    known = agent.amounts_in(found, bare=True)
+    assert {17.59, 9.99, 26.38, 16.99} <= known, sorted(known)
+    assert agent.invented_amounts(said, known) == set(), \
+        "real prices with cents are still called made up"
+    assert agent.invented_amounts("$1,299.95 and $0.99", agent.amounts_in(
+        "1,299.95 then 0.99", bare=True)) == set()
+    # and a really invented one is still caught
+    assert agent.invented_amounts("about $12.49", known) == {12.49}
+
+    # the whole path, as it ran: the job's message noted, then said
+    spoke = []
+
+    class Fake:
+        llm = tts = None
+
+        def generate_reply(self, **k):
+            spoke.append(k)
+
+    class Ctx:
+        items = []
+
+        def copy(self):
+            return self
+
+        def add_message(self, **k):
+            pass
+
+    class Stand:
+        instructions = ""
+        chat_ctx = Ctx()
+
+        async def update_chat_ctx(self, ctx, **k):
+            return None
+    obj = Stand()
+    agent.note_amounts(obj, found)
+
+    async def go():
+        agent.check_the_prices(Fake(), obj, said, 1)
+        await asyncio.sleep(0.05)
+    asyncio.run(go())
+    assert not spoke, "it apologised for prices Amazon really gave"
+
+
+@check("'stop that' about something already finished stops nothing")
+def _():
+    """Call 86: "I've stopped that search" - about a search that had
+    finished a minute before. job_id stays set after a job ends."""
+    src = io.open("agent.py", encoding="utf-8").read()
+    i = src.index("async def stop_that(")
+    body = src[i:i + 2500]
+    j = body.index('jid = getattr(self, "job_id", None)')
+    k = body.index("/jobs/cancel")
+    assert '"job_live"' in body[j:k], \
+        "a finished job can still be 'stopped' and announced as stopped"
+    assert "not say you stopped anything" in body[j:k], \
+        "nothing tells it not to announce a stop that never happened"
+    i = src.index("async def find_out(")
+    doc = src[i:i + 1200]
+    assert "search_site that shop" in doc, \
+        "what one shop has now can still go to a web search"
+
+
 @check("a text is never called sent when it cannot be delivered")
 def _():
     """Call 76: a new customer with no email was told twice "I've sent you

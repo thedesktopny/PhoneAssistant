@@ -2588,9 +2588,14 @@ they go quiet, ask once whether they are still there, then wait.
         if hunt and not hunt.done():
             hunt.cancel()
         jid = getattr(self, "job_id", None)
-        if not jid:
-            return ("Nothing is running. Do not say you are waiting for "
-                    "anything.")
+        # job_id stays set after a job ends, so its answer can be read.
+        # Call 86: "I've stopped that search" - about one that had already
+        # finished. Only a live job can be stopped.
+        if not jid or not (getattr(self, "job_live", False) or (
+                hunt and not hunt.done())):
+            return ("Nothing is running, so there is nothing to stop. Do "
+                    "not say you stopped anything - just do what they asked "
+                    "for now.")
         try:
             async with httpx.AsyncClient(timeout=20) as c:
                 await c.post(f"{BACKEND}/jobs/cancel", headers=AUTH,
@@ -3594,8 +3599,9 @@ they go quiet, ask once whether they are still there, then wait.
 
         IT CANNOT SEE THIS CONVERSATION: write the whole question out,
         make and model included. Not for the caller's own email, orders
-        or calendar, and not for "where is it cheapest" - find_best_price
-        does that."""
+        or calendar, not for "where is it cheapest" - find_best_price -
+        and not for what one shop has or charges now ("is the other one
+        still on Amazon, how much") - search_site that shop."""
         key = " ".join(question.lower().split())[:120]
         if self._lookups.get(key) == "failed":
             # The same question again gets the same nothing (call 52 ran
@@ -3844,7 +3850,11 @@ ASKED_NOTHING = ("I am sorry - I said that had been asked for, and it has "
 
 # A money amount as said: "$13,599", "$38,935.00", "$ 12.5".
 AMOUNT = re.compile(r"\$\s?(\d[\d,]*(?:\.\d{1,2})?)")
-BARE_NUMBER = re.compile(r"\b(\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?\b")
+# The cents belong to the number. Call 86: "$17.59" was remembered as 17,
+# so the real Amazon prices $17.59 and $9.99 were called made up - twice -
+# after the caller had heard them read correctly.
+BARE_NUMBER = re.compile(
+    r"\b((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)\b")
 MADE_UP_PRICE = ("I am sorry - I just gave you a price I did not read "
                  "anywhere. Please ignore it. I will only give you prices "
                  "I have read on a real page.")
