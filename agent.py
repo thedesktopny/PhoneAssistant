@@ -695,8 +695,11 @@ SHOPPING AND ORDERS
    for, it puts it in their basket and reads that shop's checkout back.
    Nothing is bought. Never ask such a shop's address or card - they
    come from their account there (call 87).
-3. Read ALL of the checkout back - each item, address, card, total - and
-   ask exactly: "Should I place this order?" Wait.
+3. Read ALL of the checkout back - each item, address, card, total.
+   They may have several addresses and cards saved there: ask which to
+   use. review_checkout with deliver_to or pay_with ("Monsey", "the Visa
+   ending 6158") changes it and reads back again. Settled? Ask exactly:
+   "Should I place this order?" Wait.
 4. Only on a clear yes, confirm_order. "Cancel that" -> cancel_order.
 5. No login on that shop: draft_order says what is missing. Address:
    what_is_saved, or save_address. Card: the best way is card_setup_code
@@ -705,13 +708,8 @@ SHOPPING AND ORDERS
 Never start a new search while an order is open.
 
 CHECKING A BASKET BEFORE BUYING
-review_checkout reads the checkout page back - items, address, card,
-total - and cannot buy anything, so it is always safe to look. Read the
-WHOLE thing back before asking about buying, and if the total is more than
-they expected say so first. The cart may hold things they put there weeks
-ago: if there is more in it than they asked for, tell them item by item.
-To change where or how it ships, pass a few words in deliver_to or
-pay_with ("Monsey", "the Visa ending 6158").
+review_checkout cannot buy anything, so it is always safe to look. If
+there is more in it than they asked for, tell them item by item.
 
 OTHER SITES
 - do_on_website works on sites we have never set up: give it a plain
@@ -2144,9 +2142,19 @@ they go quiet, ask once whether they are still there, then wait.
         if not d.get("job_id"):
             return (f"The order is written down, but the basket could not "
                     f"be opened: {d.get('detail', '')}. Nothing was bought.")
-        self.job_id = d["job_id"]
+        return self._watch_basket(
+            site, d["job_id"],
+            f"Putting it in their {site} basket and opening the checkout. "
+            f"Tell them in one sentence that nothing is being bought - you "
+            f"will read them {site}'s own total first - then say nothing "
+            f"until you are told what it shows.")
+
+    def _watch_basket(self, site: str, jid: int, first_words: str) -> str:
+        """Watch a job that reads the shop's checkout for the open order,
+        and say what to do with what it shows."""
+        self.job_id = jid
         self.job_site = site
-        oid, jid = self.order_id, d["job_id"]
+        oid = self.order_id
 
         async def fetch():
             j = await backend_get("/jobs/status", job_id=jid)
@@ -2161,10 +2169,18 @@ they go quiet, ask once whether they are still there, then wait.
             if st in ("needs_code", "needs_input"):
                 return f"{site} needs this from them: {msg}. Ask them."
             if st == "done" and d.get("order_state") == "ready":
+                # Several addresses and cards may be saved on the shop.
+                # The one selected is a default, not their choice: ask
+                # before the yes (David: "we still need to choose one").
                 return (f"This is {site}'s own checkout. Read ALL of it "
                         f"back, adding nothing - each item, the address, "
-                        f"the card and the total {d.get('order_total')} - "
-                        f"then ask exactly: Should I place this order? "
+                        f"the card and the total {d.get('order_total')}. "
+                        f"If it names other saved addresses or cards, "
+                        f"ask which they want; to change one, "
+                        f"review_checkout with deliver_to or pay_with, "
+                        f"which reads it back again. When the address and "
+                        f"card are settled, ask exactly: "
+                        f"Should I place this order? "
                         f"Nothing has been bought. {msg}")
             if st == "done" and d.get("order_state") == "check":
                 # The basket is not the order they asked for. It cannot be
@@ -2185,10 +2201,7 @@ they go quiet, ask once whether they are still there, then wait.
             return None
 
         self._start_watch("job", fetch, describe)
-        return (f"Putting it in their {site} basket and opening the "
-                f"checkout. Tell them in one sentence that nothing is being "
-                f"bought - you will read them {site}'s own total first - "
-                f"then say nothing until you are told what it shows.")
+        return first_words
 
     @function_tool
     @auto_report("orders")
@@ -2198,9 +2211,12 @@ they go quiet, ask once whether they are still there, then wait.
         checkout page and read everything back: items, address, card and
         total. It CANNOT buy anything - the buttons that would are blocked.
         deliver_to and pay_with are optional: a few words to pick between
-        saved ones, like "Monsey" or "the Visa ending 6158"."""
+        the shop's saved ones, like "Monsey" or "the Visa ending 6158".
+        With an order open, this is how they choose the address and card
+        before saying yes."""
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
+        oid = getattr(self, "order_id", None) or 0
         try:
             async with httpx.AsyncClient(timeout=25) as c:
                 r = await c.post(f"{BACKEND}/jobs/checkout", headers=AUTH,
@@ -2208,12 +2224,19 @@ they go quiet, ask once whether they are still there, then wait.
                                          "site": site,
                                          "deliver_to": deliver_to,
                                          "pay_with": pay_with,
-                                         "call_id": self.call_id or 0})
+                                         "call_id": self.call_id or 0,
+                                         "order_id": oid})
                 d = r.json()
         except Exception as e:
             log.error(f"checkout failed: {e}")
             return (google_refusal(e, "the checkout")
                     or "Couldn't open the checkout.")
+        if oid and d.get("job_id"):
+            return self._watch_basket(
+                site, d["job_id"],
+                f"Changing it on {site} and reading the checkout back. Tell "
+                f"them in one sentence that nothing is being bought, then "
+                f"say nothing until you are told what it shows.")
         self.job_id = d.get("job_id")
         self.job_site = site
         self._watch_job(f"opening the {site} checkout")

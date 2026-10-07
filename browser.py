@@ -2920,9 +2920,16 @@ def _run_browse(jid: int, account_id: int, site: str):
                             # placed, until it is put right (call 90).
                             state, why = _basket_matches(
                                 payload["order_id"], act)
+                            chosen = {"final_total": total}
+                            if act.get("chosen_address"):
+                                chosen["ship_label"] = str(
+                                    act["chosen_address"])[:160]
+                            if act.get("chosen_card"):
+                                chosen["pay_label"] = str(
+                                    act["chosen_card"])[:80]
                             _order_set(payload["order_id"], state,
                                        (why + " " if why else "")
-                                       + answer[:600], final_total=total)
+                                       + answer[:600], **chosen)
                         else:
                             _order_set(payload["order_id"], "draft",
                                        "Reached the checkout but the total "
@@ -3165,13 +3172,19 @@ EXPECTED: about {price}
    option (size, pack, count, colour). No clear match: give_up, never
    substitute. Set the quantity, then Add to Cart.
 3. Anything else in the basket: leave it, and report it.
-4. Proceed to checkout, and stop on the page with the final button that
+4. Proceed to checkout. On the address step and the payment step, NOTE
+   every saved choice the site offers - each address by its name or
+   first line (at most five), each card as "Visa ending 1234" - and keep
+   the one already selected. Stop on the page with the final button that
    places the order. You may NOT press it - nothing can be bought here.
 5. Finish with done. In answer, read back: every item in the order with
-   its quantity and price, the delivery address, the payment card, and
-   the order total. Put the order total, as it is written, in "total";
-   this item's quantity on the review page in "quantity"; and
-   "other_items": true if anything else is in the basket.
+   its quantity and price, the delivery address, the payment card, the
+   order total, and the OTHER saved addresses and cards on offer, if any.
+   In the JSON put the order total, as written, in "total"; this item's
+   quantity on the review page in "quantity"; "other_items": true if
+   anything else is in the basket; the selected address in
+   "chosen_address" and card in "chosen_card"; and the saved choices in
+   "addresses" and "cards" (lists).
 If the site asks which address or card, keep the one already selected
 and carry on - you read it back at the end, and they can change it then.
 Call 89 stopped to ask, and the question reached the caller too late.
@@ -3205,8 +3218,9 @@ CARD_NAME, SAVED_USERNAME, SAVED_PASSWORD. They are swapped for real values.
 Rules, in order of importance:
 1. Add ONLY the item described, in the quantity given. If you cannot find a
    product that clearly matches, give_up — do not substitute.
-2. If the site already has a saved address or card that matches the
-   customer's, use it. Otherwise enter the customer's details.
+2. ship_to and pay_with name the customer's choice among the site's own
+   saved addresses and cards: select exactly those. Only when the site
+   has none saved, enter the customer's details.
 3. Before the final purchase, you must be on a review/summary screen. Read
    the item, quantity, shipping address, and total. Then use place_order
    with the index of the final purchase button and the total shown.
@@ -3302,6 +3316,11 @@ def _run_checkout(jid: int, account_id: int, site: str):
         # would order two.
         spec["already_in_basket"] = True
         spec["total_they_said_yes_to"] = approved
+        # The address and card they chose, as the shop names them.
+        if order.ship_label:
+            spec["ship_to"] = order.ship_label
+        if order.pay_label:
+            spec["pay_with"] = order.pay_label
     values = {
         "SHIP_LINE1": addr.line1 if addr else "",
         "SHIP_LINE2": addr.line2 if addr else "",

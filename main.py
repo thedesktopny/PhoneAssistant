@@ -2130,7 +2130,9 @@ anyway, and trying wastes the call.
 Reply done with, each on its own line: every item with its quantity and
 price; the delivery address; the payment method exactly as written, such
 as "Visa ending 1234"; the delivery date or shipping choice; and the
-order total. If the page does not show one of them, say which one."""
+order total. If the page does not show one of them, say which one. In
+the JSON also put the order total, as written, in "total", the selected
+address in "chosen_address" and the card in "chosen_card"."""
 
 CHECKOUT_CHANGES = """If a delivery address is wanted: open Change beside
 the delivery address, pick the saved address matching "{deliver_to}", and
@@ -2143,9 +2145,12 @@ answer - do not keep trying."""
 @app.post("/jobs/checkout")
 def job_checkout(request: Request, account_id: int, site: str,
                  deliver_to: str = "", pay_with: str = "",
-                 call_id: int = 0):
+                 call_id: int = 0, order_id: int = 0):
     """Take a cart as far as the review page and read everything back.
-    Never completes a purchase: the buttons that would are blocked."""
+    Never completes a purchase: the buttons that would are blocked. With
+    order_id, the total and the chosen address and card are written to
+    that order - how a caller with several saved addresses and cards
+    picks one before saying yes."""
     require_auth(request)
     if not BROWSERBASE_API_KEY:
         raise HTTPException(400, "Browserbase isn't configured.")
@@ -2155,9 +2160,13 @@ def job_checkout(request: Request, account_id: int, site: str,
             deliver_to=deliver_to or "the one already chosen",
             pay_with=pay_with or "the one already chosen")
     goal = CHECKOUT_GOAL.format(changes=changes)
+    payload = {"goal": goal, "url": "", "max_steps": 18, "may_buy": False}
+    if order_id:
+        payload["order_id"] = order_id
+        payload["budget"] = 240
+        _order_set(order_id, "preparing", "Reading the checkout again.")
     jid = start_job(account_id, "browse", site, call_id=call_id or None,
-                    payload={"goal": goal, "url": "",
-                             "max_steps": 18, "may_buy": False})
+                    payload=payload)
     return {"job_id": jid, "state": "queued"}
 
 
@@ -3489,7 +3498,8 @@ def order_status(request: Request, order_id: int):
     db.close()
     return {"order_id": row.id, "state": row.state, "message": row.message,
             "confirmation": row.confirmation, "final_total": row.final_total,
-            "job_state": job.state if job else "",
+            "ship_label": row.ship_label or "", "pay_label": row.pay_label
+            or "", "job_state": job.state if job else "",
             "history": row.history or ""}
 
 

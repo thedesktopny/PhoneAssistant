@@ -4843,6 +4843,48 @@ def _():
         "a cart goal still starts on the home page"
 
 
+@check("the address and the card are chosen before the yes")
+def _():
+    """David: "I have a lot of addresses and credit cards saved, and we
+    still need to choose one before we confirm." The basket job kept
+    whichever the shop had selected and went straight to 'Should I place
+    this order?'."""
+    import browser
+    g = browser.PREPARE_GOAL
+    for need in ("NOTE", '"chosen_address"', '"chosen_card"',
+                 '"addresses"', '"cards"', "OTHER saved addresses"):
+        assert need in g, f"the basket job does not report: {need}"
+    for col in ("ship_label", "pay_label"):
+        assert hasattr(main.Order, col), f"orders cannot keep {col}"
+    src = io.open("browser.py", encoding="utf-8").read()
+    i = src.index("def _run_checkout(")
+    co = src[i:src.index("\ndef ", i + 10)]
+    assert "order.ship_label" in co and "order.pay_label" in co, \
+        "the order is placed with whatever the shop had selected"
+    assert "select exactly those" in browser.CHECKOUT_SYSTEM
+    a = io.open("agent.py", encoding="utf-8").read()
+    i = a.index("def _watch_basket(")
+    body = a[i:a.index("    @function_tool", i)]
+    assert "ask which they want" in body and \
+        body.index("ask which they want") < body.index(
+            "Should I place this order?"), \
+        "it still goes straight from the read-back to the yes"
+    i = a.index("async def review_checkout(")
+    body = a[i:a.index("    @function_tool", i)]
+    assert '"order_id": oid' in body and "_watch_basket(" in body, \
+        "changing the address does not update the order's total"
+    m = io.open("main.py", encoding="utf-8").read()
+    i = m.index("def job_checkout(")
+    body = m[i:m.index("\n@app.", i)]
+    assert "order_id: int = 0" in body and 'payload["order_id"]' in body
+    inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                           "+1555", 1)
+    assert "several addresses and cards saved" in inst.instructions
+    # a change job that reads the checkout writes the choice to the order
+    assert 'act.get("chosen_address")' in src and \
+        '"ship_label"' in src[src.index("def _run_browse("):]
+
+
 @check("a text is never called sent when it cannot be delivered")
 def _():
     """Call 76: a new customer with no email was told twice "I've sent you

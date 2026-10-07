@@ -367,6 +367,10 @@ class Order(Base):
     state = Column(String(30), default="draft")   # draft/confirmed/placing/placed/failed/cancelled
     confirmation = Column(String(120), default="")
     final_total = Column(String(20), default="")
+    # which of the SHOP's saved addresses and cards the caller chose, as
+    # the shop names them ("Desktop - 144 Rodney St", "Visa ending 6158")
+    ship_label = Column(String(160), default="")
+    pay_label = Column(String(80), default="")
     message = Column(Text, default="")
     history = Column(Text, default="")
     job_id = Column(Integer, nullable=True)
@@ -520,6 +524,10 @@ def _ensure_columns():
         ],
         "jobs": [
             ("reason", "VARCHAR(40) DEFAULT ''"),
+        ],
+        "orders": [
+            ("ship_label", "VARCHAR(160) DEFAULT ''"),
+            ("pay_label", "VARCHAR(80) DEFAULT ''"),
         ],
         "accounts": [
             ("stripe_customer", "VARCHAR(40) DEFAULT ''"),
