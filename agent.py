@@ -2614,10 +2614,16 @@ they go quiet, ask once whether they are still there, then wait.
         if offers:
             await log_turn(self.call_id, "tool", f"prices for {item}",
                            "find_best_price")
+            # A live price is the shop's own, right now; a listing is a
+            # copy that can be days old. The caller hears the difference.
             lines = [f"{o['shop'] or 'unknown shop'}: {o['price']}"
+                     + (" LIVE from the shop right now" if o.get("live")
+                        else " as listed")
+                     + (f", was {o['was']}" if o.get("was") else "")
                      + (f" ({o['delivery']})" if o.get("delivery") else "")
                      + f" - {o['title'][:70]}" for o in offers[:6]]
-            head = "Prices found, cheapest first:"
+            head = ("Prices found, cheapest first. Say 'about' for a "
+                    "listed price, and that it is as listed:")
             if not quick.get("exact"):
                 # The listings are near misses. Reading them out as the
                 # thing they asked for is how the wrong shoe gets bought.

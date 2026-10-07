@@ -592,6 +592,20 @@ def _():
     assert after == before, "a question started a browser job"
 
 
+@scenario("prices: a shop's live feed is wired in, and the office can "
+          "see which are on",
+          "B&H's listed $849.99 was the old price; the live page said "
+          "$699.99 marked down - a listing is a copy, and can be days old")
+def _():
+    d = call("/price", item="Epson ET-5850 printer")
+    assert "live_sources" in d, f"the live-feed plumbing is not deployed: {d}"
+    if not d["live_sources"]:
+        raise SetupProblem("no shop feed is switched on yet - add "
+                           "BESTBUY_API_KEY in Railway to turn Best Buy on")
+    live = [o for o in d.get("offers") or [] if o.get("live")]
+    assert live, f"a feed is on but gave no live price: {d}"
+
+
 # --------------------------------------------------------------- result
 
 print()

@@ -12,6 +12,7 @@ cheapest lookalike is still the wrong answer.
 from core import *                                   # noqa: F401,F403
 from core import _re_scrub
 from rules import is_blocked, blocked_terms_in, BLOCKED_REPLY
+from feeds import live_prices, live_sources
 
 
 def _search_serper(q: str) -> dict:
@@ -214,19 +215,29 @@ def shopping_prices(item: str, limit: int = 8, shop: str = "") -> dict:
     browser, so no shop can refuse us, and it takes about two seconds."""
     if is_blocked(item):
         return {"blocked": True, "answer": BLOCKED_REPLY, "offers": []}
-    if not SERPER_API_KEY:
-        return {"offers": [], "error": "shopping search isn't configured"}
     item, said_shop = split_shop(item)
     shop = (shop or said_shop).strip()
-    try:
-        d = _serper_shopping(item)
-    except Exception as e:
-        return {"offers": [], "error": str(e)[:200]}
+    # A shop's own feed is live; a listing is a copy. Where a shop has a
+    # feed, its listing is dropped and the live price stands in its place.
+    live = live_prices(item, shop)
+    live_shops = {o["shop"].lower() for o in live}
+    if not SERPER_API_KEY and not live:
+        return {"offers": [], "error": "shopping search isn't configured",
+                "live_sources": live_sources()}
+    d = {}
+    if SERPER_API_KEY:
+        try:
+            d = _serper_shopping(item)
+        except Exception as e:
+            if not live:
+                return {"offers": [], "error": str(e)[:200],
+                        "live_sources": live_sources()}
 
-    offers = []
+    offers = list(live)
     for x in d.get("shopping", []):
         price = (x.get("price") or "").strip()
-        if not price:
+        if not price or (x.get("source") or "").strip().lower() \
+                in live_shops:
             continue
         offers.append({
             "shop": (x.get("source") or "").strip(),
@@ -295,6 +306,10 @@ def shopping_prices(item: str, limit: int = 8, shop: str = "") -> dict:
         if rest:
             said += ", then " + ", ".join(rest)
         said += "."
+        lives = [o["shop"] for o in kept if o.get("live")]
+        if lives:
+            said += (f" {' and '.join(lives)} is the live price from the "
+                     f"shop itself; the rest are listings.")
         if not same_thing:
             said = ("I could not find that exact one, so these are the "
                     "closest: " + said)
@@ -310,7 +325,8 @@ def shopping_prices(item: str, limit: int = 8, shop: str = "") -> dict:
                        (o["shop"] or "").replace("&", "and"))
                        or _squash(o["shop"]).startswith(_squash(shop)))]
     return {"offers": kept, "answer": said, "checked": len(offers),
-            "exact": same_thing, "shop": shop, "at_shop": at_shop}
+            "exact": same_thing, "shop": shop, "at_shop": at_shop,
+            "live_sources": live_sources()}
 
 
 def tool_web_search(query: str, near: str = "") -> dict:

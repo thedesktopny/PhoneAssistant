@@ -4335,6 +4335,82 @@ def _():
         "the jobs list still hides what each job was asked to do"
 
 
+@check("a shop's own live price replaces its listing, and says so")
+def _():
+    """B&H's listed $849.99 was the old price; the live page said $699.99
+    marked down. A shop that publishes its prices gives them live, no
+    wall, fully allowed. The feed's price stands in for the listing."""
+    import feeds
+    import search
+    sample = {"products": [
+        {"sku": 1, "name": "Epson EcoTank ET-5850 Printer",
+         "salePrice": 699.99, "regularPrice": 849.99,
+         "onlineAvailability": True, "inStoreAvailability": False,
+         "url": "https://www.bestbuy.com/x", "freeShipping": True}]}
+    asked = []
+
+    def fake_get(url):
+        asked.append(url)
+        return sample
+    undo = everywhere("_bestbuy_get", fake_get)
+    undo2 = everywhere("BESTBUY_API_KEY", "k")
+    try:
+        got = feeds.bestbuy_prices("Epson ET-5850 printer")
+    finally:
+        undo()
+        undo2()
+    assert asked and "search=epson" in asked[0] and "et-5850" in asked[0], \
+        asked
+    assert "apiKey=k" in asked[0]
+    o = got[0]
+    assert o["shop"] == "Best Buy" and o["price"] == "$699.99" and \
+        o["amount"] == 699.99 and o["live"] is True, o
+    assert o["was"] == "$849.99" and "in stock online" in o["delivery"], o
+    # no key: nothing asked, nothing returned
+    undo = everywhere("_bestbuy_get", lambda url: 1 / 0)
+    undo2 = everywhere("BESTBUY_API_KEY", "")
+    try:
+        assert feeds.bestbuy_prices("Epson ET-5850") == []
+        assert feeds.live_sources() == []
+    finally:
+        undo()
+        undo2()
+
+    # the listing for Best Buy is dropped; the live price stands in
+    listing = {"shopping": [
+        {"source": "Best Buy", "title": "Epson EcoTank ET-5850 Printer",
+         "price": "$849.99", "link": "https://bestbuy.com/x"},
+        {"source": "B&H Photo", "title": "Epson EcoTank ET-5850 Printer",
+         "price": "$799.99", "link": "https://bhphotovideo.com/x"}]}
+    undo = everywhere("_serper_shopping", lambda item: listing)
+    undo2 = everywhere("live_prices", lambda item, shop="": [
+        dict(o, live=True) for o in [{
+            "shop": "Best Buy", "title": "Epson EcoTank ET-5850 Printer",
+            "price": "$699.99", "amount": 699.99, "was": "$849.99",
+            "delivery": "in stock online", "link": ""}]])
+    undo3 = everywhere("SERPER_API_KEY", "k")
+    undo4 = everywhere("live_sources", lambda: ["best buy"])
+    try:
+        out = search.shopping_prices("Epson ET-5850 printer")
+    finally:
+        undo()
+        undo2()
+        undo3()
+        undo4()
+    shops = [(o["shop"], o["price"], bool(o.get("live"))) for o in out["offers"]]
+    assert shops[0] == ("Best Buy", "$699.99", True), shops
+    assert ("Best Buy", "$849.99", False) not in shops, \
+        "the stale listing is still read out next to the live price"
+    assert "live price from the shop itself" in out["answer"], out["answer"]
+    assert out["live_sources"] == ["best buy"]
+    # and the caller hears which is which
+    src = io.open("agent.py", encoding="utf-8").read()
+    i = src.index("async def find_best_price(")
+    body = src[i:i + 4000]
+    assert "LIVE from the shop right now" in body and "as listed" in body, \
+        "a listed price and a live one sound the same to the caller"
+
+
 @check("a text is never called sent when it cannot be delivered")
 def _():
     """Call 76: a new customer with no email was told twice "I've sent you

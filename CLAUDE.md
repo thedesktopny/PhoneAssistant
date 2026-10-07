@@ -34,6 +34,11 @@ Other useful reads: `/usage/summary?days=7`, `/browser/where`,
 - `main.py` — backend, admin panel, Gmail/Calendar, browser runners,
   ordering, costs, live log. Big. Read the section you need.
 - `agent.py` — the LiveKit voice agent and its ~45 tools.
+- `find.py` — how a QUESTION is answered: pages read from the search
+  engine's copy, site named, freshness code. Never a browser. The voice
+  tool is `find_out`; the browser is only for things done ON a site.
+- `feeds.py` — live prices from shops that publish them (Best Buy, with
+  `BESTBUY_API_KEY`). A listing is a copy; a feed is the shop, now.
 - `check.py` — pre-push checks, offline. **Run before every push. Never
   push on a failure.**
 - `scenarios.py` — replays real problems from real calls against the LIVE
@@ -102,7 +107,16 @@ Railway auto-deploys both services from `main` on push.
 - Real cost is ~$0.44/min, ~94% of it the OpenAI Realtime model. Rates
   are Railway vars `RATE_*`; verify against invoices.
 - Google OAuth app is in testing mode — accounts must be on the test-user
-  list in Google Cloud Console.
+  list in Google Cloud Console. An address NOT on the list is blocked by
+  Google outright ("Access blocked: ... has not completed verification"),
+  with no Continue button; one on the list gets a warning it can click
+  through. That is the whole difference between a sign-in that works and
+  one that fails (calls 82-84).
+- Questions never open a browser (Oct 2026). `find_out` -> `/find` reads
+  the search engine's copy of pages in seconds. Replayed against every
+  real question callers had asked: 3-7s each instead of 4-13 minutes,
+  no walls, site named. A copied page can be days old - a listed price is
+  "about $X, as listed", never today's price.
 
 ## When David reports a failed call
 1. Pull `/events` for the window he describes, and `/jobs` and `/calls/<id>`.
