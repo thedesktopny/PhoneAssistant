@@ -4006,6 +4006,219 @@ def _():
         "it keeps searching after the caller hangs up"
 
 
+@check("nothing from an earlier call starts before the caller asks")
+def _():
+    """Call 84: two seconds after the PIN, before he had said a word, the
+    car search from the night before started on its own. "Who asked you
+    to check the next car website now?" """
+    a = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                        "+1555", 1)
+    a.verified = True
+    assert a.heard_request is False
+    said = a._not_asked_yet()
+    assert said and "has not asked for anything yet" in said, said
+    a.heard_request = True
+    assert a._not_asked_yet() is None
+    src = io.open("agent.py", encoding="utf-8").read()
+    for name in ("do_on_website", "find_best_price", "sign_in_to_site",
+                 "reset_site_password", "check_site_orders", "search_site"):
+        i = src.index(f"    async def {name}(")
+        body = src[i:src.index("    @function_tool", i + 10)]
+        assert "self._not_asked_yet()" in body, \
+            f"{name} can start before the caller has asked for anything"
+    i = src.index("agent_obj.heard_request = True")
+    assert "stored != BLANKED" in src[i - 200:i], \
+        "the PIN being said would count as asking for something"
+    assert "Never carry" in a.instructions
+
+
+@check("a stopped job stays stopped")
+def _():
+    """Call 84: the search was stopped, and twenty seconds later the same
+    job carried on clicking and wrote "done" over the top."""
+    import browser
+    wrote = []
+    real = browser.Session
+
+    class NoDb:
+        def __init__(self):
+            wrote.append("db")
+
+    browser._JOBS[987654] = {"cancelled": True}
+    browser.Session = NoDb
+    try:
+        browser._job_set(987654, "done", "The best options are...")
+        assert not wrote, "a stopped job was written over"
+    finally:
+        browser.Session = real
+        browser._JOBS.pop(987654, None)
+    logged = []
+    ok, text = browser._replay_recipe(
+        None, [{"action": "click", "desc": "ok"}], {}, logged.append,
+        stopped=lambda: True)
+    assert ok is False and not text, "saved steps ran after the stop"
+    src = io.open("browser.py", encoding="utf-8").read()
+    assert 'stopped=lambda: (_JOBS.get(jid) or {}).get("cancelled")' in src
+
+
+@check("Google's 'choose a way' screen picks what works instead of giving up")
+def _():
+    """Call 84: Google offered "Tap Yes on your phone or tablet" and "Use
+    your phone or tablet to get a security code". Neither was on our list,
+    so the sign-in died - though tapping Yes had worked a minute before."""
+    src = io.open("browser.py", encoding="utf-8").read()
+    i = src.index("def pick_from_selection(page):")
+    body = src[i:i + 2200]
+    for want in ("Tap Yes on your phone", "get a security code"):
+        assert want in body, f"'{want}' is still not something it can pick"
+    assert body.index("text=/Phone call/i") < \
+        body.index("text=/Tap Yes on your phone/i"), \
+        "a text or a call should still come first"
+    assert 'reason="no_method"' in src
+    assert 'reason="tap_timeout"' in src
+    i = src.index("def describe_code_screen(page):")
+    assert "security code that their own phone" in src[i:i + 2600]
+    # the number Google shows can change - and it is said when it does
+    j = src.index("now_num = tap_number(page)")
+    loop = src[j - 900:j + 700]
+    assert "seen_num" in loop and "'now ' if changed" in loop, \
+        "a new number on the screen is never told to the caller"
+    assert "if not num:\n                            num = tap_number" \
+        not in src, "the number is still only read once"
+
+
+@check("a sign-in that got past the password is tried again without it")
+def _():
+    """Call 84: Google accepted the password; the next step failed. He
+    said "try again" - refused. "Start over" - asked to spell the password
+    a third time, and the sign-in never restarted, though he was told "we
+    did try again"."""
+    import asyncio
+    a = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                        "+1555", 1)
+    a.verified = True
+    a.heard_request = True
+    a.onboard_sid = None
+    a.login_ok = {"email": "someone@gmail.com", "password": "Secret12345"}
+    a.signin_tries = 1
+    said = a._signin_failed({
+        "state": "failed", "reason": "no_method",
+        "message": "Google offered no verification method we can use. "
+                   "url=https://accounts.google.com/x | screen: Verify"})
+    assert "will not need to say it again" in said, said
+    assert "password left empty" in said, said
+    assert "url=" not in said and "screen:" not in said, said
+    assert "left a note" not in said, said
+    a.login_ok = None
+    said = a._signin_failed({"state": "failed", "reason": "tap_timeout",
+                             "message": "They never approved the prompt."})
+    assert "do not leave another" in said, said
+
+    started, real_post, real_log = [], agent.backend_post, agent.log_turn
+
+    async def fake_post(path, payload, params=None):
+        started.append((path, dict(payload)))
+        return {"session_id": 5}
+
+    async def no_log(*x, **k):
+        return None
+    agent.backend_post, agent.log_turn = fake_post, no_log
+    a._start_watch = lambda *x, **k: None
+    tool = agent.Assistant.connect_email
+    try:
+        # a password Google accepted is used again, with no spelling back
+        a.login_ok = {"email": "someone@gmail.com", "password": "Secret12345"}
+        a.password_confirmed = False
+        out = asyncio.run(tool(a, None, "Someone@gmail.com", ""))
+        assert started and started[-1][1].get("password") == \
+            "Secret12345", (out, [(x, sorted(y)) for x, y in started])
+        assert "Sign-in started" in out, out
+        # no accepted password: it must be asked for, nothing starts
+        started.clear()
+        a.login_ok = None
+        out = asyncio.run(tool(a, None, "someone@gmail.com", ""))
+        assert not started and "Ask them for it" in out, out
+        # a first password is still spelled back, and says nothing started
+        a.password_confirmed = False      # as after any failed sign-in
+        out = asyncio.run(tool(a, None, "someone@gmail.com", "Abc12"))
+        assert not started and "NOTHING HAS STARTED YET" in out, out
+    finally:
+        agent.backend_post, agent.log_turn = real_post, real_log
+    src = io.open("agent.py", encoding="utf-8").read()
+    i = src.index("async def try_another_way(")
+    body = src[i:i + 2000]
+    assert "text a code instead" not in body, \
+        "it still promises a text that Google may never send"
+    assert "popped up again" in body, \
+        "nothing says a repeated prompt is not a reason to switch"
+    i = src.index("async def _connect_state(")
+    assert "left a note for the office and someone will call" not in \
+        src[i:i + 3000], "the status tool still ends the sign-in for good"
+
+
+@check("a note really left for the office is not called a false claim")
+def _():
+    """Call 84: "I've sent a note to the office" - true, the note was in
+    the record - and the call was marked as having made it up, twice: on
+    the call and in the review afterwards."""
+    import asyncio
+    spoke = []
+
+    class Fake:
+        llm = tts = None
+
+        def generate_reply(self, **k):
+            spoke.append(k)
+
+    class Ctx:
+        items = []
+
+        def copy(self):
+            return self
+
+        def add_message(self, **k):
+            pass
+
+    class Stand:
+        def __init__(self):
+            self.ran_tools = {"leave_note_for_office"}
+            self.chat_ctx = Ctx()
+
+        async def update_chat_ctx(self, ctx, **k):
+            return None
+
+    async def go():
+        agent.check_the_claim(Fake(), Stand(),
+                              "I've sent a note to the office.", 1)
+        await asyncio.sleep(0.05)
+    asyncio.run(go())
+    assert not spoke, "it apologised for a note it really did leave"
+    import advisor
+    src = io.open("advisor.py", encoding="utf-8").read()
+    i = src.index("def review_call(")
+    body = src[i:i + 3000]
+    assert "query(Followup)" in body, "the reviewer cannot see notes left"
+    assert 'if t.who == "tool"' in body, "the reviewer cannot see tools run"
+
+
+@check("fixed words have a voice of their own")
+def _():
+    """Call 84: "Are you still there?" came out as "Remember, if you're
+    ready to continue..." and, a minute later, as a whole earlier answer
+    again. Words handed to the model are a suggestion; say() with a voice
+    of its own says exactly them."""
+    src = io.open("agent.py", encoding="utf-8").read()
+    i = src.index("session = AgentSession(")
+    assert "tts=fixed_voice" in src[i:i + 400], \
+        "the session has no voice for fixed words"
+    j = src.index("fixed_voice = openai.TTS(")
+    assert j < i and "except Exception" in src[j:i], \
+        "a voice that fails to load must not stop the call being answered"
+    from livekit.plugins import openai as lk_openai
+    lk_openai.TTS(model=agent.FIXED_WORDS_MODEL, voice=agent.REALTIME_VOICE,
+                  api_key="x")
+
+
 @check("a text is never called sent when it cannot be delivered")
 def _():
     """Call 76: a new customer with no email was told twice "I've sent you

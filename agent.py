@@ -71,6 +71,7 @@ LOOKUP_WAIT = int(os.environ.get("LOOKUP_WAIT", "75"))
 # Costs page will keep quoting you the old price.
 REALTIME_MODEL = os.environ.get("REALTIME_MODEL", "gpt-realtime")
 REALTIME_VOICE = os.environ.get("REALTIME_VOICE", "alloy")
+FIXED_WORDS_MODEL = os.environ.get("FIXED_WORDS_MODEL", "gpt-4o-mini-tts")
 AUTH = {"Authorization": f"Bearer {SERVICE_TOKEN}"} if SERVICE_TOKEN else {}
 
 server = AgentServer()
@@ -441,6 +442,7 @@ class Assistant(Agent):
                  known: str = ""):
         self.account = account
         self.ran_tools = set()      # every tool that has really run
+        self.heard_request = False  # has the caller asked for anything yet
         self.call_id = call_id
         self.caller_number = caller_number
         self.account_id = account["account_id"]
@@ -485,7 +487,8 @@ one turns out to be wrong, say so and work from what they tell you now.
 RECENT HISTORY — what was SAID on earlier calls and texts
 {history or "Nothing recent."}
 
-That is a record of conversation, NOT a record of facts. When they
+That is a record of conversation, NOT a record of facts. Never carry
+on anything from it until they ask. When they
 mean "what I asked for last time", tell them what it shows they asked for
 - never ask them to repeat it. What you said before may have been wrong. If they ask the same thing again, assume the last answer was wrong
 and get it right this time.
@@ -2196,6 +2199,8 @@ they go quiet, ask once whether they are still there, then wait.
         goal - so put every requirement in goal."""
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
+        if self._not_asked_yet():
+            return self._not_asked_yet()
         if then_try.strip():
             return await self._keep_looking(goal, site, then_try)
         try:
@@ -2217,6 +2222,17 @@ they go quiet, ask once whether they are still there, then wait.
         self._watch_job(goal)
         return ("On it. Tell them it takes up to a minute and stay with "
                 "them, then call get_site_result.")
+
+    def _not_asked_yet(self):
+        """Call 84: two seconds after the PIN, before he had said a word,
+        a car search from the night before started on its own. Earlier
+        calls are history; work starts when the caller asks for it."""
+        if getattr(self, "heard_request", True):
+            return None
+        return ("The caller has not asked for anything yet on this call. "
+                "Do not start anything from an earlier call. Ask what they "
+                "would like today; you may mention in one sentence what was "
+                "left unfinished, and wait for a yes.")
 
     async def _keep_looking(self, goal: str, site: str, then_try: str):
         names = [x.strip() for x in re.split(r"[,;\n]",
@@ -2388,6 +2404,8 @@ they go quiet, ask once whether they are still there, then wait.
         """Look up the caller's recent orders on a site they're signed into."""
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
+        if self._not_asked_yet():
+            return self._not_asked_yet()
         try:
             async with httpx.AsyncClient(timeout=25) as c:
                 r = await c.post(f"{BACKEND}/jobs/site-orders", headers=AUTH,
@@ -2410,6 +2428,8 @@ they go quiet, ask once whether they are still there, then wait.
         """Search a site for a product on the caller's behalf."""
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
+        if self._not_asked_yet():
+            return self._not_asked_yet()
         try:
             async with httpx.AsyncClient(timeout=25) as c:
                 r = await c.post(f"{BACKEND}/jobs/site-search", headers=AUTH,
@@ -2467,6 +2487,8 @@ they go quiet, ask once whether they are still there, then wait.
         the session for next time. Works on sites we've never set up."""
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
+        if self._not_asked_yet():
+            return self._not_asked_yet()
         try:
             async with httpx.AsyncClient(timeout=25) as c:
                 r = await c.post(f"{BACKEND}/jobs/site-login", headers=AUTH,
@@ -2503,6 +2525,8 @@ they go quiet, ask once whether they are still there, then wait.
         they never need to know it. Get a clear yes first."""
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
+        if self._not_asked_yet():
+            return self._not_asked_yet()
         if not said_yes(caller_said):
             return (f"Do not start yet. Say: 'I can reset your {site} "
                     f"password. {site.title()} will send a code - if it "
@@ -2559,10 +2583,12 @@ they go quiet, ask once whether they are still there, then wait.
         site = getattr(self, "job_site", "") or "that"
         self.job_id = None
         await log_turn(self.call_id, "tool", f"stopped: {why}", "stop_that")
-        return (f"Stopped. Say plainly that you have stopped trying {site}, "
-                f"and why, in one sentence. Anything already saved stays "
-                f"saved. Offer to try again later or to have the office "
-                f"call them. Never say you are still waiting for it.")
+        # Call 84: a search nobody asked for was stopped, and the caller
+        # was then offered the office "to follow up" on it.
+        return (f"Stopped. Say plainly that you have stopped, in one "
+                f"sentence, then ask what they would like to do. Offer the "
+                f"office only if they still want {site} done. Never say "
+                f"you are still waiting for it.")
 
     @function_tool
     @auto_report("orders")
@@ -2574,6 +2600,8 @@ they go quiet, ask once whether they are still there, then wait.
         something costs or where to get it - not web_search."""
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
+        if self._not_asked_yet():
+            return self._not_asked_yet()
         # The quick way first: the shopping results carry a price per shop,
         # the same block Google puts at the top of its page. Reading four
         # shop pages for the same answer took 45 seconds of a phone call.
@@ -3177,12 +3205,32 @@ they go quiet, ask once whether they are still there, then wait.
     @function_tool
     @auto_report("signin")
     async def connect_email(self, context: RunContext, email: str,
-                            password: str):
+                            password: str = ""):
         """Connect the caller's Gmail using the address and password they
         just gave you. Only call after spelling both back character by
-        character and getting a clear yes."""
+        character and getting a clear yes. To try again after Google got
+        past the password, leave password empty - never ask for it
+        again."""
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
+        # Call 84: Google accepted the password, the next step failed, he
+        # said "start over" - and was asked to spell the password a third
+        # time. Then the second call that starts the sign-in never came,
+        # and he was told "we did try again". A password Google has
+        # accepted on this call is used again without a word. Held in
+        # memory for this call only (rule 2), never written anywhere.
+        ok = getattr(self, "login_ok", None) or {}
+        same = ok.get("email", "").lower() == (email or "").strip().lower()
+        if same and (not password or password == ok.get("password")):
+            password = ok["password"]
+            self.password_confirmed = True
+        elif not password:
+            return ("There is no password from this call to use. Ask them "
+                    "for it, spell it back, then call connect_email with it.")
+        self.signin_tries = getattr(self, "signin_tries", 0) + 1
+        if self.signin_tries > 4:
+            return ("That is four sign-ins on this call. Stop - say the "
+                    "office will call to help, and leave_note_for_office.")
         low = (email or "").lower()
         if not any(low.endswith(d) for d in
                    ("@gmail.com", "@googlemail.com")) and "@" in low:
@@ -3196,12 +3244,14 @@ they go quiet, ask once whether they are still there, then wait.
                 ("capital " + ch) if ch.isupper() else
                 ("the digit " + ch) if ch.isdigit() else
                 ch for ch in password)
-            return (f"Before signing in, spell the password back to them "
-                    f"exactly like this, slowly: {spelled}. That is "
+            self.signin_tries -= 1          # nothing has started yet
+            return (f"NOTHING HAS STARTED YET. Spell the password back to "
+                    f"them exactly like this, slowly: {spelled}. That is "
                     f"{len(password)} characters. Ask if every character is "
-                    f"right. If they say yes, call connect_email again with "
-                    f"the same values. If they correct anything, call it "
-                    f"again with the corrected password.")
+                    f"right. The moment they say yes, call connect_email "
+                    f"again with the same values - that is what starts it. "
+                    f"If they correct anything, call it again with the "
+                    f"corrected password.")
         try:
             data = await backend_post("/onboard/start", {
                 "account_id": self.account_id,
@@ -3223,6 +3273,9 @@ they go quiet, ask once whether they are still there, then wait.
 
         def describe(d):
             st, msg = d.get("state", ""), d.get("message", "")
+            if st in PAST_THE_PASSWORD:
+                self.login_ok = {"email": email.strip(),
+                                 "password": password}
             if st == "needs_tap":
                 # Fixed words, spoken TO the caller. Call 82 heard the
                 # assistant read out "Tell them to tap Yes" - talking about
@@ -3240,16 +3293,64 @@ they go quiet, ask once whether they are still there, then wait.
             if st == "failed":
                 self.password_confirmed = False
                 if d.get("reason") == "bad_password":
+                    self.login_ok = None
                     return ("Tell them Google didn't accept the password, "
                             "and offer to try once more, spelling it out "
                             "one character at a time.")
-                return (f"Say it didn't work — {msg} — and that you've "
-                        f"left a note for the office.")
+                return self._signin_failed(d)
             return None
 
         self._start_watch("signin", fetch, describe)
         return ("Sign-in started. Tell them it takes a minute or two, then "
                 "call how_is_it_going.")
+
+    def _signin_failed(self, d: dict) -> str:
+        """What to say when a Google sign-in fails after the password.
+
+        Call 84 was told "Google offered no verification method we can use
+        ... tell them you've left a note for the office ... then move on",
+        with a web address and a screen dump in the middle. So when he said
+        "try again" it refused, and when he said "start over" it asked for
+        the password again. The reason code decides; the password was
+        right, so trying again costs him nothing."""
+        reason = d.get("reason") or ""
+        if reason == "cancelled":
+            return None
+        what = {
+            "no_method": "Google did not offer a way to check it is you "
+                         "that works over the phone this time",
+            "tap_timeout": "the message on their phone was not answered in "
+                           "time",
+        }.get(reason) or (d.get("message") or "it did not finish").split(
+            " url=")[0][:160]
+        sid = getattr(self, "onboard_sid", None)
+        if sid and sid not in getattr(self, "_noted", set()):
+            self._noted = getattr(self, "_noted", set()) | {sid}
+            asyncio.create_task(self._note_signin_failure(d))
+        ok = getattr(self, "login_ok", None)
+        if ok and getattr(self, "signin_tries", 0) < 4:
+            return (f"Say it didn't finish: {what}. Their password was "
+                    f"right, so they will not need to say it again. Offer to "
+                    f"try again now. If they say yes, call connect_email "
+                    f"with email {ok['email']} and password left empty.")
+        return (f"Say it didn't finish: {what}. A note is already with the "
+                f"office - do not leave another. Ask what they would like "
+                f"to do.")
+
+    async def _note_signin_failure(self, d: dict):
+        note_tool_ran(self, "leave_note_for_office")    # a note, really left
+        try:
+            await backend_post("/followups", {
+                "account_id": self.account_id,
+                "call_id": self.call_id,
+                "reason": "signin_failed",
+                "note": f"Email sign-in failed for {d.get('email', '')} "
+                        f"({d.get('reason') or 'no reason'}): "
+                        f"{(d.get('message') or '')[:600]}",
+                "channel": "voice",
+            })
+        except Exception:
+            pass
 
     async def _connect_state(self, context=None):
 
@@ -3271,17 +3372,6 @@ they go quiet, ask once whether they are still there, then wait.
         if state == "done":
             return f"Connected. {msg}"
         if state == "failed":
-            try:
-                await backend_post("/followups", {
-                    "account_id": self.account_id,
-                    "call_id": self.call_id,
-                    "reason": "signin_failed",
-                    "note": f"Email sign-in failed for "
-                            f"{d.get('email', '')}: {msg}",
-                    "channel": "voice",
-                })
-            except Exception:
-                pass
             if d.get("reason") == "bad_password":
                 self.pw_attempts = getattr(self, "pw_attempts", 0) + 1
                 if self.pw_attempts < 3:
@@ -3292,9 +3382,7 @@ they go quiet, ask once whether they are still there, then wait.
                             f"(Attempt {self.pw_attempts} of 3.)")
                 return ("Three wrong passwords. Stop trying — Google can "
                         "lock the account. Tell them someone will call back.")
-            return (f"It didn't work: {msg}. Apologise, tell them you've "
-                    f"left a note for the office and someone will call "
-                    f"them back, then move on.")
+            return self._signin_failed(d)
         return (f"Still working ({state}). Stay with them, but say nothing "
                 f"more about it - I will tell you when it changes.")
 
@@ -3361,8 +3449,10 @@ they go quiet, ask once whether they are still there, then wait.
     @function_tool
     @auto_report("signin")
     async def try_another_way(self, context: RunContext):
-        """If the caller can't tap the notification on their phone, ask
-        Google to text them a code instead."""
+        """Only when the caller says they CANNOT tap the message on their
+        phone - no phone with them, nothing arrived. If it popped up again
+        or they ask about the number, that is the same message: repeat the
+        number, never switch (call 84 switched, and the sign-in died)."""
         if not getattr(self, "onboard_sid", None):
             if getattr(self, "job_id", None):
                 return ("This is a shop sign-in, not Google, and the shop "
@@ -3380,8 +3470,11 @@ they go quiet, ask once whether they are still there, then wait.
         except Exception as e:
             log.error(f"another way failed: {e}")
             return "Couldn't switch methods."
-        return ("Asked Google to text a code instead. Wait about ten seconds, "
-                "then how_is_it_going again.")
+        # Not "text a code": Google decides what it offers, and call 84
+        # was told a text was coming when none ever did.
+        return ("Asked Google for another way to check it is them. Say only "
+                "that - not which way, nobody knows yet. You will be told "
+                "what Google asks for next.")
 
     async def _code_to_google(self, context, code: str):
 
@@ -3814,6 +3907,11 @@ they go quiet, ask once whether they are still there, then wait.
         return "Sent."
 
 
+# A sign-in in any of these states has got past the password.
+PAST_THE_PASSWORD = ("needs_tap", "needs_code", "verifying", "consenting",
+                     "done")
+
+
 # ------------------------------------------------------- claiming to have sent
 
 # Said in the first person, in the past: "I've sent you a link", "I texted
@@ -3826,7 +3924,10 @@ CLAIMED_SEND = re.compile(
 SEND_TOOLS = {"send_text", "text_setup_link", "send_password_link",
               "send_email", "reply_to_email", "forward_email",
               "send_drive_file", "email_connect_code", "card_setup_code",
-              "add_another_phone"}
+              "add_another_phone",
+              # "I've sent a note to the office" is true once a note is
+              # left - call 84 apologised for one that really was sent
+              "leave_note_for_office"}
 SENT_NOTHING = ("I am sorry - I have not actually sent that, and I should "
                 "not have said so.")
 
@@ -4266,10 +4367,22 @@ async def entrypoint(ctx: JobContext):
         log.warning(f"could not open call record: {e}")
 
     log.info(f"voice model: {REALTIME_MODEL} ({REALTIME_VOICE})")
+    # A text-to-speech voice for fixed words only. Without it, "fixed"
+    # words were a request to the model, which it rephrased: call 84 asked
+    # "Are you still there?" twice and the caller heard "Remember, if you're
+    # ready to continue..." and then a whole earlier answer again. The
+    # model's own replies keep its own voice; this is only used by say().
+    try:
+        fixed_voice = openai.TTS(model=FIXED_WORDS_MODEL,
+                                 voice=REALTIME_VOICE)
+    except Exception as e:
+        log.warning(f"no voice for fixed words: {e}")
+        fixed_voice = None
     session = AgentSession(
         llm=openai.realtime.RealtimeModel(model=REALTIME_MODEL,
                                           voice=REALTIME_VOICE),
         vad=silero.VAD.load(),
+        tts=fixed_voice,
     )
 
     def signed_up(new_account: dict, welcome: str = ""):
@@ -4335,6 +4448,10 @@ async def entrypoint(ctx: JobContext):
                 stored = keep_or_blank(secret, role, text)
                 if role == "user":
                     note_amounts(agent_obj, text)
+                    # a request, not the PIN being said
+                    if getattr(agent_obj, "verified", False) and \
+                            stored != BLANKED:
+                        agent_obj.heard_request = True
                 else:
                     check_the_claim(session, agent_obj, text, call_id)
                     check_the_prices(session, agent_obj, text, call_id)

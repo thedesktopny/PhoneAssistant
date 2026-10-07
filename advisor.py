@@ -330,11 +330,21 @@ def review_call(call_id: int) -> dict:
                .order_by(CallTurn.id).all())
     jobs = db.query(Job).filter_by(call_id=call_id).all()
     account_id = call.account_id
-    said = [f"{t.who}: {(t.text or '')[:300]}" for t in turns]
+    # What was SAID is the caller and the assistant. Tool lines are what
+    # was DONE, and the system's own "problem" flags are neither - call 84
+    # was marked down for "I've sent a note to the office" while the note
+    # sat in the record, because notes were never shown to the reviewer.
+    said = [f"{t.who}: {(t.text or '')[:300]}" for t in turns
+            if t.who in ("caller", "agent")]
+    did = [f"tool {t.tool or ''}: {(t.text or '')[:200]}" for t in turns
+           if t.who == "tool"]
+    for f in (db.query(Followup).filter_by(call_id=call_id)
+                .order_by(Followup.id).all()):
+        did.append(f"note left for the office ({f.reason}): "
+                   f"{(f.note or '')[:160]}")
     # The step-by-step history, not just the final state. Without it the
     # reviewer called "I'm signing in to Amazon now" a false claim, when a
     # sign-in really was running - it just ended badly.
-    did = []
     for j in jobs:
         did.append(f"job {j.id} {j.kind} {j.site}: ended {j.state} "
                    f"{j.reason or ''} {(j.message or '')[:200]}")

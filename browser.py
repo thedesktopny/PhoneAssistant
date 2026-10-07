@@ -694,6 +694,13 @@ def _run_signin(sid: int, account_id: int, email: str):
                     "app. Ask them to open it and read the current code.")
         if _re.search(r"backup code|recovery code", body, _re.I):
             return "Google wants one of their backup codes."
+        if _re.search(r"security code", body, _re.I):
+            how = _re.search(r"(?:On your|Open|Go to)[^.]{0,200}\.", body)
+            return ("Google wants a security code that their own phone "
+                    "makes, even with no signal. "
+                    + (f"Google's screen says: {how.group(0)} " if how
+                       else "")
+                    + "Ask them to read the code out.")
         if _re.search(r"security key|USB|tap your key", body, _re.I):
             return ("Google wants a physical security key, which we can't do. "
                     "Offer try_another_way.")
@@ -850,13 +857,21 @@ def _run_signin(sid: int, account_id: int, email: str):
 
             def pick_from_selection(page):
                 """On 'Choose a way to verify', pick something we can do:
-                a texted code first, then a voice call, then anything."""
+                a texted code first, then a voice call, then the phone
+                prompt again, then a code the phone makes, then anything.
+
+                Call 84 offered only "Tap Yes on your phone or tablet" and
+                "Use your phone or tablet to get a security code" - neither
+                was on this list, so it gave up, though tapping Yes had
+                worked a minute before."""
                 for sel in ('text=/Get a verification code at/i',
                             'text=/Text message/i',
                             'text=/Send a text message/i',
                             'text=/Get a code.{0,40}(text|SMS)/i',
                             'text=/Phone call/i',
                             'text=/Call.{0,20}(instead|me)/i',
+                            'text=/Tap Yes on your phone/i',
+                            'text=/get a security code/i',
                             'text=/Google Authenticator/i',
                             'text=/backup code/i'):
                     el = q(page, sel)
@@ -881,7 +896,7 @@ def _run_signin(sid: int, account_id: int, email: str):
                         continue
                     _ob_set(sid, "failed",
                             "Google offered no verification method we can "
-                            "use. " + where(page))
+                            "use. " + where(page), reason="no_method")
                     browser.close()
                     return
 
@@ -906,6 +921,7 @@ def _run_signin(sid: int, account_id: int, email: str):
                                 reason="tap")
                     waited = 0
                     switched = False
+                    seen_num = ""
                     while waited < 200:
                         time.sleep(4)
                         waited += 4
@@ -914,14 +930,23 @@ def _run_signin(sid: int, account_id: int, email: str):
                                     reason="cancelled")
                             browser.close()
                             return
-                        # the number sometimes renders after the first look
-                        if not num:
-                            num = tap_number(page)
-                            if num:
-                                _ob_set(sid, "needs_tap",
-                                        f"The number to choose on your "
-                                        f"phone is {num}.",
-                                        reason="tap_number")
+                        # The number sometimes renders after the first
+                        # look, and Google sends a fresh prompt with a NEW
+                        # number when the old one times out. Call 84: "it
+                        # popped up again" - and he was never told the
+                        # number had changed.
+                        # Seen twice running before it is said: a misread
+                        # screen must not send them to a wrong number.
+                        now_num = tap_number(page)
+                        if now_num and now_num != num and \
+                                (now_num == seen_num or not num):
+                            changed = bool(num)
+                            num = now_num
+                            _ob_set(sid, "needs_tap",
+                                    f"The number to choose on your phone is "
+                                    f"{'now ' if changed else ''}{num}.",
+                                    reason="tap_number")
+                        seen_num = now_num
                         if (_PENDING.get(sid) or {}).get("other_way"):
                             _PENDING[sid]["other_way"] = False
                             if pick_another_method(page):
@@ -938,7 +963,8 @@ def _run_signin(sid: int, account_id: int, email: str):
                         continue
                     if wants_tap(page):
                         _ob_set(sid, "failed",
-                                "They never approved the prompt.")
+                                "They never approved the prompt.",
+                                reason="tap_timeout")
                         browser.close()
                         return
                     page.wait_for_timeout(3000)
@@ -1328,6 +1354,13 @@ _JOB_STARTED = {}
 
 
 def _job_set(jid: int, state: str, message: str = "", reason: str = ""):
+    # A stopped job stays stopped. Call 84: the caller said "who asked you
+    # to check that?", the search was stopped - and twenty seconds later
+    # the same job wrote "done" over the top, with an answer nobody wanted.
+    if (_JOBS.get(jid) or {}).get("cancelled") and reason != "cancelled":
+        emit("job", f"job {jid}", f"ignored after it was stopped: {state}",
+             "info")
+        return
     if state in ("opening", "signing_in") and jid not in _JOB_STARTED:
         _JOB_STARTED[jid] = time.time()
     if state in ("done", "failed") and jid in _JOB_STARTED:
@@ -2532,13 +2565,18 @@ def _match_element(items: list, desc: str):
 
 
 def _replay_recipe(page, steps: list, creds: dict, log_fn,
-                   subject: str = ""):
-    """Run recorded steps without the model. Returns (ok, answer_text)."""
+                   subject: str = "", stopped=None):
+    """Run recorded steps without the model. Returns (ok, answer_text).
+    stopped() is asked before every step: a job that has been stopped does
+    not carry on clicking (call 84)."""
     needs = any(st.get("text") == "TASK_SUBJECT" for st in steps)
     if needs and not subject:
         log_fn("saved steps need a subject and this task has none")
         return False, ""
     for i, st in enumerate(steps):
+        if stopped and stopped():
+            log_fn("stopped part-way through the saved steps")
+            return False, ""
         a = st.get("action")
         try:
             if a in ("click", "type"):
@@ -2685,8 +2723,12 @@ def _run_browse(jid: int, account_id: int, site: str):
             if recipe and recipe["steps"]:
                 _job_set(jid, "working",
                          f"Using what worked before for {task}.")
-                ok, text = _replay_recipe(page, recipe["steps"], creds,
-                                          log_fn, subject)
+                ok, text = _replay_recipe(
+                    page, recipe["steps"], creds, log_fn, subject,
+                    stopped=lambda: (_JOBS.get(jid) or {}).get("cancelled"))
+                if (_JOBS.get(jid) or {}).get("cancelled"):
+                    browser.close()
+                    return
                 if ok and text:
                     answer = _summarise_page(text, goal)
                     if is_blocked(answer):

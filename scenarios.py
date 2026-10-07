@@ -535,6 +535,36 @@ def _():
         f"the heading was right there and it was called not found: {st}")
 
 
+@scenario("browser: a stopped search stays stopped",
+          "call 84 - 'who asked you to check the next car website?' - it "
+          "was stopped, then carried on and wrote 'done' over the stop")
+def _():
+    """The same search as call 84, on the same site, stopped as soon as
+    it starts. CarsDirect has saved steps for it, which is the path that
+    ignored the stop."""
+    import time as _t
+    d = call("/jobs/browse", method="POST", account_id=ACCOUNT,
+             goal="find a lower-priced family minivan with 8 seats, leather "
+                  "seats, a sunroof, and a large trunk",
+             site="CarsDirect", url="", call_id=0)
+    jid = d.get("job_id")
+    assert jid, f"no job started: {d}"
+    for _ in range(20):
+        _t.sleep(1)
+        if call("/jobs/status", job_id=jid).get("state") in (
+                "opening", "working", "done", "failed"):
+            break
+    call("/jobs/cancel", method="POST", job_id=jid, why="scenario stop")
+    st = {}
+    for _ in range(12):                 # long enough for the old bug
+        _t.sleep(4)
+        st = call("/jobs/status", job_id=jid)
+        assert st.get("state") == "failed" and \
+            st.get("reason") == "cancelled", (
+                f"a stopped job carried on and became {st.get('state')}: "
+                f"{(st.get('message') or '')[:160]}")
+
+
 # --------------------------------------------------------------- result
 
 print()
