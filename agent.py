@@ -686,24 +686,22 @@ CONTACTS, FILES AND THE TO-DO LIST
   tick_off_to_do.
 
 SHOPPING AND ORDERS
-1. What they want: item, how many, which site. Vague -> search_site or
-   do_on_website, read the name and price, get a yes on the exact item.
+1. What they want: item, option, how many, which site. Vague ->
+   search_site, read the name and price, get a yes on the exact item.
 2. The MOMENT they say yes to an item, draft_order - before you ask for
-   anything else. That writes the item and price down. Until you do, the
-   order exists only in this conversation and it WILL be lost: a caller
-   gave his address and the whole order vanished into another search.
-3. Address: what_is_saved, read it back; none -> save_address. Never hold
-   an address in your head - save it, then it is theirs for next time.
-4. Payment: what_is_saved shows their cards. None saved? If the site has one, use that.
-   Otherwise the best way is card_setup_code - someone with internet adds
-   it on our secure page and the number is never said aloud. Only if
-   nobody can help, take it by voice and save_card.
-5. draft_order again with the address and card, then read back item,
-   quantity, price, address and card ending, and ask exactly: "Should I
-   place this order?" Wait.
-6. Only on a clear yes, confirm_order. "Cancel that" -> cancel_order.
-Never start a new search while an order is open. If the price needs
-checking, review_checkout reads the real basket back.
+   anything else, or the order WILL be lost (a caller gave his address
+   and it vanished into another search). On a shop they have a login
+   for, it puts it in their basket and reads that shop's checkout back.
+   Nothing is bought. Never ask such a shop's address or card - they
+   come from their account there (call 87).
+3. Read ALL of the checkout back - each item, address, card, total - and
+   ask exactly: "Should I place this order?" Wait.
+4. Only on a clear yes, confirm_order. "Cancel that" -> cancel_order.
+5. No login on that shop: draft_order says what is missing. Address:
+   what_is_saved, or save_address. Card: the best way is card_setup_code
+   - added on our secure page, never said aloud; only if nobody can
+   help, by voice and save_card.
+Never start a new search while an order is open.
 
 CHECKING A BASKET BEFORE BUYING
 review_checkout reads the checkout page back - items, address, card,
@@ -2063,6 +2061,21 @@ they go quiet, ask once whether they are still there, then wait.
             "call_id": self.call_id})
         self.order_id = d.get("order_id")
         self.order_item = f"{d.get('quantity')} x {d.get('item')}"
+        await log_turn(self.call_id, "tool",
+                       f"order {self.order_id} written down: "
+                       f"{self.order_item} from {site}", "draft_order")
+        # A shop they are signed up to: their own address and card are
+        # there. Put it in the basket and read the real checkout back -
+        # never ask for an address the shop already has (call 87: "why
+        # are you jumping to shipping? the cart comes first").
+        try:
+            logins = await backend_get("/logins", account_id=self.account_id)
+        except Exception:
+            logins = []
+        has_login = any((r.get("site") or "").lower() == site.lower()
+                        for r in logins or [])
+        if has_login:
+            return await self._prepare_order(site)
         need = []
         if not d.get("address"):
             need.append("no address yet - what_is_saved, or ask and "
@@ -2085,6 +2098,53 @@ they go quiet, ask once whether they are still there, then wait.
                       "again with it.")
         return (head + " Read all of that back and ask: Should I place "
                        "this order?")
+
+    async def _prepare_order(self, site: str):
+        try:
+            async with httpx.AsyncClient(timeout=25) as c:
+                r = await c.post(f"{BACKEND}/orders/prepare", headers=AUTH,
+                                 params={"order_id": self.order_id})
+                d = r.json()
+        except Exception as e:
+            log.error(f"prepare failed: {e}")
+            return ("The order is written down, but the basket could not be "
+                    "opened just now. Say so; nothing was bought.")
+        if not d.get("job_id"):
+            return (f"The order is written down, but the basket could not "
+                    f"be opened: {d.get('detail', '')}. Nothing was bought.")
+        self.job_id = d["job_id"]
+        self.job_site = site
+        oid, jid = self.order_id, d["job_id"]
+
+        async def fetch():
+            j = await backend_get("/jobs/status", job_id=jid)
+            if j.get("state") == "done":
+                o = await backend_get("/orders/status", order_id=oid)
+                j["order_state"] = o.get("state")
+                j["order_total"] = o.get("final_total")
+            return j
+
+        def describe(d):
+            st, msg = d.get("state", ""), d.get("message", "")
+            if st in ("needs_code", "needs_input"):
+                return f"{site} needs this from them: {msg}. Ask them."
+            if st == "done" and d.get("order_state") == "ready":
+                return (f"This is {site}'s own checkout. Read ALL of it "
+                        f"back, adding nothing - each item, the address, "
+                        f"the card and the total {d.get('order_total')} - "
+                        f"then ask exactly: Should I place this order? "
+                        f"Nothing has been bought. {msg}")
+            if st == "done":
+                return (f"Say you got to the {site} checkout but could not "
+                        f"read the total, so nothing will be placed, and "
+                        f"offer to try again. {msg}")
+            return None
+
+        self._start_watch("job", fetch, describe)
+        return (f"Putting it in their {site} basket and opening the "
+                f"checkout. Tell them in one sentence that nothing is being "
+                f"bought - you will read them {site}'s own total first - "
+                f"then say nothing until you are told what it shows.")
 
     @function_tool
     @auto_report("orders")
@@ -2140,6 +2200,11 @@ they go quiet, ask once whether they are still there, then wait.
         except Exception as e:
             log.error(f"confirm failed: {e}")
             return "Couldn't start the checkout."
+        if not d.get("job_id"):
+            # Only a total read from the shop's own checkout can be said
+            # yes to (call 87).
+            return (f"NOT placed - nothing was bought. "
+                    f"{d.get('detail', '')} Read the checkout back first.")
         self.job_id = d.get("job_id")
         await log_turn(self.call_id, "tool", f"order {self.order_id} placing",
                        "confirm_order")
@@ -2221,8 +2286,10 @@ they go quiet, ask once whether they are still there, then wait.
                        f"on {site or url or 'the web'}: {goal[:120]}",
                        "do_on_website")
         self._watch_job(goal)
-        return ("On it. Tell them it takes up to a minute and stay with "
-                "them, then call get_site_result.")
+        # Call 87: being told to keep them company became four progress
+        # lines in ninety seconds. The watcher speaks when it changes; nothing to fill.
+        return ("On it. Tell them ONCE that it takes up to a minute, then "
+                "say nothing about it until you are told it is done.")
 
     def _not_asked_yet(self):
         """Call 84: two seconds after the PIN, before he had said a word,

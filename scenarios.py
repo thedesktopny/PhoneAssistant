@@ -621,6 +621,24 @@ def _():
     assert d.get("freshness") in ("indexed", "dated", "none"), d
 
 
+@scenario("orders: nothing can be bought until the shop's own total is read back",
+          "call 87 - a yes would have put the item in the cart AND bought it, "
+          "and he would never have heard Amazon's real total")
+def _():
+    """Makes nothing: an order number that does not exist."""
+    for path, want in (("/orders/prepare", "state to prepare"),
+                       ("/orders/confirm", "read back from the shop")):
+        try:
+            call(path, method="POST", order_id=0, confirmed="yes")
+            raise AssertionError(f"{path} accepted an order that does not "
+                                 f"exist")
+        except urllib.error.HTTPError as e:
+            said = e.read().decode("utf-8", "ignore")
+            assert e.code == 400 and want in said, (
+                f"{path}: the new order flow is not deployed: {e.code} "
+                f"{said[:160]}")
+
+
 # --------------------------------------------------------------- result
 
 print()

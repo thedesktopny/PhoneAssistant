@@ -3514,7 +3514,8 @@ def _():
     assert "holding" in words, words
 
     # 5. a job with nobody on the phone keeps its old, longer leash
-    assert "if call_id and time.time() - t0 > CALL_BUDGET" in body, \
+    assert "if call_id and time.time() - t0 > int(" in body and \
+        'payload.get("budget") or CALL_BUDGET' in body, \
         "a background job would be cut off by a caller's clock"
     assert 60 <= browser.CALL_BUDGET <= 180, \
         f"{browser.CALL_BUDGET}s is not a sensible time to hold someone"
@@ -4530,6 +4531,96 @@ def _():
         "what one shop has now can still go to a web search"
 
 
+@check("an order goes in the basket, the shop's checkout is read back, "
+       "and only that total can be bought")
+def _():
+    """Call 87: "why are you jumping to shipping? The cart comes first."
+    The order asked for our saved address, and a yes would have added it
+    to the cart AND bought it in one go, stopping only 20% over - he would
+    never have heard Amazon's real total. Now: basket, read back, yes to
+    THAT total, and nothing else may be bought."""
+    import browser
+    src = io.open("browser.py", encoding="utf-8").read()
+    # the first half can never buy
+    m = io.open("main.py", encoding="utf-8").read()
+    i = m.index('def order_prepare(')
+    body = m[i:m.index("\n@app.", i)]
+    assert '"may_buy": False' in body and '"order_id": order_id' in body, \
+        "the basket job could press the button that buys"
+    assert "PREPARE_GOAL" in body
+    for need in ("same option", "Add to Cart", "may NOT press it",
+                 '"total"', "anything else is in the basket"):
+        assert need in browser.PREPARE_GOAL, f"PREPARE_GOAL lacks: {need}"
+    # confirm only a total that was read back
+    i = m.index('def order_confirm(')
+    body = m[i:m.index("\n@app.", i)]
+    assert 'row.state != "ready"' in body and "row.final_total" in body, \
+        "an order can still be bought without its real total read back"
+    # the runner: a done basket makes the order ready at that total
+    i = src.index("def _run_browse(")
+    run = src[i:src.index("\ndef ", i + 10)]
+    assert 'payload.get("order_id")' in run and '"ready"' in run
+    # and placing it stops if the total is not the one they said yes to
+    i = src.index("def _run_checkout(")
+    co = src[i:src.index("\ndef ", i + 10)]
+    assert 'reason="total_changed"' in co and "approved" in co, \
+        "the order can be placed at a total nobody agreed to"
+    assert co.index("total_changed") < co.index('"Placing now."'), \
+        "the total is compared after the button is pressed"
+    assert "already_in_basket" in co and "already_in_basket" in \
+        browser.CHECKOUT_SYSTEM, "the second half would add it again"
+    assert browser._money_of("$35.97") == 35.97
+    assert browser._money_of("1,299.00 USD") == 1299.0
+    assert browser._money_of("") == 0.0
+    # the assistant: basket first for a shop they have a login on
+    a = io.open("agent.py", encoding="utf-8").read()
+    i = a.index("async def draft_order(")
+    body = a[i:a.index("    @function_tool", i)]
+    assert "has_login" in body and "_prepare_order(site)" in body
+    assert body.index("_prepare_order(site)") < body.index("no address yet"), \
+        "it still asks for an address before trying the shop's own"
+    assert "log_turn(" in body, "a written-down order leaves no line"
+    i = a.index("async def _prepare_order(")
+    body = a[i:a.index("    @function_tool", i)]
+    assert "Should I place this order?" in body and \
+        "Nothing has been bought" in body
+    i = a.index("async def confirm_order(")
+    body = a[i:a.index("    @function_tool", i)]
+    assert "NOT placed - nothing was bought" in body, \
+        "a refused confirm could still be heard as placed"
+
+
+@check("a saved recipe never clicks the last search's product")
+def _():
+    """Call 87: looking up labels, the saved Amazon recipe clicked "Sensi
+    Touch 2 Smart Thermostat" - the product from the search before."""
+    import browser
+    steps = [{"action": "type", "desc": "input: Search Amazon",
+              "text": "TASK_SUBJECT"},
+             {"action": "click", "desc": "a: Sensi Touch 2 Smart Thermostat "
+                                         "Wi-Fi, Alexa, Energy Star"},
+             {"action": "click", "desc": "button: Add to Cart"}]
+    kept = browser._generic_steps(
+        "find the difference between the Sensi Touch 2 Smart Thermostat "
+        "and the ST76W2", steps)
+    assert kept == steps[:1], kept
+    plain = [{"action": "click", "desc": "a: Hello, sign in"},
+             {"action": "type", "desc": "input: email", "text": "x"}]
+    assert browser._generic_steps("sign in to amazon", plain) == plain
+
+
+@check("a website job says 'a minute' once, not four times")
+def _():
+    """Call 87: "this might take up to a minute", "I'm still checking",
+    "still working on it", "still checking, thanks for your patience" -
+    four in ninety seconds. "Stay with them" invited every one."""
+    src = io.open("agent.py", encoding="utf-8").read()
+    i = src.index("    async def do_on_website(")
+    body = src[i:src.index("    @function_tool", i + 10)]
+    assert "stay with" not in body, "it is still told to keep talking"
+    assert "ONCE" in body and "say nothing about it" in body
+
+
 @check("a text is never called sent when it cannot be delivered")
 def _():
     """Call 76: a new customer with no email was told twice "I've sent you
@@ -4577,6 +4668,8 @@ def _():
     assert steps.index("draft_order") < steps.index("save_address"), \
         "the address is still taken before the order exists"
     assert "Never start a new search while an order is open" in steps, steps
+    assert "Never ask such a shop's address or card" in steps, \
+        "it still asks for an address the shop already has (call 87)"
 
     src = io.open("agent.py", encoding="utf-8").read()
     i = src.index("async def draft_order(")

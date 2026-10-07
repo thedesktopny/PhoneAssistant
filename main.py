@@ -51,7 +51,7 @@ from find import find_out, needs_source
 from advisor import (ADVISOR_SYSTEM, PROFILE_SYSTEM, REVIEW_SYSTEM, WORKING_CLAIMS, advise, call_state, learn_about_caller, profile_for, review_call)
 from google_tools import (CODE_DIGITS, CODE_MAIL, CONNECT_CODE_HOURS, CONNECT_MAX_FAILS, CONNECT_MAX_FAILS_IP, CONVERTIBLE, DOC, DRIVE_KINDS, DRIVE_MAX_BYTES, MESSAGE_ACTIONS, PERSON_FIELDS, SEND_MAX_BYTES, SHEET, SLIDES, code_from_email, document_text, gmail_client, google_client, list_mailboxes, pick_connection, tool_attachment_text, tool_attachments, tool_cancel_event, tool_contact_add, tool_contacts_search, tool_create_event, tool_doc_add, tool_doc_create, tool_doc_replace, tool_draft_email, tool_drive_editable_copy, tool_drive_read, tool_drive_save_pdf, tool_drive_search, tool_email_drive_file, tool_find_contact, tool_find_free, tool_forward_email, tool_list_events, tool_mark_all_read, tool_mark_read, tool_message_action, tool_read_email, tool_reply_email, tool_search_email, tool_send_email, tool_sheet_add_row, tool_sheet_create, tool_sheet_read, tool_sheet_update, tool_task_add, tool_task_done, tool_tasks_list, tool_unread_summary)
 from google_tools import (_as_pdf, _cal, _category, _col_letters, _column_number, _connect_code, _connect_code_ok, _connect_too_many, _drive_kind, _drive_meta, _extract_body, _flow, _google_time, _headers_of, _made, _must_be, _person, _sheet_values, _spoken_date, _tab_range, _upload, _walk_parts)
-from browser import (_order_set, BROWSE_SYSTEM, BUY_BUTTONS, CHECKOUT_SYSTEM, DIAL_MAP, DOING_GOAL, MAX_BROWSERS, NAV_NOISE, ORDER_PAGES, PROXY_STATUS, REFUSAL_HINT, SEARCH_PAGES, SITES, STUCK_LIMIT, US_AREA_STATE, claims_action, delete_everything, disconnect_mailbox, do_back, do_click, do_fill, do_goto, forget_site_login, list_site_logins, looks_like_pdf, page_answer, page_eval, page_shot, page_text, page_url, q, q_all, read_pdf, revoke_google, save_site_login, settle, signed_in, use_site_login, _browser_error)
+from browser import (_order_set, PREPARE_GOAL, BROWSE_SYSTEM, BUY_BUTTONS, CHECKOUT_SYSTEM, DIAL_MAP, DOING_GOAL, MAX_BROWSERS, NAV_NOISE, ORDER_PAGES, PROXY_STATUS, REFUSAL_HINT, SEARCH_PAGES, SITES, STUCK_LIMIT, US_AREA_STATE, claims_action, delete_everything, disconnect_mailbox, do_back, do_click, do_fill, do_goto, forget_site_login, list_site_logins, looks_like_pdf, page_answer, page_eval, page_shot, page_text, page_url, q, q_all, read_pdf, revoke_google, save_site_login, settle, signed_in, use_site_login, _browser_error)
 import everyday
 import signup
 from browser import (site_url, _JOB_STARTED, _LAST_LIMIT_FLAG, _LAST_PROXY_FLAG, _PENDING, _SNAPSHOT_JS, _TASK_CACHE, _action_index, _action_sig, _agent_fallback, _as_placeholder, _bb_connect_url, _bb_session, _body_mark, _decide, _do_site_login, _find_recipe, _first_json, _flag_account_limit, _flag_proxy_fallback, _flag_proxy_unavailable, _forget_context, _get_context, _going_in_circles, _handle, _is_nav_error, _job_set, _match_element, _new_browserbase_context, _ob_set, _open_with_session, _page_snapshot, _queue_lock, _recipe_result, _recipe_value, _record_request, _replay_recipe, _run_browse, _run_checkout, _run_reset, _run_signin, _run_site_login, _run_site_orders, _run_site_search, _save_context, _save_recipe, _shape, _slots, _stuck_note, _task_label, _task_shape, _user_turn, _waiting, _where_for_account, _where_for_phone)
@@ -3383,9 +3383,36 @@ def order_draft(b: OrderBody, request: Request):
     return out
 
 
+@app.post("/orders/prepare")
+def order_prepare(request: Request, order_id: int):
+    """Put the item in the basket and read the shop's own checkout back -
+    items, address, card, total. Never buys: it runs with may_buy off."""
+    require_auth(request)
+    if not BROWSERBASE_API_KEY:
+        raise HTTPException(400, "Browserbase isn't configured.")
+    db = Session()
+    row = db.query(Order).filter_by(id=order_id).first()
+    if not row or row.state not in ("draft", "ready", "failed"):
+        db.close()
+        raise HTTPException(400, "Order isn't in a state to prepare.")
+    goal = PREPARE_GOAL.format(site=row.site, item=row.item,
+                               quantity=row.quantity or 1,
+                               price=row.expected_price or "unknown")
+    acct, site, call_id = row.account_id, row.site, row.call_id
+    db.close()
+    jid = start_job(acct, "browse", site, call_id=call_id or None,
+                    payload={"goal": goal, "url": "", "max_steps": 30,
+                             "may_buy": False, "order_id": order_id,
+                             "budget": 240})
+    _order_set(order_id, "preparing", "Putting it in the basket.",
+               job_id=jid, final_total="")
+    return {"order_id": order_id, "job_id": jid, "state": "preparing"}
+
+
 @app.post("/orders/confirm")
 def order_confirm(request: Request, order_id: int, confirmed: str = ""):
-    """Caller said yes out loud. Starts the checkout job."""
+    """Caller said yes out loud - to the total read from the shop's own
+    checkout. Starts the job that places it, at that total only."""
     require_auth(request)
     if confirmed.strip().lower() not in ("yes", "confirmed", "place it"):
         raise HTTPException(400, "Needs an explicit yes.")
@@ -3393,9 +3420,11 @@ def order_confirm(request: Request, order_id: int, confirmed: str = ""):
         raise HTTPException(400, "Browserbase isn't configured.")
     db = Session()
     row = db.query(Order).filter_by(id=order_id).first()
-    if not row or row.state not in ("draft", "failed"):
+    if not row or row.state != "ready" or not row.final_total:
         db.close()
-        raise HTTPException(400, "Order isn't in a state to confirm.")
+        raise HTTPException(400, "This order has not been read back from "
+                                 "the shop's checkout yet, so there is no "
+                                 "total they have said yes to.")
     row.state = "confirmed"
     acct_id, site = row.account_id, row.site
     db.commit()

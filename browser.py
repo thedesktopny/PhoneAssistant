@@ -2519,8 +2519,30 @@ def _find_recipe(site: str, task: str):
     return out
 
 
+def _generic_steps(goal: str, steps: list) -> list:
+    """The part of a recipe that works for the next search too. Call 87: a
+    saved 'product_price' recipe for Amazon clicked "Sensi Touch 2 Smart
+    Thermostat" - from the search before - while looking up labels. A
+    click on the thing that was asked about is not a reusable step."""
+    words = {w for w in _re_scrub.findall(r"[a-z0-9]{3,}", goal.lower())
+             if w not in ("the", "and", "for", "with", "find", "check",
+                          "price", "what", "this", "that", "from", "any")}
+    out = []
+    for st in steps:
+        if st.get("action") == "click":
+            desc = set(_re_scrub.findall(r"[a-z0-9]{3,}",
+                                         (st.get("desc") or "").lower()))
+            if len(words & desc) >= 2:
+                break
+        out.append(st)
+    return out
+
+
 def _save_recipe(site: str, task: str, goal: str, steps: list):
     """Store the steps that worked. Existing recipe -> refresh it."""
+    steps = _generic_steps(goal, steps)
+    if not steps:
+        return
     db = Session()
     row = (db.query(Recipe)
              .filter_by(site=site or "generic", task=task).first())
@@ -2767,7 +2789,8 @@ def _run_browse(jid: int, account_id: int, site: str):
                 # Somebody is holding a phone. Two minutes of hold music
                 # is the most anyone should be asked for, whatever the
                 # model believes it is about to achieve.
-                if call_id and time.time() - t0 > CALL_BUDGET:
+                if call_id and time.time() - t0 > int(
+                        payload.get("budget") or CALL_BUDGET):
                     _job_set(jid, "failed",
                              f"It has been trying for two minutes without "
                              f"getting there, so it stopped rather than "
@@ -2866,6 +2889,18 @@ def _run_browse(jid: int, account_id: int, site: str):
                     _job_set(jid, "done", answer,
                              reason="met" if act.get("met") is True
                              else "not_met")
+                    # A basket taken to the review page for an order: the
+                    # total read here is the one the caller says yes to,
+                    # and the only one the order may be placed at.
+                    if payload.get("order_id"):
+                        total = str(act.get("total") or "").strip()[:20]
+                        if _money_of(total):
+                            _order_set(payload["order_id"], "ready",
+                                       answer[:600], final_total=total)
+                        else:
+                            _order_set(payload["order_id"], "draft",
+                                       "Reached the checkout but the total "
+                                       "was not read. " + answer[:400])
                     outcome = "ok"
                     if recorded:
                         _save_recipe(site_key, task, goal, recorded)
@@ -3086,6 +3121,31 @@ def _run_browse(jid: int, account_id: int, site: str):
 
 
 
+# The first half of an order: into the basket, as far as the review page,
+# read back. Run as a browse job with may_buy off, so the button that buys
+# cannot be pressed whatever the model decides (call 87).
+PREPARE_GOAL = """Put one item in the customer's basket on {site} and take it as
+far as the order review page. They are already signed in there.
+
+ITEM: {item}
+QUANTITY: {quantity}
+EXPECTED: about {price}
+
+1. Find exactly this item - the same product AND the same option (size,
+   pack, count, colour). If there is no clear match, give_up; never
+   substitute.
+2. Set the quantity, then Add to Cart.
+3. Open the basket, Proceed to checkout, and stop on the page with the
+   final button that places the order. You may NOT press it - nothing can
+   be bought here.
+4. Finish with done. In answer, read back: every item in the order with
+   its quantity and price - say clearly if anything else is in the basket
+   - the delivery address, the payment card, and the order total. Put the
+   order total, as it is written, in "total".
+If the site wants a sign-in code or a choice only they can make, use
+ask_user."""
+
+
 CHECKOUT_SYSTEM = """You are placing an order on a website for a customer
 who has already confirmed every detail on the phone. You get the page text
 and numbered interactive elements. Reply with ONE JSON action and nothing
@@ -3122,8 +3182,20 @@ Rules, in order of importance:
 4. After purchasing, find the confirmation/order number and use done.
 5. If anything asks for a code or a choice only the customer can make,
    use ask_user.
-6. Never buy anything else, never add extras, never change quantity."""
+6. Never buy anything else, never add extras, never change quantity.
+7. If the order says already_in_basket, the item is in the basket from a
+   moment ago: open the basket and Proceed to checkout - never add it
+   again. If the basket holds anything else, give_up and say what."""
 
+
+
+def _money_of(text) -> float:
+    """$1,299.99 -> 1299.99; 0.0 when there is no amount."""
+    m = _re_scrub.search(r"\d[\d,]*(?:\.\d{1,2})?", str(text or ""))
+    try:
+        return float(m.group(0).replace(",", "")) if m else 0.0
+    except ValueError:
+        return 0.0
 
 
 def _order_set(oid: int, state: str, message: str = "", **fields):
@@ -3170,6 +3242,13 @@ def _run_checkout(jid: int, account_id: int, site: str):
         "pay_with": (f"{card.brand} ending {card.last4}" if card
                      else "(use the site's saved payment method)"),
     }
+    approved = order.final_total or ""
+    if order.state in ("confirmed", "placing") and approved:
+        # The basket was filled and read back on the call; the caller said
+        # yes to this total. Go straight to checkout - adding it again
+        # would order two.
+        spec["already_in_basket"] = True
+        spec["total_they_said_yes_to"] = approved
     values = {
         "SHIP_LINE1": addr.line1 if addr else "",
         "SHIP_LINE2": addr.line2 if addr else "",
@@ -3296,6 +3375,20 @@ def _run_checkout(jid: int, account_id: int, site: str):
 
                 if a == "place_order":
                     total = str(act.get("total", ""))[:20]
+                    # The caller said yes to a total. Anything else is a
+                    # different order: stop, buy nothing, and say so.
+                    if approved:
+                        want, got = _money_of(approved), _money_of(total)
+                        if not got or abs(got - want) > max(0.01, 0.005 *
+                                                            want):
+                            msg = (f"The total on the checkout is now "
+                                   f"{total or 'unreadable'}, not the "
+                                   f"{approved} they said yes to. Nothing "
+                                   f"was bought.")
+                            _order_set(oid, "failed", msg)
+                            _job_set(jid, "failed", msg,
+                                     reason="total_changed")
+                            break
                     _order_set(oid, "placing",
                                f"On the review screen, total {total}. "
                                f"Placing now.")
