@@ -606,6 +606,21 @@ def _():
     assert live, f"a feed is on but gave no live price: {d}"
 
 
+@scenario("find: the difference between two models is read, not guessed",
+          "call 85 - 'what's the difference, why is it more?' answered from "
+          "memory: 'might be packaging or retailer bundles'")
+def _():
+    d = call("/find", q="What are the key differences between the Sensi "
+                        "Touch 2 Smart Thermostat and the Sensi Touch 2 "
+                        "Smart Thermostat ST76W2?")
+    if d.get("reason") in ("no_model", "search_failed"):
+        raise SetupProblem(f"the find path has nothing to work with: {d}")
+    assert d.get("how") == "search", (
+        f"a model-number comparison was answered from memory: "
+        f"{(d.get('answer') or '')[:160]}")
+    assert d.get("freshness") in ("indexed", "dated", "none"), d
+
+
 # --------------------------------------------------------------- result
 
 print()

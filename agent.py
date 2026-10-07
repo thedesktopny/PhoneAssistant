@@ -2216,6 +2216,10 @@ they go quiet, ask once whether they are still there, then wait.
                                       "allowed to talk to you about this."
         self.job_id = d.get("job_id")
         self.job_question = goal
+        self.job_site = site
+        await log_turn(self.call_id, "tool",
+                       f"on {site or url or 'the web'}: {goal[:120]}",
+                       "do_on_website")
         self._watch_job(goal)
         return ("On it. Tell them it takes up to a minute and stay with "
                 "them, then call get_site_result.")
@@ -2415,6 +2419,8 @@ they go quiet, ask once whether they are still there, then wait.
             return "Couldn't start that."
         self.job_id = d.get("job_id")
         self.job_question = f"their recent orders on {site}"
+        await log_turn(self.call_id, "tool", f"checking orders on {site}",
+                       "check_site_orders")
         self._watch_job(f"recent orders on {site}")
         return ("Looking that up. Tell them it takes about half a minute, "
                 "then say nothing until I tell you it's done.")
@@ -2442,9 +2448,21 @@ they go quiet, ask once whether they are still there, then wait.
                                       "allowed to talk to you about this."
         self.job_id = d.get("job_id")
         self.job_question = f"{query} on {site}"
+        self.job_site = site
+        await log_turn(self.call_id, "tool", f"searching {site}: {query}",
+                       "search_site")
         self._watch_job(f"searching {site} for {query}")
-        return ("Searching. Tell them it takes about half a minute, then "
-                "say nothing until I tell you it's done.")
+        # Call 85: "did you go into my account?" - and then "maybe you
+        # log in when I check out?", with no clear answer, and he hung up.
+        return (f"Searching. Tell them it takes about half a minute, then "
+                f"say nothing until I tell you it's done. This search does "
+                f"NOT sign in to their account and buys nothing. When they "
+                f"pick one: draft_order. You sign in to {site} only when "
+                f"placing the order, and before anything is bought you read "
+                f"them the real total from {site}'s checkout and wait for "
+                f"their yes - say exactly that if they ask about their "
+                f"account. If they repeat a price back wrong, say the right "
+                f"one.")
 
     @function_tool
     @auto_report("site_read")
@@ -2505,6 +2523,8 @@ they go quiet, ask once whether they are still there, then wait.
                  if (r.get("site") or "").lower() == site.lower()), "")
         except Exception:
             self.job_username = ""
+        await log_turn(self.call_id, "tool", f"signing in to {site}",
+                       "sign_in_to_site")
         self._watch_job(f"signing in to {site}")
         return (f"Signing in to {site}. Tell them it takes a minute or two, "
                 f"then call how_is_it_going.")

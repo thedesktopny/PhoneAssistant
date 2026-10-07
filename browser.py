@@ -2033,6 +2033,12 @@ Rules:
   compare two things: open the first, note what matters with "found", go
   back, open the second, note that too, then answer from your notes. Never
   open a page you have already noted.
+- Asked what differs between two listings of what looks like the same
+  thing, read BOTH. A different price for the same product is almost
+  always the seller, new or used/renewed, how many in the box, or what is
+  included - note those for each. Never say "no difference" from one page
+  (call 85 did, and a $43 gap went unexplained); met is false until both
+  have been read.
 - The answer field is read aloud, so keep it to two or three sentences with
   plain names, prices and dates. Never include a URL."""
 

@@ -29,6 +29,10 @@ from ai import _openai_chat, ASK_SYSTEM
 # memory is where the invented button combinations came from (call 52).
 NEEDS_SOURCE = _re_scrub.compile(
     r"(?i)\b[A-Z]{2,}[-\s]?\d{3,}[A-Z0-9-]*\b|\b\d{3,}[A-Z]{2,}\b"
+    # call 85: "ST76W2" - letters and digits mixed, any lengths
+    r"|\b(?=[A-Z0-9-]{4,}\b)(?=[A-Z0-9-]*\d)(?=[A-Z0-9-]*[A-Z])"
+    r"[A-Z0-9]+(?:-[A-Z0-9]+)*\b"
+    r"|\b(difference|differences|differ|compare|comparison|versus|vs)\b"
     r"|\b(price|prices|cost|costs|how much|cheap|cheapest|deal|sale|"
     r"discount|in stock|available|availability|hours|open|opens|closed|"
     r"closes|today|tonight|this week|now|current|currently|latest|newest|"

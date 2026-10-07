@@ -4411,6 +4411,50 @@ def _():
         "a listed price and a live one sound the same to the caller"
 
 
+@check("comparing two listings reads both, and a model number needs a page")
+def _():
+    """Call 85: two Amazon listings of the Sensi Touch 2, $166.59 and
+    $209.99. The difference was answered from memory ("might be packaging
+    or retailer bundles"), then from ONE page ("no real difference"), and
+    the $43 gap was never explained."""
+    import find
+    for q in ("What are the key differences between the Sensi Touch 2 "
+              "Smart Thermostat and the Sensi Touch 2 Smart Thermostat "
+              "ST76W2?",
+              "Sensi ST76W2 vs ST55",
+              "compare the Ninja AF101 and AF161"):
+        assert find.needs_source(q), f"would answer from memory: {q}"
+    for q in ("how do you make a cup of tea", "what is a sukkah",
+              "what does a thermostat do"):
+        assert not find.needs_source(q), f"would search for: {q}"
+    src = io.open("browser.py", encoding="utf-8").read()
+    i = src.index("BROWSE_SYSTEM = ")
+    body = src[i:i + 6000]
+    assert "read BOTH" in body and "met is false until both" in body, \
+        "a comparison can still be answered from one page"
+    for what in ("seller", "used/renewed", "how many in the box"):
+        assert what in body, f"nothing says to look at {what}"
+
+
+@check("every job a tool starts leaves a line in the call record")
+def _():
+    """Call 85: two jobs ran on Amazon and the call record showed neither -
+    only find_out and end_call. Nobody reading the call could tell what
+    the system had done."""
+    src = io.open("agent.py", encoding="utf-8").read()
+    for name in ("search_site", "do_on_website", "find_best_price",
+                 "check_site_orders", "sign_in_to_site", "find_out",
+                 "confirm_order", "connect_email"):
+        i = src.index(f"    async def {name}(")
+        body = src[i:src.index("    @function_tool", i + 10)]
+        assert "log_turn(" in body, f"{name} leaves no line in the record"
+    i = src.index("    async def search_site(")
+    body = src[i:src.index("    @function_tool", i + 10)]
+    assert "NOT sign in to their account and buys nothing" in body, \
+        "a caller asking 'did you go into my account' has no clear answer"
+    assert "real total from" in body
+
+
 @check("a text is never called sent when it cannot be delivered")
 def _():
     """Call 76: a new customer with no email was told twice "I've sent you
