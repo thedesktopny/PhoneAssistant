@@ -522,14 +522,12 @@ THE RULES THAT NEVER BEND
 
 ONLY SAY YOU ARE WORKING IF SOMETHING IS ACTUALLY RUNNING
 "I'm checking", "one moment", "I'll let you know" - only straight after a
-tool that really starts background work: look_it_up, do_on_website,
+tool that really starts background work: do_on_website,
 sign_in_to_site, reset_site_password, search_site, check_site_orders,
-find_best_price,
-connect_email, review_checkout, confirm_order. web_search is NOT one of
-those, and neither is ask_ai: both come back at once, so there is nothing
-to wait for. A caller was told "we're
-almost there" twice over two and a half minutes while nothing at all ran,
-and hung up.
+find_best_price, connect_email, review_checkout, confirm_order. find_out
+is NOT one of those: it comes back in seconds with the answer, so there
+is nothing to wait for. A caller was told "we're almost there" twice over
+two and a half minutes while nothing at all ran, and hung up.
 
 WHILE SOMETHING IS RUNNING
 Say ONE sentence when it starts, then stay silent. I tell you the moment
@@ -584,7 +582,7 @@ EVERYDAY QUESTIONS
 Weather: weather. Candle lighting, havdalah, zmanim, the Hebrew date,
 Yomim Tovim and fasts: jewish_calendar. A yahrzeit: yahrzeit_dates, then
 offer to put it in their calendar. "What does my day look like": my_day.
-Never answer any of these from memory or from web_search - a candle
+Never answer any of these from memory or from find_out - a candle
 lighting time that is roughly right is wrong. Always say which place the
 times are for. When they say what they keep - Rabbeinu Tam, 40 minutes,
 the Magen Avraham - call remember_minhag once; every time after is theirs.
@@ -620,14 +618,13 @@ ANSWERING QUESTIONS
   how they get told a wrong address.
 - Anything exact or changing - a price, hours, one model's exact steps -
   say what you believe, say it is worth checking, and offer to check.
-- NOT SURE? ASK FIRST: ask_ai puts it to a bigger model and answers in
-  seconds. Three callers got wrong fridge instructions from a guess.
-- WHEN IT HAS TO BE RIGHT, USE look_it_up - it searches and reads the real
-  pages itself. web_search is only for a phone number, an address, a quick
-  fact; headlines alone have given callers wrong instructions. If a search
-  gave you a promising link but not the detail, read_page opens it and
-  reads it properly.
-- WRITE THE WHOLE QUESTION. Those tools cannot hear this call. Put the
+- NOT SURE, OR IT HAS TO BE RIGHT? USE find_out: general things from a
+  bigger model; a model number, price, hours, place or "which ones have
+  X" from the real pages, site named. Seconds, never a browser. Guessing
+  gave three callers wrong fridge instructions.
+- SAY WHERE IT CAME FROM AND HOW OLD: "about $X, as Best Buy lists it",
+  never today's price; "as far as I know" for general knowledge.
+- WRITE THE WHOLE QUESTION. find_out cannot hear this call. Put the
   make, the model number and what they actually want in every time. One
   question went out as "how to turn on the icemaker for the" and came back
   useless.
@@ -645,8 +642,8 @@ ANSWERING QUESTIONS
 
 WHAT SOMETHING COSTS
 "Where can I get it cheapest", "what does it cost", "who sells it" ->
-find_best_price. Do NOT use web_search for prices: it once answered "where
-is it cheapest" with the street address of an outlet shop.
+find_best_price. Do NOT use find_out for "where is it cheapest": a plain
+search once answered that with the street address of an outlet shop.
 
 EMAIL
 - "My last few emails", "what came in today" -> recent_email (the common
@@ -2597,7 +2594,7 @@ they go quiet, ask once whether they are still there, then wait.
         """Where an item can be bought cheapest, with prices and shop
         names. item is just the thing ("Epson ET-5850"); if they name a
         shop ("from B&H"), put it in shop. Use whenever they ask what
-        something costs or where to get it - not web_search."""
+        something costs or where to get it - not find_out."""
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
         if self._not_asked_yet():
@@ -3562,47 +3559,66 @@ they go quiet, ask once whether they are still there, then wait.
 
     @function_tool
     @auto_report("search")
-    async def web_search(self, context: RunContext, query: str,
-                         near: str = ""):
-        """A quick fact, ONLY when you don't already know it: a phone
-        number, an address, opening hours. Not for ordinary knowledge you
-        have, and not for a model's exact steps - look_it_up does those.
-        Set near to a place name for local questions."""
+    async def find_out(self, context: RunContext, question: str):
+        """Find something out - the ONE way. General things come from a
+        bigger model; anything with a model number, a price, hours, a
+        place or a list of what exists comes from the real pages, read
+        from the search engine's copy, with the site named. Seconds, and
+        it never opens a browser.
+
+        IT CANNOT SEE THIS CONVERSATION: write the whole question out,
+        make and model included. Not for the caller's own email, orders
+        or calendar, and not for "where is it cheapest" - find_best_price
+        does that."""
+        key = " ".join(question.lower().split())[:120]
+        if self._lookups.get(key) == "failed":
+            # The same question again gets the same nothing (call 52 ran
+            # one three times while the caller waited).
+            return ("That exact question already came back with nothing on "
+                    "this call. Do not ask it again unchanged. Tell them "
+                    "plainly you could not find it, or ask something "
+                    "genuinely different - a different wording, the "
+                    "manual, a part number.")
         try:
-            data = await backend_get("/web/search", q=query, near=near)
+            d = await backend_get("/find", q=question,
+                                  account_id=self.account_id,
+                                  call_id=self.call_id or 0)
         except Exception as e:
-            log.error(f"web search failed: {e}")
-            return "The search didn't go through."
-        if data.get("blocked"):
+            log.error(f"find failed: {e}")
+            return ("Couldn't check that just now. Say so plainly; do not "
+                    "guess in its place.")
+        if d.get("blocked"):
             return ("BLOCKED. Say exactly: I am not allowed to talk to you "
                     "about this. Nothing else.")
-        ans = data.get("answer") or ""
-        results = data.get("results", [])
-        if not ans and not results:
-            return f"Nothing useful came back for '{query}'."
-
-        self.last_search = [r.get("url", "") for r in results]
-        await log_turn(self.call_id, "tool", f"searched: {query}",
-                       "web_search", backend_get.last_ms)
-        lines = []
-        if ans:
-            lines.append(f"Summary: {ans}")
-        for i, r in enumerate(results, 1):
-            lines.append(f"{i}. {r.get('title', '')} — {r.get('snippet', '')}")
-        lines.append(
-            "These are short summaries, not the pages themselves. Anything "
-            "you say came from HERE must actually be here - never say 'the "
-            "page says' about something you are filling in yourself. If "
-            "what they need isn't in these summaries, either say what you "
-            "know from your own knowledge and make clear that is what it "
-            "is, or call read_page with a result number to read the real "
-            "page. Do not give the same question two different confident "
-            "answers. "
-            "This search is FINISHED - there is nothing still running and "
-            "nothing more will arrive. If you told them you were going to "
-            "check, searching was not checking: call read_page NOW or give "
-            "them your answer. Do not say 'almost there'.")
-        return "\n".join(lines)[:2000]
+        answer = (d.get("answer") or "").strip()
+        fresh = d.get("freshness") or "none"
+        sites = ", ".join(s.get("site", "") for s in d.get("sources") or [])
+        await log_turn(self.call_id, "tool",
+                       f"found out ({d.get('how', '?')}, {fresh}"
+                       f"{', ' + sites if sites else ''}): {question[:100]}",
+                       "find_out", backend_get.last_ms)
+        if fresh == "knowledge":
+            self._lookups[key] = "done"
+            return (f"{answer} -- Say that in your own words, keeping any "
+                    f"'it varies' or 'I'm not certain' part - never turn a "
+                    f"hedge into a definite answer. This is general "
+                    f"knowledge, not a page: if they need it exact for "
+                    f"their model, say so. Nothing is still running.")
+        if not d.get("found") or not answer:
+            self._lookups[key] = "failed"
+            what = f" The pages did cover this: {answer}" if answer else ""
+            return (f"NOT FOUND. No page answered that.{what} -- Tell them "
+                    f"plainly you could not find it written anywhere. Never "
+                    f"fill the gap from memory, never say 'the page says' "
+                    f"about anything not here. Nothing is still running.")
+        self._lookups[key] = "done"
+        when = (f"as of {d['as_of']}" if d.get("as_of")
+                else "when the page was copied, which may be days ago")
+        return (f"{answer} -- Tell them that now, in your own words, keeping "
+                f"which site each part came from ({sites}). Any price here "
+                f"is what the site LISTED {when}: say 'lists it at about' "
+                f"and never call it today's price. Nothing is still running "
+                f"and nothing more will arrive.")
 
     @function_tool
     @auto_report("email")
@@ -3661,157 +3677,6 @@ they go quiet, ask once whether they are still there, then wait.
         self._watch_job("reading the document")
         return ("Still reading. Say NOTHING more - I will tell you what it "
                 "says.")
-
-    @function_tool
-    @auto_report("search")
-    async def ask_ai(self, context: RunContext, question: str):
-        """Ask a bigger model a general-knowledge question. Use it the
-        moment you are unsure of anything general.
-
-        IT CANNOT SEE THIS CONVERSATION: write the whole question out -
-        make, model, what they actually want. "How do I turn on the ice
-        maker" gets a useless answer.
-
-        Fast: do not announce it, just call it and answer."""
-        try:
-            data = await backend_get("/ask", q=question)
-        except Exception as e:
-            log.error(f"ask failed: {e}")
-            return "Couldn't check that just now."
-        if data.get("blocked"):
-            return ("BLOCKED. Say exactly: I am not allowed to talk to you "
-                    "about this. Nothing else.")
-        said = (data.get("answer") or "").strip()
-        if not said:
-            return ("No answer came back. Say plainly that you don't know "
-                    "and offer to look it up properly with look_it_up.")
-        await log_turn(self.call_id, "tool", f"asked: {question[:80]}",
-                       "ask_ai", backend_get.last_ms)
-        return (f"{said} -- Say that to them in your own words, keeping "
-                f"any 'it varies' or 'I'm not certain' part - do not turn a "
-                f"hedge into a definite answer. If it says something needs "
-                f"checking, offer look_it_up.")
-
-    @function_tool
-    @auto_report("search")
-    async def look_it_up(self, context: RunContext, question: str):
-        """Find something out PROPERLY: searches, then reads the real
-        pages itself. For exact detail you don't know - one model's steps,
-        today's price, this week's hours. Takes about a minute in the
-        background: one short sentence, then stay quiet.
-
-        IT CANNOT SEE THIS CONVERSATION: write the whole question out,
-        make and model included."""
-        key = " ".join(question.lower().split())[:120]
-        if self._lookups.get(key) == "failed":
-            # Running the same failed search again gets the same nothing,
-            # and the caller is listening to it. One call spent four and a
-            # half minutes on three identical lookups.
-            return ("That exact lookup already failed once on this call. Do "
-                    "NOT run it again unchanged - it will fail the same way "
-                    "and they are waiting. Tell them straight that you "
-                    "can't get the manufacturer's own instructions. Then "
-                    "either say what you know with the caveat that it "
-                    "varies by model, or try look_it_up ONCE more with a "
-                    "genuinely different question - a different wording, "
-                    "the manual, a part number - never the same one.")
-        try:
-            async with httpx.AsyncClient(timeout=25) as c:
-                r = await c.post(f"{BACKEND}/jobs/browse", headers=AUTH,
-                                 params={"account_id": self.account_id,
-                                         "goal": question,
-                                         "max_steps": 10,
-                                         "call_id": self.call_id or 0})
-                d = r.json()
-        except Exception as e:
-            log.error(f"look up failed: {e}")
-            return "Couldn't start that."
-        if d.get("blocked"):
-            return d.get("answer") or "BLOCKED."
-        self.job_id = d.get("job_id")
-        self.job_question = question
-        await log_turn(self.call_id, "tool", f"looking up: {question[:120]}",
-                       "look_it_up")
-
-        # Say it ONCE, in fixed words the model cannot embroider, and then
-        # hold this call open until there's an answer. Three different
-        # wordings of "say it once then be quiet" all failed - it told one
-        # caller it was checking three times in ten seconds. It cannot talk
-        # while it is waiting inside a tool.
-        await speak_exactly(getattr(self, "session", None),
-                            "Let me look that up for you. It takes about a "
-                            "minute.", mid_tool=True)
-
-        waited = 0
-        while waited < LOOKUP_WAIT:
-            await asyncio.sleep(3)
-            waited += 3
-            try:
-                st = await backend_get("/jobs/status", job_id=self.job_id)
-            except Exception:
-                continue
-            state = st.get("state", "")
-            if state == "done":
-                self._lookups[key] = "done"
-                return (f"{st.get('message', '')} -- Tell them that now, in "
-                        f"your own words. Do not say you are still looking, "
-                        f"you have the answer.")
-            if state == "failed":
-                self._lookups[key] = "failed"
-                return (f"It didn't work: {st.get('message', '')}. You have "
-                        f"nothing from it - do not describe what it said. "
-                        f"Tell them plainly you couldn't get it, then say "
-                        f"what you know with the caveat that it varies by "
-                        f"model. Do not run this same lookup again.")
-            if state == "needs_input":
-                return (st.get("message", "") + " Ask them, then call "
-                        "answer_website_question.")
-
-        # slower than expected - hand back to the watcher so the call
-        # doesn't sit inside a tool for ever
-        self._watch_job(f"looking up {question}")
-        return ("Still going. Say NOTHING further about it - I will tell "
-                "you the moment it finishes.")
-
-    @function_tool
-    @auto_report("search")
-    async def read_page(self, context: RunContext, which: int,
-                        looking_for: str):
-        """Open one of the search results and read the real page, when the
-        search summary doesn't have the detail the caller needs. 'which' is
-        the number from the search list. Use this instead of guessing at
-        steps, buttons, prices or instructions."""
-        urls = getattr(self, "last_search", [])
-        if not urls:
-            return "No search results to open. Do a web_search first."
-        if which < 1 or which > len(urls) or not urls[which - 1]:
-            return (f"Pick a number between 1 and {len(urls)} from the "
-                    f"search results.")
-        try:
-            async with httpx.AsyncClient(timeout=25) as c:
-                # hand over the other results too, so a page that blocks
-                # robots falls through to the next one without coming back
-                # to ask - the manufacturer's own page is usually first and
-                # usually the one that refuses
-                spares = " ".join(u for u in urls[which:] if u)
-                r = await c.post(f"{BACKEND}/jobs/browse", headers=AUTH,
-                                 params={"account_id": self.account_id,
-                                         "goal": looking_for,
-                                         "url": urls[which - 1],
-                                         "urls": spares,
-                                         "max_steps": 8,
-                                         "call_id": self.call_id or 0})
-                d = r.json()
-        except Exception as e:
-            log.error(f"read page failed: {e}")
-            return "Couldn't open that page."
-        if d.get("blocked"):
-            return d.get("answer") or "BLOCKED."
-        self.job_id = d.get("job_id")
-        self.job_question = looking_for
-        self._watch_job(f"reading a page about {looking_for}")
-        return ("Reading the page now. Tell them that in one sentence, then "
-                "say nothing until I tell you what it says.")
 
     @function_tool
     @auto_report("calendar")

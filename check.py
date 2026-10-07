@@ -848,11 +848,6 @@ def _():
     assert "spares.pop(0)" in window, \
         "a bot check still ends the job instead of trying the next source"
     assert "do_goto(page, nxt" in window, window[:200]
-    agent_src = open("agent.py", encoding="utf-8").read()
-    rp = agent_src[agent_src.index("async def read_page("):]
-    rp = rp[:rp.index("\n    @function_tool")]
-    assert '"urls": spares' in rp, \
-        "read_page doesn't pass the other results as fallbacks"
 
 
 @check("a PDF is read, not browsed")
@@ -2397,56 +2392,45 @@ def _():
     inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
                            "+1555", 1)
     names = {getattr(t, "__name__", "") for t in inst.tools}
-    assert "read_page" in names, \
-        "nothing can open a search result and read the actual page"
-    # the lookup tools run in another process and see none of the call
+    assert "find_out" in names, "there is no way to find something out"
+    for old in ("web_search", "ask_ai", "look_it_up", "read_page"):
+        assert old not in names, (
+            f"{old} is back. Four ways to find things out, chosen by "
+            f"reading English, is how a question became a browser job.")
     tools = {getattr(t, "__name__", ""): t for t in inst.tools}
-    for t in ("ask_ai", "look_it_up"):
-        if t in tools:
-            doc = tools[t].__doc__ or ""
-            assert "CANNOT SEE THIS CONVERSATION" in doc, (
-                f"{t} doesn't warn that it's blind to the call. A caller "
-                f"asked about his ice maker and the question sent was "
-                f"'how to turn on the icemaker for the'.")
-    assert "WRITE THE WHOLE QUESTION" in inst.instructions, \
-        "nothing tells it to put the model number into the question"
-    assert "ask_ai" in names, (
-        "there is no way to ask a bigger model. The voice model is tuned "
-        "for speech, not knowledge - it invented three different fridge "
-        "answers rather than admit it didn't know, and browsing for a "
-        "minute is the wrong fix for something a good model simply knows.")
-    assert "/ask" in {r.path for r in main.app.routes}, "/ask is gone"
-    assert "look_it_up" in names, (
-        "there is no single tool that searches AND reads the page. Telling "
-        "the model to do it in two steps failed on three separate calls - "
-        "it searched, narrated progress, and answered from headlines.")
+    doc = tools["find_out"].__doc__ or ""
+    assert "CANNOT SEE THIS CONVERSATION" in doc, (
+        "find_out doesn't warn that it's blind to the call. A caller asked "
+        "about his ice maker and the question sent was 'how to turn on the "
+        "icemaker for the'.")
     said = inst.instructions
-    assert "USE look_it_up" in said, \
-        "the instructions still send it to web_search for exact detail"
+    assert "WRITE THE WHOLE QUESTION" in said, \
+        "nothing tells it to put the model number into the question"
+    assert "/find" in {r.path for r in main.app.routes}, "/find is gone"
+    assert "USE find_out" in said, \
+        "the instructions don't say where exact detail comes from"
+    assert "SAY WHERE IT CAME FROM AND HOW OLD" in said, \
+        "a copied price can be read out as today's"
     # It must be free to answer general knowledge straight away - forbidding
     # that made it browse for a minute and a half over something it knew.
     assert "ANSWER FROM WHAT YOU KNOW FIRST" in said, \
         "it is being made to search for things it already knows"
     assert "Looking it up is SLOWER" in said, \
         "nothing tells it that searching what it knows wastes the call"
-    # the tool's own description must not invite needless lookups either
-    tools = {getattr(t, "__name__", ""): t for t in inst.tools}
-    doc = (tools["web_search"].__doc__ or "")
-    assert "ONLY when you don't already know it" in doc, \
-        "web_search still reads as 'search for any fact'"
     # but never guess about the caller's own things, and never fake a source
     assert "never from memory, always from a tool" in said, \
         "it may now guess about the caller's own email and orders"
     assert "NEVER dress a guess up as a source" in said, \
         "it can claim a page said something it invented"
-    assert "read_page" in said, "it is never told how to get the real detail"
     src = open("agent.py", encoding="utf-8").read()
-    body = src[src.index("async def web_search("):]
+    body = src[src.index("async def find_out("):]
     body = body[:body.index("\n    @function_tool")]
     assert "log_turn(" in body, \
-        "web_search leaves no trace, so nobody can tell if it ever ran"
-    assert "never say 'the " in body, \
-        "the search result no longer warns against faking a source"
+        "find_out leaves no trace, so nobody can tell if it ever ran"
+    assert "never say 'the page says'" in body, \
+        "a not-found result no longer warns against faking a source"
+    assert "lists it at about" in body, \
+        "a listed price can be read out as the price"
 
 
 @check("a page that failed to load is never described")
@@ -2504,35 +2488,38 @@ def _():
     said = inst.instructions
     assert "ONLY SAY YOU ARE WORKING" in said, \
         "nothing stops it narrating progress on work it never started"
-    assert "web_search is NOT one of" in said, \
-        "a finished search can still be treated as something to wait for"
+    assert "find_out\nis NOT one of" in said, \
+        "a finished lookup can still be treated as something to wait for"
     src = open("agent.py", encoding="utf-8").read()
-    body = src[src.index("async def web_search("):]
+    body = src[src.index("async def find_out("):]
     body = body[:body.index("\n    @function_tool")]
-    assert "This search is FINISHED" in body, \
-        "the search result doesn't say it has already returned"
+    assert body.count("Nothing is still running") >= 3, \
+        "a find_out result doesn't say it has already returned"
 
 
-@check("a lookup holds the call, so there's no gap to fill with chatter")
+@check("a question never opens a browser")
 def _():
-    """Three wordings of "say it once then be quiet" all failed - one
-    caller was told "this will take about a minute" three times in ten
-    seconds. The model cannot speak while it is inside a tool call, so the
-    lookup waits there instead of returning and leaving a silence."""
+    """Calls 42-62: one fridge question became twenty browser jobs, three
+    human checks and nine different answers. Call 83: a minivan question
+    hit four car-site walls. A question is answered from the search
+    engine's copy of the pages in seconds; the browser is for things that
+    must be DONE on a site."""
     src = open("agent.py", encoding="utf-8").read()
-    body = src[src.index("async def look_it_up("):]
+    body = src[src.index("async def find_out("):]
     body = body[:body.index("\n    @function_tool")]
-    assert "LOOKUP_WAIT" in body, \
-        "look_it_up returns immediately again, leaving a gap to fill"
-    assert "speak_exactly(" in body and "mid_tool=True" in body, \
-        "the announcement must go through speak_exactly, which knows this " \
-        "voice cannot speak from inside a tool"
-    assert 'state == "done"' in body and "Tell them that now" in body, \
-        "the answer should come back from the tool, not a later update"
-    # and it must still hand over if it runs long, not hold the call for ever
-    assert "_watch_job(" in body, "a slow lookup would hold the call open"
-    assert agent.LOOKUP_WAIT >= 30, "the wait is too short to be useful"
-    assert agent.LOOKUP_WAIT <= 180, "that would hold a caller far too long"
+    assert '"/find"' in body, "find_out does not use the find path"
+    for word in ("jobs/browse", "_watch_job", "job_id", "LOOKUP_WAIT"):
+        assert word not in body, f"find_out starts a browser job ({word})"
+    assert "_lookups.get(key)" in body and \
+        body.index("_lookups.get(key)") < body.index('"/find"'), \
+        "it asks before checking whether this already came back empty"
+    assert 'self._lookups[key] = "failed"' in body, \
+        "an empty result is never recorded, so it can be repeated for ever"
+    inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                           "+1555", 1)
+    assert len(inst.tools) <= 78, (
+        f"{len(inst.tools)} tools. Four question tools became one; the "
+        f"count must not creep back up.")
 
 
 @check("'search again' is a complaint, not an instruction")
@@ -2547,21 +2534,6 @@ def _():
         "caller wording is still being read as a choice of tool"
     assert "does NOT mean run" in said, \
         "'search again' can still re-run a search that just failed"
-
-
-@check("the same failed lookup isn't run again")
-def _():
-    """Call 52: the ice maker lookup failed, and the assistant ran the
-    identical search twice more while the caller waited four and a half
-    minutes and then hung up."""
-    src = open("agent.py", encoding="utf-8").read()
-    body = src[src.index("async def look_it_up("):]
-    body = body[:body.index("\n    @function_tool")]
-    assert "_lookups" in body, "nothing remembers that a lookup failed"
-    assert body.index("_lookups.get(key)") < body.index("jobs/browse"), \
-        "it starts the job before checking whether this already failed"
-    assert 'self._lookups[key] = "failed"' in body, \
-        "a failure is never recorded, so it can be repeated for ever"
 
 
 @check("a shop listing doesn't outrank the manual")
@@ -2878,7 +2850,8 @@ def _():
     assert "WHEN THEY CORRECT YOU" in text and "stop_that" in text
     assert "still finishing" in text and "is genuinely still running" in text, \
         "it must not claim to be finishing work the caller corrected, but may say so about work that really is running"
-    assert "find_best_price" in text and "Do NOT use web_search for prices"         in text, "prices can still be answered from search summaries"
+    assert "find_best_price" in text and "Do NOT use find_out for" \
+        in text, "prices can still be answered from search summaries"
     paths = {r.path for r in main.app.routes}
     assert "/jobs/price" in paths
     # the price job must read shop pages and write each one down

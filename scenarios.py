@@ -565,6 +565,33 @@ def _():
                 f"{(st.get('message') or '')[:160]}")
 
 
+@scenario("find: a real question is answered in seconds, with the site, "
+          "and no browser",
+          "calls 42-62 - one fridge question, twenty browser jobs, three "
+          "human checks, nine different answers over two days")
+def _():
+    import time as _t
+    before = (call("/jobs", limit=1) or [{}])[0].get("job_id", 0)
+    t0 = _t.time()
+    d = call("/find", q="how do I turn Shabbos mode on and off on the "
+                        "Frigidaire PRDF1922AF refrigerator")
+    took = _t.time() - t0
+    if d.get("reason") in ("no_model", "search_failed"):
+        raise SetupProblem(f"the find path has nothing to work with: {d}")
+    assert d.get("found"), f"the fridge question came back empty: {d}"
+    assert took < 20, f"{took:.0f}s - a question is taking browser time"
+    sites = [x.get("site", "") for x in d.get("sources") or []]
+    assert any("frigidaire" in x for x in sites), \
+        f"the answer does not come from the maker's own site: {sites}"
+    assert d.get("freshness") in ("indexed", "dated"), d.get("freshness")
+    low = (d.get("answer") or "").lower()
+    assert "frigidaire" in low, f"the site is not named in the answer: {low}"
+    for bad in ("pages you gave", "what you gave", "page 1", "page 2"):
+        assert bad not in low, f"it talks about the pages, not the site: {low}"
+    after = (call("/jobs", limit=1) or [{}])[0].get("job_id", 0)
+    assert after == before, "a question started a browser job"
+
+
 # --------------------------------------------------------------- result
 
 print()

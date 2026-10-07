@@ -56,7 +56,9 @@ Rules:
   sentence say what they DO cover. Never fill the gap from memory. Never
   invent a button, a step, a part number or a price.
 - Two or three short spoken sentences. No lists, no markdown, no URLs,
-  no web addresses.
+  no web addresses. Never mention the pages as given to you - no "the
+  pages you gave me", "in what I was given", "page 2". Speak as someone
+  who read those sites: "Frigidaire's site says", "Amazon lists".
 Reply with JSON only:
 {"answer": "...", "found": true, "used": [1, 3]}
 'used' is the numbers of the pages the answer came from."""
