@@ -4655,6 +4655,23 @@ def _():
     body = m[i:m.index("\n@app.", i)]
     assert '"preparing", "placing"' in body and "already being put" in body, \
         "two basket jobs can run for the same shop"
+    assert 'j.state not in ("done", "failed")' in body, \
+        "a basket job that failed blocks every later order on that shop"
+    # and a call's own order whose job has ended is not 'open'
+    a.order_id = 4
+    posted.clear()
+
+    async def ended_get(path, **params):
+        return ({"state": "preparing", "job_state": "failed"}
+                if path == "/orders/status" else [])
+    agent.backend_get, agent.backend_post = ended_get, fake_post
+    try:
+        asyncio.run(agent.Assistant.draft_order(
+            a, None, "amazon", "MUNBYN labels 4-pack", 1, "35.97"))
+    finally:
+        agent.backend_get, agent.backend_post = real_get, real_post
+    assert "/orders/draft" in posted, \
+        "an order whose basket job failed still blocks a new one"
 
 
 @check("a site's question reaches the caller as a question, and the answer "

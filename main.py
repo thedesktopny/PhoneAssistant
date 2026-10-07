@@ -3411,11 +3411,20 @@ def order_prepare(request: Request, order_id: int):
         raise HTTPException(400, "Order isn't in a state to prepare.")
     # One basket job per shop at a time: two put the item in the cart
     # twice (call 89).
-    busy = (db.query(Order)
-              .filter(Order.account_id == row.account_id,
-                      Order.site == row.site, Order.id != row.id,
-                      Order.state.in_(["preparing", "placing"]))
-              .first())
+    # Only a job still running counts. A basket job that failed leaves
+    # its order at "preparing" (call 89's order 4) - that must not block
+    # the next order for ever.
+    busy = None
+    for o in (db.query(Order)
+                .filter(Order.account_id == row.account_id,
+                        Order.site == row.site, Order.id != row.id,
+                        Order.state.in_(["preparing", "placing"]))
+                .all()):
+        j = db.query(Job).filter_by(id=o.job_id).first() if o.job_id \
+            else None
+        if j and j.state not in ("done", "failed"):
+            busy = o
+            break
     if busy:
         db.close()
         raise HTTPException(400, f"Order {busy.id} is already being put in "
@@ -3474,8 +3483,13 @@ def order_status(request: Request, order_id: int):
     db.close()
     if not row:
         raise HTTPException(404, "Unknown order.")
+    db = Session()
+    job = db.query(Job).filter_by(id=row.job_id).first() if row.job_id \
+        else None
+    db.close()
     return {"order_id": row.id, "state": row.state, "message": row.message,
             "confirmation": row.confirmation, "final_total": row.final_total,
+            "job_state": job.state if job else "",
             "history": row.history or ""}
 
 

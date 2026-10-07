@@ -2075,8 +2075,10 @@ they go quiet, ask once whether they are still there, then wait.
                                       order_id=self.order_id)
             except Exception:
                 o = {}
+            ended = (o.get("state") in ("preparing", "placing")
+                     and o.get("job_state") in ("done", "failed"))
             if o.get("state") in ("preparing", "ready", "confirmed",
-                                  "placing"):
+                                  "placing") and not ended:
                 return (f"An order is ALREADY open - order {self.order_id}, "
                         f"{getattr(self, 'order_item', '')}, "
                         f"{o.get('state')}. Do NOT write another. If it is "
