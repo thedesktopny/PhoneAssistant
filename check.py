@@ -4621,6 +4621,96 @@ def _():
     assert "ONCE" in body and "say nothing about it" in body
 
 
+@check("one order, one basket: a second yes does not add it twice")
+def _():
+    """Call 89: "yes" twice wrote two orders and ran two basket jobs. The
+    labels went into the Amazon cart twice, and the first job's finished
+    checkout ($39.16) was never heard - its watcher was replaced."""
+    import asyncio
+    a = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                        "+1555", 1)
+    a.verified = True
+    a.heard_request = True
+    a.order_id = 3
+    a.order_item = "1 x MUNBYN labels"
+    posted = []
+    real_get, real_post = agent.backend_get, agent.backend_post
+
+    async def fake_get(path, **params):
+        return {"state": "preparing"} if path == "/orders/status" else []
+
+    async def fake_post(path, payload, params=None):
+        posted.append(path)
+        return {"order_id": 4}
+    agent.backend_get, agent.backend_post = fake_get, fake_post
+    try:
+        out = asyncio.run(agent.Assistant.draft_order(
+            a, None, "amazon", "MUNBYN labels 4-pack", 1, "35.97"))
+    finally:
+        agent.backend_get, agent.backend_post = real_get, real_post
+    assert not posted, "a second order was written while one was open"
+    assert "ALREADY open" in out and "cancel_order first" in out, out
+    m = io.open("main.py", encoding="utf-8").read()
+    i = m.index("def order_prepare(")
+    body = m[i:m.index("\n@app.", i)]
+    assert '"preparing", "placing"' in body and "already being put" in body, \
+        "two basket jobs can run for the same shop"
+
+
+@check("a site's question reaches the caller as a question, and the answer "
+       "reaches the site")
+def _():
+    """Call 89: Amazon asked which address. It came out as "still working
+    on it" for four minutes; the job gave up; then "the basement one" was
+    refused because only something shaped like a code could get through,
+    and he was told the site had not accepted it."""
+    src = io.open("agent.py", encoding="utf-8").read()
+    w = src[src.index("    async def _watch(self"):
+            src.index("    def _start_watch(")]
+    assert 'state in ("needs_input"' in w and "as a question" in w, \
+        "a question from a job is still turned into a progress update"
+    assert w.index("as a question") < w.index("Update the caller now"), \
+        "the question branch must come before the update branch"
+    i = src.index("async def answer_website_question(")
+    body = src[i:i + 2000]
+    assert "already stopped" in body and "site refused their answer" in body, \
+        "a job that stopped waiting is still blamed on the site"
+    assert 'd.get("ok") is False' in body, \
+        "a refused answer is still reported as passed on"
+    # the backend takes words for a question, digits for a code
+    from fastapi.testclient import TestClient
+    c = TestClient(main.app, raise_server_exceptions=False, base_url="https://t")
+    c.headers["Authorization"] = f"Bearer {main.SERVICE_TOKEN}" \
+        if getattr(main, "SERVICE_TOKEN", "") else ""
+    db = main.Session()
+    job = main.Job(account_id=1, kind="browse", site="amazon",
+                   state="needs_input", payload="{}")
+    db.add(job)
+    db.commit()
+    jid = job.id
+    db.close()
+    main._JOBS[jid] = {}
+    try:
+        r = c.post("/jobs/code", json={"job_id": jid,
+                                       "code": "the basement one, Screenshot"})
+        assert r.status_code == 200 and r.json().get("ok") is True, r.text
+        assert main._JOBS[jid]["code"] == "the basement one, Screenshot"
+        db = main.Session()
+        db.query(main.Job).filter_by(id=jid).first().state = "needs_code"
+        db.commit()
+        db.close()
+        r = c.post("/jobs/code", json={"job_id": jid, "code": "basement"})
+        assert r.json().get("ok") is False, \
+            "words were typed into a code box"
+    finally:
+        main._JOBS.pop(jid, None)
+    import browser
+    assert "keep the one already selected" in browser.PREPARE_GOAL, \
+        "the basket job still stops to ask which address"
+    i = src.index("    async def search_site(")
+    assert "INSIDE one product" in src[i:i + 900]
+
+
 @check("a text is never called sent when it cannot be delivered")
 def _():
     """Call 76: a new customer with no email was told twice "I've sent you

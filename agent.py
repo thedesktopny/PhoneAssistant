@@ -934,6 +934,17 @@ they go quiet, ask once whether they are still there, then wait.
                             f'guest checkout or anything else that has not '
                             f'been done before. Never say it worked or is '
                             f'still going.'))
+                    elif sess and line and state in ("needs_input",
+                                                     "needs_code"):
+                        # Call 89: the site's question went out as "one
+                        # short update" and came out as "still working on
+                        # it" - for four minutes, until the job gave up.
+                        await sess.generate_reply(
+                            instructions=(f"Ask the caller this now, in "
+                                          f"English, as a question, then "
+                                          f"wait for their answer. Do not "
+                                          f"say it is still working: "
+                                          f"{line}"))
                     elif sess and line:
                         await sess.generate_reply(
                             instructions=(f"Update the caller now, in one "
@@ -2054,6 +2065,24 @@ they go quiet, ask once whether they are still there, then wait.
         """Put the order together. Nothing is placed yet."""
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
+        # Call 89: a second "yes" wrote a second order, started a second
+        # basket job - the item went into the Amazon cart TWICE - and the
+        # first job's finished checkout was never heard: its watcher was
+        # replaced by the second one's.
+        if getattr(self, "order_id", None):
+            try:
+                o = await backend_get("/orders/status",
+                                      order_id=self.order_id)
+            except Exception:
+                o = {}
+            if o.get("state") in ("preparing", "ready", "confirmed",
+                                  "placing"):
+                return (f"An order is ALREADY open - order {self.order_id}, "
+                        f"{getattr(self, 'order_item', '')}, "
+                        f"{o.get('state')}. Do NOT write another. If it is "
+                        f"being put in the basket, say so and wait. If they "
+                        f"want something different instead, cancel_order "
+                        f"first, then draft_order.")
         d = await backend_post("/orders/draft", {
             "account_id": self.account_id, "site": site, "item": item,
             "quantity": quantity, "expected_price": expected_price,
@@ -2458,11 +2487,21 @@ they go quiet, ask once whether they are still there, then wait.
         if not getattr(self, "job_id", None):
             return "Nothing is waiting on an answer."
         try:
-            await backend_post("/jobs/code",
-                               {"job_id": self.job_id, "code": answer})
+            d = await backend_post("/jobs/code",
+                                   {"job_id": self.job_id, "code": answer})
         except Exception as e:
             log.error(f"answer failed: {e}")
-            return "That didn't go through."
+            # Call 89: "the site didn't accept that answer" - when the job
+            # had stopped waiting twenty seconds before. Say what happened.
+            return ("It did NOT reach the site: that job had already stopped "
+                    "waiting for an answer, so nothing more happened and "
+                    "nothing was bought. Say exactly that - not that the "
+                    "site refused their answer - and offer to start it "
+                    "again.")
+        if d and d.get("ok") is False:
+            return (f"It was NOT passed on ({d.get('reason', '')}). This "
+                    f"step wants a code - the digits they were sent. Ask "
+                    f"for those.")
         return ("Passed it on. Say nothing more about it - I will tell you "
                 "when it changes.")
 
@@ -2495,7 +2534,11 @@ they go quiet, ask once whether they are still there, then wait.
     @function_tool
     @auto_report("site_read")
     async def search_site(self, context: RunContext, site: str, query: str):
-        """Search a site for a product on the caller's behalf."""
+        """Search a site for a product on the caller's behalf. This reads
+        the results list only. To hear the options INSIDE one product -
+        pack sizes, counts, colours - do_on_website on that product: "go
+        into the MUNBYN 220-sheet labels and list every option with its
+        price" (calls 86, 89: "go into the item, you'll see the 4-pack")."""
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
         if self._not_asked_yet():

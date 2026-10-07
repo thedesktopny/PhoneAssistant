@@ -2390,6 +2390,20 @@ class JobCode(BaseModel):
 def job_code(b: JobCode, request: Request):
     require_auth(request)
     if b.job_id in _JOBS:
+        # A question that is not a code - which address, which size - is
+        # answered in words. Call 89: "the basement one" could never have
+        # reached the job; only something shaped like a code got through.
+        db = Session()
+        row = db.query(Job).filter_by(id=b.job_id).first()
+        asking = row.state if row else ""
+        db.close()
+        if asking == "needs_input":
+            said = " ".join("".join(ch for ch in b.code
+                                    if ch.isprintable()).split())[:200]
+            if not said:
+                return {"ok": False, "reason": "empty"}
+            _JOBS[b.job_id]["code"] = said
+            return {"ok": True}
         # ASCII only. isalnum() is true for Chinese numerals and the like,
         # and speech-to-text does produce those from a spoken code - we
         # were typing them into the site verbatim.
@@ -3395,6 +3409,17 @@ def order_prepare(request: Request, order_id: int):
     if not row or row.state not in ("draft", "ready", "failed"):
         db.close()
         raise HTTPException(400, "Order isn't in a state to prepare.")
+    # One basket job per shop at a time: two put the item in the cart
+    # twice (call 89).
+    busy = (db.query(Order)
+              .filter(Order.account_id == row.account_id,
+                      Order.site == row.site, Order.id != row.id,
+                      Order.state.in_(["preparing", "placing"]))
+              .first())
+    if busy:
+        db.close()
+        raise HTTPException(400, f"Order {busy.id} is already being put in "
+                                 f"the {row.site} basket. Wait for it.")
     goal = PREPARE_GOAL.format(site=row.site, item=row.item,
                                quantity=row.quantity or 1,
                                price=row.expected_price or "unknown")

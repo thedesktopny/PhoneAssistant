@@ -3142,8 +3142,11 @@ EXPECTED: about {price}
    its quantity and price - say clearly if anything else is in the basket
    - the delivery address, the payment card, and the order total. Put the
    order total, as it is written, in "total".
-If the site wants a sign-in code or a choice only they can make, use
-ask_user."""
+If the site asks which address or card, keep the one already selected
+and carry on - you read it back at the end, and they can change it then.
+Call 89 stopped to ask, and the question reached the caller too late.
+Use ask_user only for a sign-in code, or when nothing is selected at
+all."""
 
 
 CHECKOUT_SYSTEM = """You are placing an order on a website for a customer
