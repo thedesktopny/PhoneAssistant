@@ -3501,11 +3501,19 @@ def order_prepare(request: Request, order_id: int):
                                quantity=row.quantity or 1,
                                price=row.expected_price or "unknown")
     acct, site, call_id = row.account_id, row.site, row.call_id
+    # The address and card they chose last time are chosen again, by the
+    # system - the review page decides, and a choice not made is said.
+    # Call 95: Amazon's payment page had no card selected, "Use this
+    # payment method" did nothing, and the job went stuck twice.
+    deliver_to = " ".join((row.ship_label or "").replace(",", " ")
+                          .split()[:2])
+    card = "".join(ch for ch in (row.pay_label or "") if ch.isdigit())[-4:]
     db.close()
     jid = start_job(acct, "browse", site, call_id=call_id or None,
                     payload={"goal": goal, "url": "", "max_steps": 30,
                              "may_buy": False, "order_id": order_id,
-                             "budget": 240})
+                             "budget": 240, "deliver_to": deliver_to,
+                             "pay_with": card})
     _order_set(order_id, "preparing", "Putting it in the basket.",
                job_id=jid, final_total="")
     return {"order_id": order_id, "job_id": jid, "state": "preparing"}

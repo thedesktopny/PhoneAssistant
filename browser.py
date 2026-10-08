@@ -1832,6 +1832,8 @@ CART_PAGES = {
     "etsy": "https://www.etsy.com/cart",
 }
 CART_GOAL = _re_scrub.compile(r"(?i)\b(cart|basket)\b")
+ADD_TO_CART = _re_scrub.compile(r"(?i)\badd (it |this |them )?to "
+                                r"(the |your |my )?(cart|basket|bag)\b")
 
 SEARCH_PAGES = {
     "walmart": "https://www.walmart.com/search?q=",
@@ -3069,6 +3071,19 @@ def _run_browse(jid: int, account_id: int, site: str):
                             _job_set(jid, "working", "stopped short of "
                                                      "buying anything")
                             continue
+                        # Only the order flow puts things in a basket.
+                        # Call 95: "repeat the checkout and get the tax"
+                        # added the labels again - quantity 2, $75.98.
+                        if (ADD_TO_CART.search(it["desc"])
+                                and not payload.get("order_id")
+                                and not ADD_TO_CART.search(goal)):
+                            note = (f"Refused to press '{it['desc'][:60]}'. "
+                                    f"Nothing was asked to be added to the "
+                                    f"basket - read what is there instead.")
+                            history.append(note)
+                            _job_set(jid, "working",
+                                     "did not add anything to the basket")
+                            continue
                         do_click(page, _handle(page, it))
                         recorded.append({"action": "click",
                                          "desc": it["desc"]})
@@ -3251,7 +3266,9 @@ EXPECTED: about {price}
    "See more", "Show all", "Other addresses" or a scroll box - open it
    first (call 91: the caller has more than ten addresses and four were
    noted). Each address by its name or first line (at most twelve), each
-   card as "Visa ending 1234". Keep the one already selected, and move
+   card as "Visa ending 1234". Keep the one already selected - if NONE is
+   selected (no radio ticked), select the first one listed and say so in
+   your answer: its button does nothing until one is (call 95). Move
    on with that step's own button - "Use this address", "Deliver to this
    address", "Use this payment method", "Continue" - never by selecting
    it again (call 93 went round the payment page for three minutes).

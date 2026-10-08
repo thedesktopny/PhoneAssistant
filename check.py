@@ -1772,7 +1772,7 @@ def _():
     body = src[src.index("def _run_browse("):]
     body = body[:body.index(chr(10) + "def ", 10)]
     i = body.index('if a == "click":')
-    block = body[i:i + 1400]
+    block = body[i:i + 2600]
     assert "BUY_BUTTONS.search" in block and 'payload.get("may_buy")' in block,         "a browsing job can still press the button that spends the money"
     assert block.index("BUY_BUTTONS") < block.index("do_click"),         "it is checked after the click, which is no check at all"
     paths = {r.path for r in main.app.routes}
@@ -5239,6 +5239,65 @@ def _():
     assert browser._open_change_if_needed.__doc__
     assert run.index("_pick_choice(items, wanted)") < run.index(
         "act = _decide("), "the choice is picked after the model has acted"
+
+
+@check("the checkout and the basket belong to the order flow")
+def _():
+    """Call 95: "repeat the Amazon checkout" went to a website job three
+    times. The first added the labels again - quantity 2, $75.98; the next
+    two ran with no site, signed out, and asked the caller for an Amazon
+    email. Then "I only want one" was answered "it didn't reach the site"."""
+    import asyncio
+    for goal in ("repeat the Amazon checkout process and get the tax",
+                 "open the cart and read the order total",
+                 "proceed to checkout on Amazon"):
+        assert agent.CHECKOUT_GOAL_WORDS.search(goal), goal
+    for goal in ("list every option for the MUNBYN labels",
+                 "check my Verizon bill"):
+        assert not agent.CHECKOUT_GOAL_WORDS.search(goal), goal
+    a = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                        "+1555", 1)
+    a.verified = True
+    a.heard_request = True
+    out = asyncio.run(agent.Assistant.do_on_website(
+        a, None, "repeat the Amazon checkout and get the tax", "", "", ""))
+    assert "review_checkout" in out and "Nothing has started" in out, out
+    import browser
+    assert browser.ADD_TO_CART.search("button: Add to Cart")
+    assert browser.ADD_TO_CART.search("add it to the basket")
+    assert not browser.ADD_TO_CART.search("repeat the checkout")
+    src = io.open("browser.py", encoding="utf-8").read()
+    i = src.index("def _run_browse(")
+    run = src[i:src.index("\ndef ", i + 10)]
+    assert 'ADD_TO_CART.search(it["desc"])' in run and \
+        'not payload.get("order_id")' in run[run.index(
+            'ADD_TO_CART.search(it["desc"])'):run.index(
+            'ADD_TO_CART.search(it["desc"])') + 200], \
+        "a website job can still add things to the basket"
+    i = src.index("    async def do_on_website(") if False else 0
+    s2 = io.open("agent.py", encoding="utf-8").read()
+    i = s2.index("    async def do_on_website(")
+    body = s2[i:s2.index("    @function_tool", i + 10)]
+    assert 'backend_get("/logins"' in body and "site = name" in body, \
+        "a shop with a saved login is still browsed signed out"
+    i = s2.index("async def answer_website_question(")
+    body = s2[i:i + 2500]
+    assert 'st == "done"' in body and "already finished" in body
+
+
+@check("a basket job chooses the address and card from last time, and a card when none is")
+def _():
+    """Call 95: Amazon's payment page had no card selected; 'Use this
+    payment method' did nothing until one was, and the job went stuck."""
+    import browser
+    assert "if NONE is" in browser.PREPARE_GOAL and \
+        "select the first one listed" in browser.PREPARE_GOAL
+    m = io.open("main.py", encoding="utf-8").read()
+    i = m.index("def order_prepare(")
+    body = m[i:m.index("\n@app.", i)]
+    assert '"deliver_to": deliver_to' in body and '"pay_with": card' in body, \
+        "the basket job does not carry the last chosen address and card"
+    assert "row.pay_label" in body and "row.ship_label" in body
 
 
 @check("a text is never called sent when it cannot be delivered")

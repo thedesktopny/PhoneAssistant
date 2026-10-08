@@ -2399,6 +2399,28 @@ they go quiet, ask once whether they are still there, then wait.
             return self._not_asked_yet()
         if then_try.strip():
             return await self._keep_looking(goal, site, then_try)
+        # The basket and the checkout belong to the order flow. Call 95
+        # sent "repeat the Amazon checkout" here three times: it added the
+        # item again, then ran with no site, signed out, and asked the
+        # caller for an Amazon email it never got.
+        if CHECKOUT_GOAL_WORDS.search(goal):
+            return ("Not with this tool: the basket and the checkout are "
+                    "the order's. To read the checkout back or change the "
+                    "address or card: review_checkout. A different "
+                    "quantity or item: draft_order with it. Nothing has "
+                    "started.")
+        if not site:
+            try:
+                logins = await backend_get("/logins",
+                                           account_id=self.account_id)
+            except Exception:
+                logins = []
+            low = f"{goal} {url}".lower()
+            for row in logins or []:
+                name = (row.get("site") or "").lower()
+                if name and name in low:
+                    site = name             # signed in there, not anonymous
+                    break
         try:
             async with httpx.AsyncClient(timeout=25) as c:
                 r = await c.post(f"{BACKEND}/jobs/browse", headers=AUTH,
@@ -2596,6 +2618,19 @@ they go quiet, ask once whether they are still there, then wait.
                                    {"job_id": self.job_id, "code": answer})
         except Exception as e:
             log.error(f"answer failed: {e}")
+            try:
+                st = (await backend_get("/jobs/status",
+                                        job_id=self.job_id)).get("state")
+            except Exception:
+                st = ""
+            if st == "done":
+                # Call 95: "I only want one" after a checkout read-back was
+                # sent here, and he heard "it didn't reach the site".
+                return ("Nothing was waiting for an answer - that job had "
+                        "already finished. Do not mention it. Act on what "
+                        "they said: a different quantity or item is "
+                        "draft_order with it; a different address or card "
+                        "is review_checkout.")
             # Call 89: "the site didn't accept that answer" - when the job
             # had stopped waiting twenty seconds before. Say what happened.
             return ("It did NOT reach the site: that job had already stopped "
@@ -4020,6 +4055,11 @@ they go quiet, ask once whether they are still there, then wait.
                        "send_email")
         return "Sent."
 
+
+# What only the order flow may do on a shop.
+CHECKOUT_GOAL_WORDS = re.compile(
+    r"(?i)\b(check ?out|basket|cart|order (total|review)|place (the |an |my "
+    r")?order|proceed to (checkout|pay))\b")
 
 # A sign-in in any of these states has got past the password.
 PAST_THE_PASSWORD = ("needs_tap", "needs_code", "verifying", "consenting",
