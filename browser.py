@@ -3173,9 +3173,11 @@ EXPECTED: about {price}
    substitute. Set the quantity, then Add to Cart.
 3. Anything else in the basket: leave it, and report it.
 4. Proceed to checkout. On the address step and the payment step, NOTE
-   every saved choice the site offers - each address by its name or
-   first line (at most five), each card as "Visa ending 1234" - and keep
-   the one already selected. Stop on the page with the final button that
+   every saved choice the site offers. The list is often cut short - a
+   "See more", "Show all", "Other addresses" or a scroll box - open it
+   first (call 91: the caller has more than ten addresses and four were
+   noted). Each address by its name or first line (at most twelve), each
+   card as "Visa ending 1234". Keep the one already selected. Stop on the page with the final button that
    places the order. You may NOT press it - nothing can be bought here.
 5. Finish with done. In answer, read back: every item in the order with
    its quantity and price, the delivery address, the payment card, the

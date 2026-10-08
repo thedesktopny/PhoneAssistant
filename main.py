@@ -2137,9 +2137,11 @@ address in "chosen_address" and the card in "chosen_card"."""
 CHECKOUT_CHANGES = """If a delivery address is wanted: open Change beside
 the delivery address, pick the saved address matching "{deliver_to}", and
 use it. If a payment method is wanted: open Change under the payment
-section and pick the saved card matching "{pay_with}". If you cannot find
-the Change control after two tries, leave it as it is and say so in your
-answer - do not keep trying."""
+section and pick the saved card matching "{pay_with}". The saved list is
+often cut short - open "See more", "Show all" or "Other addresses" before
+deciding it is not there. If it is still not there, or you cannot find
+the Change control after two tries, keep the current one and say so in
+your answer - do not keep trying."""
 
 
 @app.post("/jobs/checkout")

@@ -2176,10 +2176,14 @@ they go quiet, ask once whether they are still there, then wait.
                         f"back, adding nothing - each item, the address, "
                         f"the card and the total {d.get('order_total')}. "
                         f"If it names other saved addresses or cards, "
-                        f"ask which they want; to change one, "
+                        f"ask which they want; many? say how many and ask "
+                        f"them to name one. To change one, "
                         f"review_checkout with deliver_to or pay_with, "
-                        f"which reads it back again. When the address and "
-                        f"card are settled, ask exactly: "
+                        f"which reads it back again. One they name that is "
+                        f"not in the list: do not argue - the list is only "
+                        f"what the page showed - review_checkout with "
+                        f"their words finds it on the shop (call 91). When "
+                        f"the address and card are settled, ask exactly: "
                         f"Should I place this order? "
                         f"Nothing has been bought. {msg}")
             if st == "done" and d.get("order_state") == "check":

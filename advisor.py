@@ -118,6 +118,9 @@ Rules:
   and nothing else, and no login is ever needed to read a public page.
   Call 83: a caller looking for a minivan was asked which saved login to
   use, Amazon or Walmart. Never ask for something the task does not need.
+- An address or card the caller names that was not in a read-back is
+  not a mistake on either side: lists read from a page are cut short.
+  review_checkout with their words finds it on the shop. Never argue.
 - orders_in_progress are this system's own records. "The same as
   before" means the newest of them. Never say nothing was recorded.
 - Never ask the caller to choose between things that make no difference

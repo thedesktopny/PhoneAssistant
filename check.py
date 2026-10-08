@@ -4885,6 +4885,25 @@ def _():
         '"ship_label"' in src[src.index("def _run_browse("):]
 
 
+@check("a saved address they name is looked for on the shop, not argued about")
+def _():
+    """Call 91: more than ten addresses on Amazon, four noted - the page
+    cuts the list short. "You see Screenshot?" "The addresses listed don't
+    show that." "I for sure have more." "I'm not hiding anything." He hung
+    up. The list is what one page showed; the shop has the rest."""
+    import browser
+    import advisor
+    g = browser.PREPARE_GOAL
+    assert "cut short" in g and "at most twelve" in g,         "the basket job still notes only the addresses on the first screen"
+    assert "cut short" in main.CHECKOUT_CHANGES,         "a change still gives up on the first screen of addresses"
+    src = io.open("agent.py", encoding="utf-8").read()
+    i = src.index("def _watch_basket(")
+    body = src[i:src.index("    @function_tool", i)]
+    assert "do not argue" in body and "their words finds it" in body,         "a name not in the read-back is still argued about"
+    assert "say how many" in body, "twenty cards would be read out"
+    assert "Never argue" in advisor.ADVISOR_SYSTEM
+
+
 @check("a text is never called sent when it cannot be delivered")
 def _():
     """Call 76: a new customer with no email was told twice "I've sent you
