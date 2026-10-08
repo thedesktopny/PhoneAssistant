@@ -5357,6 +5357,34 @@ def _():
     assert browser.BUY_BUTTONS.search("button: Buy Now | MUNBYN 880 PCs")
 
 
+@check("a job a restart cut off is ended, and its order can be read back again")
+def _():
+    """Job 241 started on the old build seconds before a deploy and was
+    left 'working' for ever; its order stayed 'preparing'. With one basket
+    job per shop, that would have blocked every later Amazon order."""
+    db = main.Session()
+    j = main.Job(account_id=1, kind="browse", site="amazon", state="working")
+    db.add(j)
+    db.commit()
+    o = main.Order(account_id=1, site="amazon", item="restart test",
+                   quantity=1, state="preparing", job_id=j.id)
+    db.add(o)
+    db.commit()
+    jid, oid = j.id, o.id
+    db.close()
+    assert main.end_what_a_restart_cut_off() >= 1
+    db = main.Session()
+    j = db.query(main.Job).filter_by(id=jid).first()
+    o = db.query(main.Order).filter_by(id=oid).first()
+    assert j.state == "failed" and j.reason == "restarted", (j.state, j.reason)
+    assert o.state == "draft" and not o.final_total, o.state
+    db.close()
+    src = io.open("main.py", encoding="utf-8").read()
+    i = src.index('app = FastAPI(title="Phone Assistant")')
+    assert "\nend_what_a_restart_cut_off()" in src[i:i + 3000], \
+        "the tidy-up is defined but never run at start-up"
+
+
 @check("a text is never called sent when it cannot be delivered")
 def _():
     """Call 76: a new customer with no email was told twice "I've sent you

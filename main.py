@@ -440,6 +440,46 @@ def text_brain(account_id: int, incoming: str) -> str:
 app = FastAPI(title="Phone Assistant")
 
 
+def end_what_a_restart_cut_off() -> int:
+    """A job runs inside this process; a restart (every deploy) kills it
+    and leaves it 'working' for ever. Job 241 was cut off mid-checkout by
+    a deploy - and with one basket job per shop, it would have blocked
+    every later order on Amazon. At start-up nothing can be running, so
+    whatever says it is was cut off. Its order, if any, goes back to
+    draft so it can simply be read back again."""
+    ended = 0
+    try:
+        db = Session()
+        live = ("queued", "opening", "working", "signing_in", "needs_code",
+                "needs_input", "waiting", "placing")
+        for j in db.query(Job).filter(Job.state.in_(live)).all():
+            j.state = "failed"
+            j.reason = "restarted"
+            j.message = ("The system restarted while this was running, so "
+                         "it stopped. Nothing was bought.")
+            j.history = ((j.history or "") + "[restart] failed: cut off by "
+                         "a restart\n")[-6000:]
+            ended += 1
+        for o in db.query(Order).filter(Order.state.in_(
+                ["preparing", "confirmed"])).all():
+            o.state = "draft"
+            o.final_total = ""
+            o.message = "Cut off by a restart before the checkout was read."
+        db.commit()
+        db.close()
+    except Exception as e:
+        emit("startup", "jobs", f"could not tidy up after a restart: {e}",
+             "warn")
+        return 0
+    if ended:
+        emit("startup", "jobs", f"{ended} job(s) cut off by a restart were "
+                                f"ended", "warn")
+    return ended
+
+
+end_what_a_restart_cut_off()
+
+
 # NB: this file must NOT be called site.py - Python has a built-in module
 # of that name and shadowing it breaks the interpreter's startup.
 from site_pages import (HOME, SIGNUP, PRIVACY, TERMS, CONNECT,
