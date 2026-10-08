@@ -5003,6 +5003,121 @@ def _():
     assert "c.note" in page, "the admin panel does not show the note"
 
 
+@check("a checkout that has not come back is never read out")
+def _():
+    """Call 93: 45 seconds into the basket job the caller heard the item,
+    "the home address saved on your Amazon account", the Visa and "$42.69
+    including tax", then "Should we go ahead and place this order?". None
+    of it had arrived."""
+    import asyncio
+    spoke, facts = [], []
+
+    class Fake:
+        llm = tts = None
+
+        def generate_reply(self, **k):
+            spoke.append(k.get("instructions", ""))
+
+    class Ctx:
+        items = []
+
+        def copy(self):
+            return self
+
+        def add_message(self, role, content):
+            facts.append(content)
+
+    class Stand:
+        job_site = "Amazon"
+        chat_ctx = Ctx()
+
+        def __init__(self, pending):
+            self.basket_pending = pending
+            self.owned_up_checkout = False
+
+        async def update_chat_ctx(self, ctx, **k):
+            return None
+
+    real_log = agent.log_turn
+
+    async def no_log(*x, **k):
+        return None
+    agent.log_turn = no_log
+
+    async def say(obj, words):
+        agent.check_the_checkout(Fake(), obj, words, 1)
+        await asyncio.sleep(0.05)
+    try:
+        obj = Stand(True)
+        asyncio.run(say(obj, "The item is in the basket, and here's what it "
+                             "shows at checkout: the shipping address is the "
+                             "home address saved on your Amazon account, and "
+                             "the total, including tax, comes to $42.69."))
+        assert spoke and "Amazon's checkout has not come back" in spoke[0], \
+            spoke
+        assert any("was invented" in f for f in facts), facts
+        spoke.clear()
+        asyncio.run(say(obj, "The total comes to $39.16."))
+        assert not spoke, "it apologised twice for one job"
+        # harmless lines while the job runs
+        asyncio.run(say(Stand(True), "I'm adding it to your Amazon basket "
+                                     "now - nothing is being bought yet."))
+        assert not spoke, "an honest holding line was called invented"
+        # once the job is back, a total is fine
+        asyncio.run(say(Stand(False), "The total comes to $39.16."))
+        assert not spoke
+    finally:
+        agent.log_turn = real_log
+    src = io.open("agent.py", encoding="utf-8").read()
+    i = src.index("def _watch_basket(")
+    body = src[i:i + 1500]
+    assert "self.basket_pending = True" in body and \
+        "self.basket_pending = False" in body
+    assert "check_the_checkout(session, agent_obj, text, call_id)" in src
+
+
+@check("a basket job moves on with the step's own button, and stops looping sooner")
+def _():
+    """Call 93: on Amazon's payment page the job re-noted the cards four
+    times, 'going round in circles', for three minutes, and failed with
+    nothing - the 'Use this payment method' button was right there."""
+    import browser
+    g = browser.PREPARE_GOAL
+    assert "Use this payment method" in g and "never by selecting" in g
+    assert "the tax as the page" in g, "the read-back has no tax or delivery"
+    src = io.open("browser.py", encoding="utf-8").read()
+    i = src.index("def _run_browse(")
+    run = src[i:src.index("\ndef ", i + 10)]
+    k = run.index("going round in circles")
+    assert "Use this payment method" in run[k:k + 700], \
+        "the loop nudge does not point at the button that moves on"
+    assert 'stuck >= (2 if payload.get("order_id")' in run, \
+        "a basket job still loops four times before giving up"
+
+
+@check("the same thing asked for again is the same order, not a second row")
+def _():
+    """Call 93: 'the same labels' wrote order 7 for the item of order 6."""
+    from fastapi.testclient import TestClient
+    c = TestClient(main.app, raise_server_exceptions=False, base_url="https://t")
+    c.headers["Authorization"] = f"Bearer {main.SERVICE_TOKEN}" \
+        if getattr(main, "SERVICE_TOKEN", "") else ""
+    body = {"account_id": 1, "site": "Amazon", "item": "MUNBYN labels, "
+            "880 pieces in 4 rolls", "quantity": 1, "expected_price": "$35.97",
+            "call_id": 1}
+    r1 = c.post("/orders/draft", json=body).json()
+    r2 = c.post("/orders/draft", json=dict(body, item="munbyn   labels, "
+                                            "880 pieces in 4 rolls",
+                                            call_id=2)).json()
+    assert r1["order_id"] == r2["order_id"], (r1, r2)
+    r3 = c.post("/orders/draft", json=dict(body, item="Epson ink")).json()
+    assert r3["order_id"] != r1["order_id"], "a different item reused an order"
+    db = main.Session()
+    row = db.query(main.Order).filter_by(id=r1["order_id"]).first()
+    assert row.call_id == 2 and row.state == "draft" and not row.final_total
+    db.close()
+
+
 @check("a text is never called sent when it cannot be delivered")
 def _():
     """Call 76: a new customer with no email was told twice "I've sent you

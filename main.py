@@ -3406,12 +3406,35 @@ def order_draft(b: OrderBody, request: Request):
     else:
         card = (db.query(PaymentCard).filter_by(account_id=b.account_id)
                   .order_by(PaymentCard.is_default.desc()).first())
-    row = Order(account_id=b.account_id, call_id=b.call_id,
-                site=b.site.lower(), item=b.item, quantity=b.quantity,
-                expected_price=b.expected_price,
-                address_id=addr.id if addr else None,
-                card_id=card.id if card else None, state="draft")
-    db.add(row)
+    # The same thing asked for again within two days is the same order,
+    # not a new row (call 93 wrote order 7 for the labels of order 6).
+    # The basket is read back afresh either way, so the old total goes.
+    want = " ".join((b.item or "").lower().split())
+    row = None
+    for o in (db.query(Order)
+                .filter(Order.account_id == b.account_id,
+                        Order.site == b.site.lower(),
+                        Order.state.in_(["draft", "ready", "check"]))
+                .order_by(Order.id.desc()).limit(10).all()):
+        if " ".join((o.item or "").lower().split()) == want and o.at and \
+                (datetime.utcnow() - o.at).total_seconds() < 2 * 86400:
+            row = o
+            break
+    if row:
+        row.call_id = b.call_id
+        row.quantity = b.quantity
+        row.expected_price = b.expected_price or row.expected_price
+        row.state = "draft"
+        row.final_total = ""
+        row.address_id = addr.id if addr else row.address_id
+        row.card_id = card.id if card else row.card_id
+    else:
+        row = Order(account_id=b.account_id, call_id=b.call_id,
+                    site=b.site.lower(), item=b.item, quantity=b.quantity,
+                    expected_price=b.expected_price,
+                    address_id=addr.id if addr else None,
+                    card_id=card.id if card else None, state="draft")
+        db.add(row)
     db.commit()
     db.refresh(row)
     out = {"order_id": row.id,

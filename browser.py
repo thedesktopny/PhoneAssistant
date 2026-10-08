@@ -3052,10 +3052,16 @@ def _run_browse(jid: int, account_id: int, site: str):
                     stuck += 1
                     history.append(
                         "You have done that same thing several times now "
-                        "and are going round in circles. Try a completely "
-                        "different route, or give_up and say what you saw.")
+                        "and are going round in circles. If the page has a "
+                        "button that moves on - Continue, Use this address, "
+                        "Use this payment method, Proceed - press that. "
+                        "Otherwise try a completely different route, or "
+                        "give_up and say what you saw.")
                     _job_set(jid, "working", "going round in circles")
-                    if stuck >= STUCK_LIMIT:
+                    # a basket job has a caller waiting for a total: two
+                    # circles are enough (call 93: four, four minutes)
+                    if stuck >= (2 if payload.get("order_id")
+                                 else STUCK_LIMIT):
                         _job_set(jid, "failed",
                                  f"It kept repeating the same steps without "
                                  f"getting anywhere. Last screen: "
@@ -3177,11 +3183,16 @@ EXPECTED: about {price}
    "See more", "Show all", "Other addresses" or a scroll box - open it
    first (call 91: the caller has more than ten addresses and four were
    noted). Each address by its name or first line (at most twelve), each
-   card as "Visa ending 1234". Keep the one already selected. Stop on the page with the final button that
-   places the order. You may NOT press it - nothing can be bought here.
+   card as "Visa ending 1234". Keep the one already selected, and move
+   on with that step's own button - "Use this address", "Deliver to this
+   address", "Use this payment method", "Continue" - never by selecting
+   it again (call 93 went round the payment page for three minutes).
+   Stop on the page with the final button that places the order. You
+   may NOT press it - nothing can be bought here.
 5. Finish with done. In answer, read back: every item in the order with
-   its quantity and price, the delivery address, the payment card, the
-   order total, and the OTHER saved addresses and cards on offer, if any.
+   its quantity and price, the delivery charge and the tax as the page
+   shows them, the delivery address, the payment card, the order total,
+   and the OTHER saved addresses and cards on offer, if any.
    In the JSON put the order total, as written, in "total"; this item's
    quantity on the review page in "quantity"; "other_items": true if
    anything else is in the basket; the selected address in

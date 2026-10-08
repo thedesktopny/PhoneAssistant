@@ -2157,9 +2157,16 @@ they go quiet, ask once whether they are still there, then wait.
         self.job_id = jid
         self.job_site = site
         oid = self.order_id
+        # Until the job comes back there IS no checkout. Call 93 read one
+        # out 45 seconds in - item, "home address", $42.69 including tax -
+        # all invented; see check_the_checkout.
+        self.basket_pending = True
+        self.owned_up_checkout = False
 
         async def fetch():
             j = await backend_get("/jobs/status", job_id=jid)
+            if j.get("state") in ("done", "failed", "cancelled"):
+                self.basket_pending = False
             if j.get("state") == "done":
                 o = await backend_get("/orders/status", order_id=oid)
                 j["order_state"] = o.get("state")
@@ -4011,6 +4018,17 @@ AMOUNT = re.compile(r"\$\s?(\d[\d,]*(?:\.\d{1,2})?)")
 # after the caller had heard them read correctly.
 BARE_NUMBER = re.compile(
     r"\b((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)\b")
+# Said about a checkout while the job reading it is still running: "the
+# total, including tax, comes to $42.69", "the shipping address is your
+# home address" (call 93). Nothing had come back.
+CHECKOUT_CLAIM = re.compile(
+    r"(?i)(\btotal\b[^.]{0,60}\$\s?\d|\$\s?\d[\d,.]*[^.]{0,30}"
+    r"\b(total|including tax|with tax)\b|(shipping|delivery) address is\b|"
+    r"payment (method|card) is\b|checkout shows\b|here.s what it shows\b|"
+    r"\bit shows at checkout\b)")
+NO_CHECKOUT_YET = ("I am sorry - the shop's checkout has not come back to me "
+                   "yet, so please ignore what I just said about it. I will "
+                   "read you the real details when it does.")
 MADE_UP_PRICE = ("I am sorry - I just gave you a price I did not read "
                  "anywhere. Please ignore it. I will only give you prices "
                  "I have read on a real page.")
@@ -4356,6 +4374,32 @@ def check_the_claim(session, agent_obj, said: str, call_id=None):
                 ASKED_NOTHING)
 
 
+def check_the_checkout(session, agent_obj, said: str, call_id=None):
+    """Correct a checkout read out before the job reading it came back.
+
+    Call 93: the basket job was 45 seconds in when the caller heard the
+    item, "the home address saved on your Amazon account", the Visa and
+    "$42.69 including tax" - then "Should we go ahead and place this
+    order?". None of it had arrived. The order could not have been placed
+    (confirm needs a total read back), but he could not know that."""
+    if not said or not getattr(agent_obj, "basket_pending", False):
+        return
+    if not CHECKOUT_CLAIM.search(said):
+        return
+    if getattr(agent_obj, "owned_up_checkout", False):
+        return
+    agent_obj.owned_up_checkout = True
+    site = getattr(agent_obj, "job_site", "") or "the shop"
+    _own_up(session, agent_obj, call_id,
+            "read out a checkout before the job reading it came back",
+            f"the {site} checkout has NOT come back yet. Everything you "
+            f"just said about the basket, the address, the card or the "
+            f"total was invented, and the caller has been told to ignore "
+            f"it. Say nothing about the checkout until you are told what "
+            f"it shows.",
+            NO_CHECKOUT_YET.replace("the shop's", f"{site}'s"))
+
+
 def check_the_prices(session, agent_obj, said: str, call_id=None):
     """Correct a price that came from nowhere, there and then.
 
@@ -4556,6 +4600,7 @@ async def entrypoint(ctx: JobContext):
                         agent_obj.heard_request = True
                 else:
                     check_the_claim(session, agent_obj, text, call_id)
+                    check_the_checkout(session, agent_obj, text, call_id)
                     check_the_prices(session, agent_obj, text, call_id)
                 asyncio.create_task(log_turn(call_id, who, stored))
                 if account:
