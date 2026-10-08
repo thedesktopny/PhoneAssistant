@@ -1,0 +1,27 @@
+name: Nightly check of the live system
+
+# Replays every real problem customers have hit against the LIVE backend,
+# every night at 3 AM New York time, and on demand. A failure means the
+# running system is doing something a customer already complained about.
+# GitHub emails the repository owner when a run fails.
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+jobs:
+  scenarios:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Replay real problems against the live system
+        env:
+          SERVICE_TOKEN: ${{ secrets.SERVICE_TOKEN }}
+          BACKEND_URL: https://web-production-13961.up.railway.app
+          TEST_ACCOUNT_ID: "1"
+        run: python scenarios.py

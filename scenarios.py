@@ -654,6 +654,57 @@ def _():
     assert n["summary"], f"an empty note was written: {n}"
 
 
+@scenario("orders: the whole basket flow runs without a phone, and buys nothing",
+          "David - 'do I really need to be the one testing all this?' - "
+          "calls 87-94 each found one more fault in the order flow by hand")
+def _():
+    """Writes the order down, puts it in the real Amazon basket, reads the
+    shop's own checkout back, and checks what came back - everything a
+    call does up to the moment the caller is asked for a yes. The yes is
+    never given, so nothing is ever bought. Takes about two minutes."""
+    import time as _t
+    d = call("/orders/draft", method="POST", body={
+        "account_id": ACCOUNT, "site": "amazon",
+        "item": "MUNBYN 4x6 Thermal Shipping Labels, 880 pieces in 4 rolls",
+        "quantity": 1, "expected_price": "$35.97", "call_id": 0})
+    oid = d.get("order_id")
+    assert oid, f"no order written down: {d}"
+    try:
+        p = call("/orders/prepare", method="POST", order_id=oid)
+    except urllib.error.HTTPError as e:
+        said = e.read().decode("utf-8", "ignore")
+        if "Browserbase" in said:
+            raise SetupProblem("no browser is configured on the backend")
+        raise AssertionError(f"the basket job would not start: {said[:200]}")
+    jid = p.get("job_id")
+    assert jid, f"no basket job started: {p}"
+    st = {}
+    for _ in range(80):                      # four minutes at most
+        _t.sleep(3)
+        st = call("/jobs/status", job_id=jid)
+        if st.get("state") in ("done", "failed"):
+            break
+    assert st.get("state") == "done", (
+        f"the basket job did not finish: {st.get('state')} "
+        f"{st.get('reason')} - {(st.get('message') or '')[:200]}")
+    o = call("/orders/status", order_id=oid)
+    assert o.get("state") in ("ready", "check"), (
+        f"the order is {o.get('state')} after the read-back: "
+        f"{(o.get('message') or '')[:200]}")
+    assert o.get("final_total", "").startswith("$"),         f"no total was read from the checkout: {o}"
+    assert o.get("ship_label") and o.get("pay_label"), (
+        f"the chosen address and card were not read back: "
+        f"{o.get('ship_label')!r} / {o.get('pay_label')!r}")
+    msg = (o.get("message") or "").lower()
+    assert "tax" in msg, f"the read-back has no tax line: {msg[:200]}"
+    assert not o.get("confirmation") and o.get("state") != "placed",         "SOMETHING WAS BOUGHT by a test - stop and look at the order"
+    try:
+        call("/orders/confirm", method="POST", order_id=0, confirmed="yes")
+        raise AssertionError("a confirm with no order went through")
+    except urllib.error.HTTPError as e:
+        assert e.code == 400, e.code
+
+
 # --------------------------------------------------------------- result
 
 print()
