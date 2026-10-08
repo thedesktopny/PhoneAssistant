@@ -5224,8 +5224,9 @@ def _():
     assert "_USE_ROW_BUTTON_JS, hit[\"idx\"]" in run, \
         "the choice is selected but the old row's button gets pressed"
     js = browser._USE_ROW_BUTTON_JS
-    assert "input[type=radio]').length > 1) return ''" in js, \
-        "the search for the button can cross into another address's row"
+    assert "DOCUMENT_POSITION_FOLLOWING" in js and "radio.checked" in js, \
+        "the button pressed may belong to a choice before the picked one"
+    assert "NONE: checked=" in js, "a failure to press leaves no evidence"
     assert "deliver to this address" in js and "use this payment method" in js
     # on the review page, Change beside the section is opened by the
     # system before the job may finish (fourth run: finished without it)

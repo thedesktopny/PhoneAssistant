@@ -2861,6 +2861,12 @@ def _run_browse(jid: int, account_id: int, site: str):
                     settle(page, 1500)
                     used = page_eval(page, _USE_ROW_BUTTON_JS, hit["idx"]) \
                         or ""
+                    if used.startswith("NONE"):
+                        # what the page offered, so the next failure can be
+                        # read instead of guessed at
+                        history.append(f"No button for the {kind} could be "
+                                       f"pressed by the system ({used[:160]}).")
+                        used = ""
                     if used:
                         settle(page, 3500)
                         history.append(
@@ -3329,20 +3335,38 @@ def _money_of(text) -> float:
 _USE_ROW_BUTTON_JS = r"""
 (idx) => {
   const el = document.querySelector('[data-pa-idx="' + idx + '"]');
-  if (!el) return '';
-  const want = /use this address|deliver to this address|ship to this address|use this payment method|use this card|use this/i;
-  let node = el;
-  for (let i = 0; i < 7 && node && node.parentElement; i++) {
-    node = node.parentElement;
-    if (node.querySelectorAll('input[type=radio]').length > 1) return '';
-    for (const b of node.querySelectorAll(
-           'button, input[type=submit], [role=button], a')) {
-      const t = (b.innerText || b.value || b.getAttribute('aria-label')
-                 || '').replace(/\s+/g, ' ').trim();
-      if (want.test(t)) { b.click(); return t.slice(0, 40); }
+  if (!el) return 'NONE: picked element gone';
+  // make sure the choice really is selected, whatever was clicked
+  const radio = (el.tagName === 'INPUT') ? el
+              : (el.querySelector('input[type=radio]')
+                 || (el.closest('label') && el.closest('label')
+                       .querySelector('input[type=radio]')));
+  if (radio && !radio.checked) {
+    radio.click();
+    if (!radio.checked) {
+      radio.checked = true;
+      radio.dispatchEvent(new Event('change', {bubbles: true}));
     }
   }
-  return '';
+  const want = /use this address|deliver to this address|ship to this address|use this payment method|use this card|use this/i;
+  const seen = [];
+  const anchor = radio || el;
+  for (const b of document.querySelectorAll(
+         'button, input[type=submit], input[type=button], [role=button], a')) {
+    const r = b.getBoundingClientRect();
+    if (!r.width || !r.height) continue;
+    const t = (b.innerText || b.value || b.getAttribute('aria-label')
+               || '').replace(/\s+/g, ' ').trim();
+    if (!want.test(t)) continue;
+    seen.push(t.slice(0, 30));
+    // the first matching button AFTER the choice in page order: the
+    // row's own button, or the one global button under the list
+    if (anchor.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) {
+      b.click();
+      return t.slice(0, 40) + ' (checked=' + (radio ? radio.checked : '?') + ')';
+    }
+  }
+  return 'NONE: checked=' + (radio ? radio.checked : '?') + ' buttons seen=' + seen.join('|');
 }
 """
 
