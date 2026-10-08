@@ -5220,6 +5220,13 @@ def _():
     i = src.index("def _run_browse(")
     run = src[i:src.index("\ndef ", i + 10)]
     assert "_pick_choice(items, wanted)" in run and "picked.add(kind)" in run
+    # and the picked row's own button is pressed, never another row's
+    assert "_USE_ROW_BUTTON_JS, hit[\"idx\"]" in run, \
+        "the choice is selected but the old row's button gets pressed"
+    js = browser._USE_ROW_BUTTON_JS
+    assert "input[type=radio]').length > 1) return ''" in js, \
+        "the search for the button can cross into another address's row"
+    assert "deliver to this address" in js and "use this payment method" in js
     assert run.index("_pick_choice(items, wanted)") < run.index(
         "act = _decide("), "the choice is picked after the model has acted"
 

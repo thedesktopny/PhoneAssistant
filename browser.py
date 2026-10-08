@@ -2859,13 +2859,24 @@ def _run_browse(jid: int, account_id: int, site: str):
                         continue
                     picked.add(kind)
                     settle(page, 1500)
-                    history.append(
-                        f"The system has selected the {kind} "
-                        f"'{hit['desc'][:60]}'. Now press the button that "
-                        f"uses it - Use this address / Deliver to this "
-                        f"address / Use this payment method - and carry on.")
+                    used = page_eval(page, _USE_ROW_BUTTON_JS, hit["idx"]) \
+                        or ""
+                    if used:
+                        settle(page, 3500)
+                        history.append(
+                            f"The system has selected the {kind} "
+                            f"'{hit['desc'][:60]}' and pressed its "
+                            f"'{used}' button. Carry on from here.")
+                    else:
+                        history.append(
+                            f"The system has selected the {kind} "
+                            f"'{hit['desc'][:60]}'. Now press the button "
+                            f"that uses it - Use this address / Deliver to "
+                            f"this address / Use this payment method - "
+                            f"and carry on.")
                     _job_set(jid, "working",
-                             f"picked the {kind}: {hit['desc'][:60]}")
+                             f"picked the {kind}: {hit['desc'][:60]}"
+                             + (f", pressed '{used}'" if used else ""))
                     items, text = _page_snapshot(page, want=goal)
                 if looks_like_bot_check(text):
                     wall = record_block(account_id, site_key, text, page_url(page), jid)
@@ -3299,6 +3310,33 @@ def _money_of(text) -> float:
         return float(m.group(0).replace(",", "")) if m else 0.0
     except ValueError:
         return 0.0
+
+
+# Press the button that belongs to the choice just picked - and only
+# that row's. Amazon draws a "Deliver to this address" under EVERY
+# address; the listing keeps one of each wording, the first in the page,
+# and that one belonged to Rodney Street: the Screenshot address was
+# selected and the old one was used (David's test, third run). A row is
+# the nearest ancestor holding exactly one radio button.
+_USE_ROW_BUTTON_JS = r"""
+(idx) => {
+  const el = document.querySelector('[data-pa-idx="' + idx + '"]');
+  if (!el) return '';
+  const want = /use this address|deliver to this address|ship to this address|use this payment method|use this card|use this/i;
+  let node = el;
+  for (let i = 0; i < 7 && node && node.parentElement; i++) {
+    node = node.parentElement;
+    if (node.querySelectorAll('input[type=radio]').length > 1) return '';
+    for (const b of node.querySelectorAll(
+           'button, input[type=submit], [role=button], a')) {
+      const t = (b.innerText || b.value || b.getAttribute('aria-label')
+                 || '').replace(/\s+/g, ' ').trim();
+      if (want.test(t)) { b.click(); return t.slice(0, 40); }
+    }
+  }
+  return '';
+}
+"""
 
 
 def _pick_choice(items: list, wanted: str):
