@@ -48,6 +48,7 @@ from signals import (BLOCK_KINDS, BLOCK_MARKS, BLOCK_REASONS, BLOCK_VENDORS, BOT
 from payments import (CHARGE_LIMIT_CENTS, StripeError, StripeNeedsRawCardAccess, stripe_card_page_url, stripe_charge, stripe_customer_for, stripe_hold_card, stripe_save_finished)
 from payments import (_card_brand, _luhn_ok, _stripe, _stripe_call)
 from find import find_out, needs_source
+from advisor import (notes_for, write_call_note, write_text_note)
 from advisor import (ADVISOR_SYSTEM, PROFILE_SYSTEM, REVIEW_SYSTEM, WORKING_CLAIMS, advise, call_state, learn_about_caller, profile_for, review_call)
 from google_tools import (CODE_DIGITS, CODE_MAIL, CONNECT_CODE_HOURS, CONNECT_MAX_FAILS, CONNECT_MAX_FAILS_IP, CONVERTIBLE, DOC, DRIVE_KINDS, DRIVE_MAX_BYTES, MESSAGE_ACTIONS, PERSON_FIELDS, SEND_MAX_BYTES, SHEET, SLIDES, code_from_email, document_text, gmail_client, google_client, list_mailboxes, pick_connection, tool_attachment_text, tool_attachments, tool_cancel_event, tool_contact_add, tool_contacts_search, tool_create_event, tool_doc_add, tool_doc_create, tool_doc_replace, tool_draft_email, tool_drive_editable_copy, tool_drive_read, tool_drive_save_pdf, tool_drive_search, tool_email_drive_file, tool_find_contact, tool_find_free, tool_forward_email, tool_list_events, tool_mark_all_read, tool_mark_read, tool_message_action, tool_read_email, tool_reply_email, tool_search_email, tool_send_email, tool_sheet_add_row, tool_sheet_create, tool_sheet_read, tool_sheet_update, tool_task_add, tool_task_done, tool_tasks_list, tool_unread_summary)
 from google_tools import (_as_pdf, _cal, _category, _col_letters, _column_number, _connect_code, _connect_code_ok, _connect_too_many, _drive_kind, _drive_meta, _extract_body, _flow, _google_time, _headers_of, _made, _must_be, _person, _sheet_values, _spoken_date, _tab_range, _upload, _walk_parts)
@@ -1570,6 +1571,7 @@ async def sms_incoming(request: Request):
     mem_add(acct.id, "sms", "user", text)
     reply = text_brain(acct.id, text)
     mem_add(acct.id, "sms", "assistant", reply)
+    write_text_note(acct.id, text, reply)
     tool_send_sms(frm, reply)
     return {"ok": True}
 
@@ -1728,9 +1730,18 @@ def call_end(request: Request, call_id: int, background: BackgroundTasks,
     try:
         background.add_task(review_call, call_id)
         background.add_task(learn_about_caller, call_id)
+        background.add_task(write_call_note, call_id)
     except Exception:
         pass
     return {"ok": True}
+
+
+@app.get("/notes")
+def notes_list(request: Request, account_id: int, limit: int = 5):
+    """The notes written after each of this customer's calls and texts,
+    newest first. The assistant reads the last few at the start of a call."""
+    require_auth(request)
+    return notes_for(account_id, max(1, min(limit, 100)))
 
 
 class AdviceBody(BaseModel):
@@ -1908,6 +1919,11 @@ def calls_list(request: Request, limit: int = 50, q: str = ""):
         by_call.setdefault(t.call_id, []).append(t)
 
     out = []
+    ids = [r.id for r in rows]
+    notes_by_call = {}
+    if ids:
+        for n in db.query(CallNote).filter(CallNote.call_id.in_(ids)).all():
+            notes_by_call[n.call_id] = n.summary or ""
     for r in rows:
         ts = by_call.get(r.id, [])
         tools = []
@@ -1925,6 +1941,7 @@ def calls_list(request: Request, limit: int = 50, q: str = ""):
                     "didn't work", "not allowed")):
                 problems.append(t.text or "")
         out.append({
+            "note": notes_by_call.get(r.id, ""),
             "call_id": r.id,
             "who": names.get(r.account_id) or "unknown",
             "from": r.from_number,

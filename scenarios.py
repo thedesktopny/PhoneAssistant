@@ -639,6 +639,21 @@ def _():
                 f"{said[:160]}")
 
 
+@scenario("notes: every call leaves a note the next call can read",
+          "David - 'each account has call notes, so last week I asked you "
+          "always has an answer'; call 90 said nothing was stored")
+def _():
+    notes = call("/notes", account_id=ACCOUNT, limit=5)
+    assert isinstance(notes, list), notes
+    if not notes:
+        raise SetupProblem("no call has ended since the notes went live - "
+                           "make one call and run this again")
+    n = notes[0]
+    for key in ("summary", "asked", "done", "unfinished", "refs", "at"):
+        assert key in n, f"a note is missing {key}: {n}"
+    assert n["summary"], f"an empty note was written: {n}"
+
+
 # --------------------------------------------------------------- result
 
 print()

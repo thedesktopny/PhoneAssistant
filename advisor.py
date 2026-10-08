@@ -69,6 +69,12 @@ def call_state(account_id: int, call_id: int = 0) -> dict:
     out["logins_saved_for_these_shops_only"] = [
         s.site for s in db.query(SiteLogin)
                           .filter_by(account_id=account_id).all()]
+    # Every earlier call and text, as notes, newest first: "last week I
+    # asked you..." is answered from these.
+    out["earlier_calls"] = [
+        {"when": n["at"], "call": n["call_id"], "summary": n["summary"],
+         "done": n["done"], "unfinished": n["unfinished"], "refs": n["refs"]}
+        for n in notes_for(account_id, 20)]
     # This system's own record of orders not yet placed: "the same as
     # before" is the newest of these (call 90).
     out["orders_in_progress"] = [
@@ -121,6 +127,9 @@ Rules:
 - An address or card the caller names that was not in a read-back is
   not a mistake on either side: lists read from a page are cut short.
   review_checkout with their words finds it on the shop. Never argue.
+- earlier_calls are the notes of every earlier call and text, newest
+  first, with dates. "Last week I asked you..." is answered from them:
+  the date, what was done, what was left - then offer to carry on.
 - orders_in_progress are this system's own records. "The same as
   before" means the newest of them. Never say nothing was recorded.
 - Never ask the caller to choose between things that make no difference
@@ -330,6 +339,151 @@ def profile_for(account_id: int) -> str:
     if (row.notes or "").strip():
         parts.append("FROM EARLIER CALLS:\n" + row.notes.strip())
     return "\n\n".join(parts)
+
+
+NOTE_SYSTEM = """You write the note kept after a telephone call, for the
+assistant that will speak to this person next time and for the office.
+
+You get the spoken turns and the record of what the system did, with the
+numbers of the orders, jobs and office notes involved. Write ONLY what
+the record supports. Never write a password, PIN, code or card number.
+
+Reply with JSON only:
+{"summary": "one or two short lines: what they wanted and how it ended",
+ "asked": ["each thing they asked for, in a few words"],
+ "done": ["each thing done, with its number from the record: 'order 6 put
+           in the Amazon basket, read back at $39.16, not placed'"],
+ "unfinished": ["what was left undone or went wrong, and why"],
+ "remember": ["anything they said to keep in mind next time"]}
+Short items, plain words, no addresses or web links. Empty lists are
+fine."""
+
+REF = _re_scrub.compile(r"(?i)\b(order|job|note|followup|email)\s+#?(\d+)")
+
+
+def _refs_in(*texts) -> list:
+    seen, out = set(), []
+    for t in texts:
+        for kind, num in REF.findall(t or ""):
+            key = (kind.lower(), int(num))
+            if key not in seen:
+                seen.add(key)
+                out.append({"kind": key[0], "id": key[1]})
+    return out
+
+
+def _lines(items) -> str:
+    if isinstance(items, str):
+        items = [items]
+    return "\n".join(str(x).strip() for x in (items or []) if str(x).strip())
+
+
+def write_call_note(call_id: int) -> dict:
+    """The note for a call that just ended. Runs on its own after every
+    call, like the review and the profile."""
+    db = Session()
+    call = db.query(Call).filter_by(id=call_id).first()
+    if not call or not call.account_id:
+        db.close()
+        return {"skipped": "no account"}
+    account_id = call.account_id
+    turns = (db.query(CallTurn).filter_by(call_id=call_id)
+               .order_by(CallTurn.id).all())
+    said = [f"{t.who}: {(t.text or '')[:300]}" for t in turns
+            if t.who in ("caller", "agent")]
+    did = [f"tool {t.tool or ''}: {(t.text or '')[:200]}" for t in turns
+           if t.who == "tool"]
+    for j in db.query(Job).filter_by(call_id=call_id).all():
+        did.append(f"job {j.id} {j.kind} {j.site}: {j.state} "
+                   f"{j.reason or ''} {(j.message or '')[:160]}")
+    for o in db.query(Order).filter_by(call_id=call_id).all():
+        did.append(f"order {o.id} on {o.site}: {o.quantity} x {o.item} - "
+                   f"{o.state}"
+                   + (f", read back at {o.final_total}" if o.final_total
+                      else ""))
+    for f in db.query(Followup).filter_by(call_id=call_id).all():
+        did.append(f"note {f.id} for the office ({f.reason}): "
+                   f"{(f.note or '')[:120]}")
+    db.close()
+    if len(said) < 3:
+        return {"skipped": "too short"}
+    if not OPENAI_API_KEY:
+        return {"skipped": "no model configured"}
+    msgs = [{"role": "system", "content": NOTE_SYSTEM},
+            {"role": "user", "content":
+                "WHAT WAS SAID:\n" + "\n".join(said)[:7000]
+                + "\n\nWHAT THE SYSTEM DID:\n"
+                + ("\n".join(did)[:3000] or "(nothing ran)")}]
+    try:
+        d = _openai_chat(msgs, model=MODEL_ADVISOR, account_id=account_id,
+                         call_id=call_id, cheap=False)
+        raw = (d["choices"][0]["message"].get("content") or "").strip()
+        out = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
+    except Exception as e:
+        emit("note", f"call {call_id}", f"no note written: {str(e)[:150]}",
+             "warn", account_id)
+        return {"error": str(e)[:200]}
+    # the same rule as every other stored line: a secret is never kept
+    fields = {k: scrub(_lines(out.get(k)))[:2000]
+              for k in ("summary", "asked", "done", "unfinished", "remember")}
+    refs = _refs_in(fields["done"], fields["unfinished"])
+    db = Session()
+    db.add(CallNote(account_id=account_id, call_id=call_id, channel="voice",
+                    refs=json.dumps(refs), **fields))
+    db.commit()
+    db.close()
+    emit("note", f"call {call_id}", f"note written: {fields['summary'][:140]}",
+         "info", account_id)
+    return {"call_id": call_id, **fields, "refs": refs}
+
+
+def write_text_note(account_id: int, asked: str, reply: str) -> None:
+    """A text exchange gets a plain note, no model: what they sent and
+    what was answered."""
+    try:
+        db = Session()
+        db.add(CallNote(account_id=account_id, channel="sms",
+                        summary=scrub(f"Text: {asked[:120]} -> "
+                                      f"{reply[:120]}"),
+                        asked=scrub(asked[:500]), done=scrub(reply[:500])))
+        db.commit()
+        db.close()
+    except Exception as e:
+        emit("note", "text", f"no note written: {str(e)[:120]}", "warn",
+             account_id)
+
+
+def notes_for(account_id: int, limit: int = 5) -> list:
+    db = Session()
+    rows = (db.query(CallNote).filter_by(account_id=account_id)
+              .order_by(CallNote.id.desc()).limit(limit).all())
+    out = []
+    for r in rows:
+        try:
+            refs = json.loads(r.refs or "[]")
+        except Exception:
+            refs = []
+        out.append({"note_id": r.id, "call_id": r.call_id,
+                    "channel": r.channel, "at": local_str(r.at),
+                    "summary": r.summary or "", "asked": r.asked or "",
+                    "done": r.done or "", "unfinished": r.unfinished or "",
+                    "remember": r.remember or "", "refs": refs})
+    db.close()
+    return out
+
+
+def notes_block(account_id: int, limit: int = 5) -> str:
+    """The notes as the assistant reads them at the start of a call."""
+    lines = []
+    for n in notes_for(account_id, limit):
+        head = (f"- {n['at']} ({'call ' + str(n['call_id']) if n['call_id']
+                else 'text'}): {n['summary']}")
+        if n["unfinished"]:
+            head += " Unfinished: " + "; ".join(n["unfinished"].splitlines())
+        if n["remember"]:
+            head += " Remember: " + "; ".join(n["remember"].splitlines())
+        lines.append(head[:400])
+    return "\n".join(lines)
 
 
 def review_call(call_id: int) -> dict:

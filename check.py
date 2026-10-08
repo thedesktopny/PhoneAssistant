@@ -4904,6 +4904,105 @@ def _():
     assert "Never argue" in advisor.ADVISOR_SYSTEM
 
 
+@check("every call leaves a note: asked, done with its numbers, unfinished")
+def _():
+    """David: "each account has call notes - after each call we save what
+    the user did, with links - so 'last week I asked you' always has an
+    answer." Call 90 showed why: two orders sat in the records and the
+    assistant said nothing was stored."""
+    import advisor
+    import json as _json
+    db = main.Session()
+    call = main.Call(account_id=1, from_number="+1555", verified=1)
+    db.add(call)
+    db.commit()
+    cid = call.id
+    for who, text, tool in (
+            ("caller", "I'd like to order the labels again", ""),
+            ("agent", "Putting it in your Amazon basket", ""),
+            ("tool", "order 6 written down: 1 x MUNBYN labels", "draft_order"),
+            ("caller", "my password is Abc12345 by the way", ""),
+            ("agent", "Should I place this order?", "")):
+        db.add(main.CallTurn(call_id=cid, who=who, text=text, tool=tool))
+    db.add(main.Order(account_id=1, call_id=cid, site="amazon",
+                      item="MUNBYN labels", quantity=1, state="ready",
+                      final_total="$39.16"))
+    db.commit()
+    db.close()
+    seen = {}
+
+    def fake_chat(messages, model="", **k):
+        seen["user"] = messages[-1]["content"]
+        return {"choices": [{"message": {"content":
+            '{"summary": "Wanted the MUNBYN labels again; order 6 read back '
+            'at $39.16, not placed.", "asked": ["order the labels again"], '
+            '"done": ["order 6 put in the Amazon basket, read back at '
+            '$39.16"], "unfinished": ["order 6 not placed - they hung up"], '
+            '"remember": ["password is Abc12345"]}'}}]}
+    undo = everywhere("_openai_chat", fake_chat)
+    undo2 = everywhere("OPENAI_API_KEY", "x")
+    try:
+        out = advisor.write_call_note(cid)
+    finally:
+        undo()
+        undo2()
+    assert "order 6" in seen["user"] and "$39.16" in seen["user"], \
+        "the note writer is not shown the orders of the call"
+    assert out["refs"] == [{"kind": "order", "id": 6}], out
+    assert "Abc12345" not in _json.dumps(out), "a password reached the note"
+    notes = advisor.notes_for(1, 5)
+    assert notes and notes[0]["call_id"] == cid, notes
+    assert notes[0]["refs"] == [{"kind": "order", "id": 6}]
+    block = advisor.notes_block(1, 5)
+    assert f"call {cid}" in block and "Unfinished:" in block, block
+    assert "Abc12345" not in block
+    # and the advisor sees every note
+    state = advisor.call_state(1)
+    assert state["earlier_calls"] and state["earlier_calls"][0]["call"] == cid
+    assert "earlier_calls" in advisor.ADVISOR_SYSTEM
+    # a text leaves a plain note, scrubbed
+    advisor.write_text_note(1, "my pin is 4321, read my mail",
+                            "Here are your last emails")
+    top = advisor.notes_for(1, 1)[0]
+    assert top["channel"] == "sms" and "4321" not in top["summary"], top
+    # it runs after every call, and texts write theirs
+    src = io.open("main.py", encoding="utf-8").read()
+    i = src.index('@app.post("/calls/end")')
+    assert "background.add_task(write_call_note, call_id)" in src[i:i + 1500]
+    i = src.index("async def sms_incoming(")
+    assert "write_text_note(acct.id, text, reply)" in src[i:i + 5000]
+    assert "/notes" in {r.path for r in main.app.routes}
+
+
+@check("a call starts with the notes of the last five, and the office sees them")
+def _():
+    src = io.open("agent.py", encoding="utf-8").read()
+    i = src.index("async def entrypoint(")
+    body = src[i:]
+    assert 'backend_get("/notes"' in body and "limit=5" in body[
+        body.index('backend_get("/notes"'):body.index('backend_get("/notes"')
+        + 200], "the last five notes are not loaded at the start of a call"
+    assert body.index('backend_get("/notes"') < body.index(
+        'backend_get("/memory"'), "raw lines still come before the notes"
+    inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                           "+1555", 1, history="- Oct 7 (call 91): labels",
+                           known="")
+    assert "notes of earlier calls and texts" in inst.instructions
+    assert "what_now with their words" in inst.instructions, \
+        "'last week I asked you' has nowhere to go"
+    from fastapi.testclient import TestClient
+    c = TestClient(main.app, raise_server_exceptions=False, base_url="https://t")
+    c.headers["Authorization"] = f"Bearer {main.SERVICE_TOKEN}" \
+        if getattr(main, "SERVICE_TOKEN", "") else ""
+    r = c.get("/notes", params={"account_id": 1, "limit": 3})
+    assert r.status_code == 200 and isinstance(r.json(), list), r.text
+    r = c.get("/calls", params={"limit": 5})
+    assert r.status_code == 200 and all("note" in x for x in r.json()), \
+        "the calls list does not carry each call's note"
+    page = io.open("admin_page.py", encoding="utf-8").read()
+    assert "c.note" in page, "the admin panel does not show the note"
+
+
 @check("a text is never called sent when it cannot be delivered")
 def _():
     """Call 76: a new customer with no email was told twice "I've sent you

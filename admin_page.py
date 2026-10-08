@@ -207,7 +207,9 @@ Waiting for events…</pre>
 
 <section class="page" id="p-calls">
   <div class="card"><h2>Calls</h2>
-    <div class="hint">Search by name, number, call id, or what they asked for.</div>
+    <div class="hint">Search by name, number, call id, or what they asked for.
+      Under each call: the note written after it - what they wanted and how
+      it ended.</div>
     <div class="search"><input id="q_calls" placeholder="e.g. David, 3476, send_email"
       onkeydown="if(event.key==='Enter')loadCalls()"></div>
     <button onclick="loadCalls()">Search</button>
@@ -433,7 +435,8 @@ async function loadCalls(){
         '<td>'+c.seconds+'s<br><span class="hint">'+c.turns+' turns</span></td>'+
         '<td>'+(c.verified?'<span class="ok">ok</span>'
                           :'<span class="no">no</span>')+'</td>'+
-        '<td>'+taskCell(c)+'</td>'+
+        '<td>'+taskCell(c)+(c.note?'<div class="hint">'+esc(c.note)+
+          '</div>':'')+'</td>'+
         '<td><button class="sec" onclick="showTx('+c.call_id+',this)">'+
         'Transcript</button></td></tr>'+
         '<tr class="det" id="det'+c.call_id+'" style="display:none">'+

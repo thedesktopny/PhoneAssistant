@@ -484,14 +484,16 @@ Standing facts from earlier calls and from the office. Use them: speak the
 way they need, use the names they use, don't make them explain twice. If
 one turns out to be wrong, say so and work from what they tell you now.
 
-RECENT HISTORY — what was SAID on earlier calls and texts
+RECENT HISTORY — notes of earlier calls and texts, newest first
 {history or "Nothing recent."}
 
-That is a record of conversation, NOT a record of facts. Never carry
-on anything from it until they ask. When they
-mean "what I asked for last time", tell them what it shows they asked for
-- never ask them to repeat it. You DO keep records: unfinished orders are
-listed above. Never say details are not stored. What you said before may have been wrong. If they ask the same thing again, assume the last answer was wrong
+Notes, NOT a record of facts. Never carry on anything from them until
+they ask. "What I asked for last time": tell them what it shows, and
+never ask them to repeat it. Further back ("last week I asked you"):
+what_now with their words; it has every note. The same thing asked
+again: assume the last answer was wrong and get it right this time.
+You DO keep records; unfinished orders are listed above.
+Never say details are not stored. What you said before may have been wrong. If they ask the same thing again, assume the last answer was wrong
 and get it right this time.
 
 HOW YOU TALK
@@ -4470,15 +4472,38 @@ async def entrypoint(ctx: JobContext):
             log.warning(f"profile load failed: {e}")
 
         history = ""
+        # The notes written after each earlier call and text, newest
+        # first. Twelve raw lines was a minute of the last call; a note
+        # is the whole of it.
         try:
-            rows = await backend_get("/memory",
-                                     account_id=account["account_id"],
-                                     limit=12)
-            history = "\n".join(
-                f"- ({r['channel']}) {r['who']}: {r['text'][:160]}"
-                for r in rows)
+            notes = await backend_get("/notes",
+                                      account_id=account["account_id"],
+                                      limit=5)
+            lines = []
+            for n in notes:
+                who = (f"call {n['call_id']}" if n.get("call_id")
+                       else "text")
+                head = f"- {n['at']} ({who}): {n['summary']}"
+                if n.get("unfinished"):
+                    head += " Unfinished: " + "; ".join(
+                        n["unfinished"].splitlines())
+                if n.get("remember"):
+                    head += " Remember: " + "; ".join(
+                        n["remember"].splitlines())
+                lines.append(head[:400])
+            history = "\n".join(lines)
         except Exception as e:
-            log.warning(f"history load failed: {e}")
+            log.warning(f"notes load failed: {e}")
+        if not history:
+            try:
+                rows = await backend_get("/memory",
+                                         account_id=account["account_id"],
+                                         limit=12)
+                history = "\n".join(
+                    f"- ({r['channel']}) {r['who']}: {r['text'][:160]}"
+                    for r in rows)
+            except Exception as e:
+                log.warning(f"history load failed: {e}")
         # Orders written down and not placed are this system's own
         # records. Call 90: "you don't have my history?" - "once the call
         # ends, the details aren't stored". They were, in two places.

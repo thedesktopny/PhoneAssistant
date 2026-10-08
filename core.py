@@ -202,6 +202,26 @@ class CallTurn(Base):
     latency_ms = Column(Integer, default=0)
 
 
+class CallNote(Base):
+    """What one call, or one text exchange, was about - written after it
+    ends: what they asked for, what was done (with the record numbers),
+    what was left unfinished, anything to remember. The assistant reads
+    the last few before the next call; the advisor reads them all, so
+    "last week I asked you..." has an answer."""
+    __tablename__ = "call_notes"
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"))
+    call_id = Column(Integer, nullable=True)
+    channel = Column(String(10), default="voice")   # voice / sms
+    at = Column(DateTime, default=datetime.utcnow)
+    summary = Column(Text, default="")        # one or two spoken lines
+    asked = Column(Text, default="")          # one item per line
+    done = Column(Text, default="")
+    unfinished = Column(Text, default="")
+    remember = Column(Text, default="")
+    refs = Column(Text, default="[]")         # [{"kind": "order", "id": 6}]
+
+
 class Memory(Base):
     """Shared conversation history across voice and SMS, per account."""
     __tablename__ = "memory"
