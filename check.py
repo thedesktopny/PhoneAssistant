@@ -5300,6 +5300,39 @@ def _():
     assert "row.pay_label" in body and "row.ship_label" in body
 
 
+@check("every page has its folded lists opened before it is read")
+def _():
+    """Calls 91 and 95: four of a dozen addresses and a few of twenty cards
+    were read as the whole list - the rest were behind "See more". Every
+    site folds lists away; the system now opens them itself, on any site,
+    before the model reads the page."""
+    import re as _re
+    import browser
+    js = browser._UNFOLD_JS
+    m = _re.search(r"const open = /(.+?)/i;", js)
+    n = _re.search(r"const never = /(.+?)/i;", js)
+    assert m and n, "the unfold rules are not where they should be"
+    opener = _re.compile(m.group(1).replace("\\\\", "\\"), _re.I)
+    never = _re.compile(n.group(1).replace("\\\\", "\\"), _re.I)
+    for t in ("See more", "Show all", "View all", "Show 12 more",
+              "More options", "More payment methods", "Other addresses",
+              "Show details", "Expand", "See all 14"):
+        assert opener.search(t) and not never.search(t), f"not opened: {t}"
+    for t in ("Place your order", "Add to Cart", "Remove", "Sign out",
+              "See less", "Show fewer", "Buy now"):
+        assert not (opener.search(t) and not never.search(t)), \
+            f"would be pressed: {t}"
+    assert "stays" in js and "location.pathname" in js, \
+        "a link that leaves the page could be followed"
+    src = io.open("browser.py", encoding="utf-8").read()
+    i = src.index("def _run_browse(")
+    run = src[i:src.index("\ndef ", i + 10)]
+    assert "_unfold(page, history)" in run and "unfolded.add(here)" in run
+    assert run.index("_unfold(page, history)") < run.index(
+        "items, text = _page_snapshot(page, want=goal)"), \
+        "the page is read before it is unfolded"
+
+
 @check("a text is never called sent when it cannot be delivered")
 def _():
     """Call 76: a new customer with no email was told twice "I've sent you
