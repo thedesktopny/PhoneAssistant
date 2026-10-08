@@ -2115,6 +2115,24 @@ _SNAPSHOT_JS = r"""
       if (lt) label = lt;
     }
     label = label.replace(/\s+/g, ' ').slice(0, 70);
+    // A button every row has - "Add to Cart" under each product, "Select"
+    // beside each choice - says nothing about WHICH row. Only the first of
+    // each wording was kept, and on a results page that was the wrong
+    // product (the 220-sheet labels went into the basket instead of the
+    // 880). It carries its row's name, so each is its own and the right
+    // one can be chosen.
+    if (/^(add to (cart|basket|bag)|buy now|select|choose|see options|view options|use this|deliver to this address)$/i.test(label)) {
+      const row = el.closest('[data-asin]:not([data-asin=""]), ' +
+        '[data-component-type="s-search-result"], li, article, ' +
+        '[class*=product], [class*=result], [class*=item]');
+      if (row) {
+        const name = (row.querySelector('h2, h3, h4, [class*=title], ' +
+                                        '[class*=name]') || row);
+        const nt = (name.innerText || '').replace(/\s+/g, ' ').trim();
+        if (nt && nt.toLowerCase() !== label.toLowerCase())
+          label = label + ' | ' + nt.slice(0, 60);
+      }
+    }
     if (!label && !typed.includes(tag)) continue;
 
     // What matters on a shop page is buried under a hundred menu links,
@@ -2717,8 +2735,9 @@ def _run_browse(jid: int, account_id: int, site: str):
                 _job_set(jid, "opening", f"Looking up: {goal[:90]}")
         except Exception as e:
             emit("browse", f"job {jid}", f"search first failed: {e}", "warn")
-    if not start and site and CART_GOAL.search(goal) \
-            and not payload.get("order_id"):
+    # A basket job too: "open the basket FIRST" from the home page sent it
+    # searching, and it added the wrong product from the results.
+    if not start and site and CART_GOAL.search(goal):
         start = CART_PAGES.get(site, "")
     if not start:
         start = site_url(site) or "https://www.google.com"

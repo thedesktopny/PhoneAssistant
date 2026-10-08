@@ -4837,7 +4837,7 @@ def _():
     src = io.open("browser.py", encoding="utf-8").read()
     i = src.index("def _run_browse(")
     run = src[i:src.index("\ndef ", i + 10)]
-    assert "CART_PAGES.get(site" in run and 'payload.get("order_id")' in \
+    assert "CART_PAGES.get(site" in run and "CART_GOAL.search(goal)" in \
         run[run.index("CART_PAGES.get(site") - 200:run.index(
             "CART_PAGES.get(site")], \
         "a cart goal still starts on the home page"
@@ -5332,6 +5332,29 @@ def _():
     assert run.index("_unfold(page, history)") < run.index(
         "items, text = _page_snapshot(page, want=goal)"), \
         "the page is read before it is unfolded"
+
+
+@check("a button every row has carries its row's name")
+def _():
+    """Running the basket flow by itself: on Amazon's results page the
+    "Add to Cart" kept in the listing was the first in the page - the
+    220-sheet labels at $9.99 - and that went into the basket instead of
+    the 880-piece pack. The basket job had also started on the home page,
+    not in the basket it was told to open first."""
+    import browser
+    js = browser._SNAPSHOT_JS
+    assert "add to (cart|basket|bag)|buy now|select" in js and \
+        "label = label + ' | ' + nt" in js, \
+        "one Add to Cart still stands for every product on the page"
+    src = io.open("browser.py", encoding="utf-8").read()
+    i = src.index("def _run_browse(")
+    run = src[i:src.index("\ndef ", i + 10)]
+    j = run.index("CART_PAGES.get(site")
+    assert "order_id" not in run[j - 250:j], \
+        "a basket job still starts on the home page"
+    # the guards still recognise the longer labels
+    assert browser.ADD_TO_CART.search("button: Add to Cart | MUNBYN 880 PCs")
+    assert browser.BUY_BUTTONS.search("button: Buy Now | MUNBYN 880 PCs")
 
 
 @check("a text is never called sent when it cannot be delivered")
