@@ -705,6 +705,52 @@ def _():
         assert e.code == 400, e.code
 
 
+@scenario("orders: 'deliver to Screenshot, card ending 9090' is on the "
+          "review page, or the order is not ready",
+          "David's first test by hand - the change was skipped and the "
+          "order was marked ready with the old address and card")
+def _():
+    """Asks for the change on the real Amazon checkout and checks the
+    review page shows it. Nothing is bought. About two minutes."""
+    import time as _t
+    d = call("/orders/draft", method="POST", body={
+        "account_id": ACCOUNT, "site": "amazon",
+        "item": "MUNBYN 4x6 Thermal Shipping Labels, 880 pieces in 4 rolls",
+        "quantity": 1, "expected_price": "$35.97", "call_id": 0})
+    oid = d["order_id"]
+    try:
+        p = call("/jobs/checkout", method="POST", account_id=ACCOUNT,
+                 site="amazon", deliver_to="Screenshot",
+                 pay_with="ending 9090", call_id=0, order_id=oid)
+    except urllib.error.HTTPError as e:
+        if "Browserbase" in e.read().decode("utf-8", "ignore"):
+            raise SetupProblem("no browser is configured on the backend")
+        raise
+    jid = p["job_id"]
+    st = {}
+    for _ in range(80):
+        _t.sleep(3)
+        st = call("/jobs/status", job_id=jid)
+        if st.get("state") in ("done", "failed"):
+            break
+    assert st.get("state") == "done", (
+        f"the change job did not finish: {st.get('state')} "
+        f"{st.get('reason')} - {(st.get('message') or '')[:200]}")
+    o = call("/orders/status", order_id=oid)
+    ship, pay = (o.get("ship_label") or ""), (o.get("pay_label") or "")
+    if o.get("state") == "check":
+        raise AssertionError(
+            f"the change was not made on Amazon, and the system said so "
+            f"(correct) - but it should have been made: {ship!r} / {pay!r}: "
+            f"{(o.get('message') or '')[:200]}")
+    assert o.get("state") == "ready", o
+    assert "screenshot" in ship.lower(), \
+        f"ready with the wrong address: {ship!r}"
+    assert "9090" in pay, f"ready with the wrong card: {pay!r}"
+    assert not o.get("confirmation") and o.get("state") != "placed", \
+        "SOMETHING WAS BOUGHT by a test - stop and look at the order"
+
+
 # --------------------------------------------------------------- result
 
 print()

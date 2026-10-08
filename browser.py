@@ -2920,6 +2920,8 @@ def _run_browse(jid: int, account_id: int, site: str):
                             # placed, until it is put right (call 90).
                             state, why = _basket_matches(
                                 payload["order_id"], act)
+                            if state == "ready":
+                                state, why = _change_applied(payload, act)
                             chosen = {"final_total": total}
                             if act.get("chosen_address"):
                                 chosen["ship_label"] = str(
@@ -3256,6 +3258,44 @@ def _money_of(text) -> float:
         return float(m.group(0).replace(",", "")) if m else 0.0
     except ValueError:
         return 0.0
+
+
+def _wanted_in(wanted: str, chosen: str) -> bool:
+    """Does the chosen address or card carry what the caller asked for?
+    "Screenshot" is in "SCREENSHOT - 12 Main St"; "ending 9090" is in
+    "Visa 9090". Digits decide for a card; words for an address."""
+    want = (wanted or "").lower()
+    got = (chosen or "").lower()
+    if not want:
+        return True
+    if not got:
+        return False
+    digits = "".join(ch for ch in want if ch.isdigit())
+    if len(digits) >= 3:
+        return digits in "".join(ch for ch in got if ch.isdigit())
+    words = [w for w in _re_scrub.findall(r"[a-z0-9]+", want)
+             if len(w) > 2 and w not in ("the", "one", "address", "card",
+                                         "visa", "mastercard", "amex")]
+    return bool(words) and all(w in got for w in words)
+
+
+def _change_applied(payload: dict, act: dict):
+    """A change the caller asked for is on the review page, or the
+    order is 'check', never 'ready'. The first test by hand asked for
+    the Screenshot address and the 9090 card and was read back Rodney
+    Street and the 6158 - marked ready for a yes."""
+    why = []
+    if payload.get("deliver_to") and not _wanted_in(
+            payload["deliver_to"], act.get("chosen_address") or ""):
+        why.append(f"The address was NOT changed to "
+                   f"'{payload['deliver_to']}' - the checkout still shows "
+                   f"{act.get('chosen_address') or 'the old one'}.")
+    if payload.get("pay_with") and not _wanted_in(
+            payload["pay_with"], act.get("chosen_card") or ""):
+        why.append(f"The card was NOT changed to '{payload['pay_with']}' - "
+                   f"the checkout still shows "
+                   f"{act.get('chosen_card') or 'the old one'}.")
+    return ("check", " ".join(why)) if why else ("ready", "")
 
 
 def _basket_matches(oid: int, act: dict):

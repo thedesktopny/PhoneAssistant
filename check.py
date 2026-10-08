@@ -5151,6 +5151,48 @@ def _():
         "a payment page can still count as the checkout"
 
 
+@check("a change the caller asked for is on the review page, or the order is not ready")
+def _():
+    """The first test by hand: 'deliver to the Screenshot address, card
+    ending 9090'. The job went straight to the review page, read back
+    Rodney Street and the Visa 6158, and the order was marked ready for
+    a yes."""
+    import browser
+    ok = browser._wanted_in
+    assert ok("Screenshot", "SCREENSHOT - 12 Main St, Spring Valley 10977")
+    assert not ok("Screenshot", "Desktop, BASEMENT 144 RODNEY ST")
+    assert ok("ending 9090", "Visa 9090") and ok("9090", "Visa ending 9090")
+    assert not ok("ending 9090", "Visa 6158")
+    assert ok("the Monsey one", "Monsey - 5 Elm Rd")
+    assert ok("", "anything") and not ok("Monsey", "")
+    st, why = browser._change_applied(
+        {"deliver_to": "Screenshot", "pay_with": "ending 9090"},
+        {"chosen_address": "Desktop, BASEMENT 144 RODNEY ST",
+         "chosen_card": "Visa 6158"})
+    assert st == "check" and "address was NOT changed" in why and \
+        "card was NOT changed" in why, (st, why)
+    assert browser._change_applied(
+        {"deliver_to": "Screenshot", "pay_with": "9090"},
+        {"chosen_address": "SCREENSHOT 12 Main", "chosen_card": "Visa 9090"}
+    ) == ("ready", "")
+    assert browser._change_applied({}, {}) == ("ready", "")
+    src = io.open("browser.py", encoding="utf-8").read()
+    i = src.index("def _run_browse(")
+    run = src[i:src.index("\ndef ", i + 10)]
+    assert "_change_applied(payload, act)" in run and \
+        run.index("_basket_matches(") < run.index("_change_applied("), \
+        "a change not made can still make an order ready"
+    m = io.open("main.py", encoding="utf-8").read()
+    assert '"deliver_to": deliver_to, "pay_with": pay_with' in m, \
+        "the job does not know what change was asked for"
+    assert "comes FIRST" in main.CHECKOUT_CHANGES and \
+        "NOT changed" in main.CHECKOUT_CHANGES
+    a = io.open("agent.py", encoding="utf-8").read()
+    i = a.index("def _watch_basket(")
+    assert "review_checkout again with" in a[i:i + 4000], \
+        "a change not made has no way to be tried again"
+
+
 @check("a text is never called sent when it cannot be delivered")
 def _():
     """Call 76: a new customer with no email was told twice "I've sent you

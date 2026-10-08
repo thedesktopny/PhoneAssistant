@@ -2205,14 +2205,15 @@ they go quiet, ask once whether they are still there, then wait.
                 # The basket is not the order they asked for. It cannot be
                 # placed as it stands (call 90: quantity 3, total $113.97,
                 # for an order of one).
-                return (f"The {site} basket does NOT match what they asked "
-                        f"for, so it cannot be placed as it is. Tell them "
-                        f"exactly what is in it and what they asked for, "
-                        f"and ask whether to put it right. If yes: "
-                        f"do_on_website on {site} to set the quantity or "
-                        f"remove the other items, then draft_order again "
-                        f"to re-check. Do NOT ask to place it. Nothing has "
-                        f"been bought. {msg}")
+                return (f"The {site} checkout does NOT match what they "
+                        f"asked for, so it cannot be placed as it is. Tell "
+                        f"them exactly what it shows and what they asked "
+                        f"for, and ask whether to put it right. A change "
+                        f"that was NOT made: review_checkout again with "
+                        f"their words. Wrong quantity or other items: "
+                        f"do_on_website on {site}, then draft_order again. "
+                        f"Do NOT ask to place it. Nothing has been bought. "
+                        f"{msg}")
             if st == "done":
                 return (f"Say you got to the {site} checkout but could not "
                         f"read the total, so nothing will be placed, and "

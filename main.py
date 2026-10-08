@@ -2159,14 +2159,22 @@ address in "chosen_address", the card in "chosen_card", and the saved
 choices in "addresses" and "cards" (lists). met is true only on the
 final review page with the items and the total shown."""
 
-CHECKOUT_CHANGES = """If a delivery address is wanted: open Change beside
-the delivery address, pick the saved address matching "{deliver_to}", and
-use it. If a payment method is wanted: open Change under the payment
-section and pick the saved card matching "{pay_with}". The saved list is
-often cut short - open "See more", "Show all" or "Other addresses" before
-deciding it is not there. If it is still not there, or you cannot find
-the Change control after two tries, keep the current one and say so in
-your answer - do not keep trying."""
+CHECKOUT_CHANGES = """THE CUSTOMER WANTS A CHANGE, and it comes FIRST - before
+reading anything back:
+- Delivery address wanted: "{deliver_to}". On the address step, or with
+  the Change link beside the address on the review page, open the saved
+  addresses - the list is often cut short: "See more", "Show all",
+  "Other addresses" - and select the
+  one whose name or lines contain those words. Press its Use / Deliver to
+  this address button.
+- Payment wanted: "{pay_with}". On the payment step, or with Change under
+  the payment on the review page, select the saved card matching it (the
+  last digits decide). Press Use this payment method.
+Only then go on to the review page. The review page must now show the
+chosen address and card: say them in chosen_address and chosen_card. If
+one of them could not be found after a real look, keep the current one,
+and say plainly in your answer that it was NOT changed and what was
+there instead. Never report the old one as if it were the change."""
 
 
 @app.post("/jobs/checkout")
@@ -2187,7 +2195,8 @@ def job_checkout(request: Request, account_id: int, site: str,
             deliver_to=deliver_to or "the one already chosen",
             pay_with=pay_with or "the one already chosen")
     goal = CHECKOUT_GOAL.format(changes=changes)
-    payload = {"goal": goal, "url": "", "max_steps": 18, "may_buy": False}
+    payload = {"goal": goal, "url": "", "max_steps": 18, "may_buy": False,
+               "deliver_to": deliver_to, "pay_with": pay_with}
     if order_id:
         payload["order_id"] = order_id
         payload["budget"] = 240
