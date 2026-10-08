@@ -498,6 +498,7 @@ and get it right this time.
 
 HOW YOU TALK
 - One or two short sentences a turn. You are on the phone.
+- Ignore coughs, sneezes and background noise; never remark on them.
 - Never go silent. Every turn ends with a question or with what you are
   doing next. Say the result, then ask the next question in one breath.
 - Before a lookup say something brief like "one second" so the line is
@@ -919,6 +920,11 @@ they go quiet, ask once whether they are still there, then wait.
                 await self._record_outcome(d)
             if state == "failed" and kind == "job":
                 said = self._failure_words(d)
+            if state in ("done", "failed", "placed", "cancelled"):
+                # Over before it is spoken. Reading a checkout back takes
+                # half a minute, and the watchdog, still seeing a live
+                # job, said "still going" in the middle of it (call 94).
+                self.job_live = False
             if line or said:
                 try:
                     sess = getattr(self, "session", None)
@@ -2230,6 +2236,24 @@ they go quiet, ask once whether they are still there, then wait.
         if not self.verified:
             return "Not verified yet. Ask for the PIN first."
         oid = getattr(self, "order_id", None) or 0
+        if not oid:
+            # "The labels from last call": the unfinished order for this
+            # shop is picked up, so the read-back flows into it and a yes
+            # can place it. Call 94 read the checkout twice with no order
+            # open, and "place it now?" led nowhere.
+            try:
+                rows = await backend_get("/orders", account_id=self.account_id,
+                                         limit=10)
+            except Exception:
+                rows = []
+            for o in rows or []:
+                if (o.get("site") or "").lower() == site.lower() and \
+                        o.get("state") in ("draft", "ready", "check"):
+                    oid = o["order_id"]
+                    self.order_id = oid
+                    self.order_item = (f"{o.get('quantity') or 1} x "
+                                       f"{o.get('item')}")
+                    break
         try:
             async with httpx.AsyncClient(timeout=25) as c:
                 r = await c.post(f"{BACKEND}/jobs/checkout", headers=AUTH,
@@ -2244,19 +2268,48 @@ they go quiet, ask once whether they are still there, then wait.
             log.error(f"checkout failed: {e}")
             return (google_refusal(e, "the checkout")
                     or "Couldn't open the checkout.")
+        await log_turn(self.call_id, "tool",
+                       f"reading the {site} checkout"
+                       + (f" for order {oid}" if oid else "")
+                       + (f", address: {deliver_to}" if deliver_to else "")
+                       + (f", card: {pay_with}" if pay_with else ""),
+                       "review_checkout")
         if oid and d.get("job_id"):
             return self._watch_basket(
                 site, d["job_id"],
-                f"Changing it on {site} and reading the checkout back. Tell "
-                f"them in one sentence that nothing is being bought, then "
-                f"say nothing until you are told what it shows.")
+                f"Reading the {site} checkout back"
+                f"{' with the change' if deliver_to or pay_with else ''}. "
+                f"Tell them in one sentence that nothing is being bought, "
+                f"then say nothing until you are told what it shows.")
         self.job_id = d.get("job_id")
         self.job_site = site
-        self._watch_job(f"opening the {site} checkout")
+        jid = d.get("job_id")
+
+        async def fetch():
+            return await backend_get("/jobs/status", job_id=jid)
+
+        def describe(d):
+            st, msg = d.get("state", ""), d.get("message", "")
+            if st in ("needs_code", "needs_input"):
+                return f"{site} needs this from them: {msg}. Ask them."
+            if st == "done" and d.get("reason") == "not_met":
+                # Call 94: "we don't have the item details, just the
+                # total - would you like to go ahead and place it?"
+                return (f"The {site} checkout page did not show everything: "
+                        f"{msg} Say what it did show and what is missing. "
+                        f"Do NOT ask whether to place anything - nothing "
+                        f"can be placed from this. Offer to look again.")
+            if st == "done":
+                return (f"This is what the {site} checkout shows - read it "
+                        f"all back, adding nothing: {msg} Nothing can be "
+                        f"placed from here; to order it, draft_order with "
+                        f"the item.")
+            return None
+
+        self._start_watch("job", fetch, describe)
         return (f"Opening the {site} checkout. Tell them it takes a minute "
-                f"and that NOTHING is being bought yet. Wait to be told what "
-                f"it says, then read it all back - each item, the address, "
-                f"the card and the total - and ask whether to go ahead.")
+                f"and that NOTHING is being bought yet, then say nothing "
+                f"until you are told what it shows.")
 
     @function_tool
     @auto_report("orders")
@@ -4567,7 +4620,10 @@ async def entrypoint(ctx: JobContext):
                                 if o.get("final_total") else "")
                              + f" ({o['state']}, {o.get('at', '')}). "
                              f"Not placed."
-                             for o in open_orders))
+                             for o in open_orders)
+                         + "\nTo carry one on: draft_order with that item "
+                           "- it picks the order up and reads the shop's "
+                           "checkout back, choices included.")
         except Exception as e:
             log.warning(f"orders load failed: {e}")
         agent_obj = Assistant(account, caller, call_id, history, known)

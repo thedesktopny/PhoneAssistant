@@ -2137,6 +2137,12 @@ one by one, before pressing Proceed to checkout.
 
 {changes}
 
+On the address step and the payment step, note every saved address and
+card the site offers - open "See more", "Show all" or "Other addresses"
+first - and keep the one already selected unless a change is wanted
+above. Go on to the final review page: the one that shows the items,
+the address, the card and the order total together.
+
 Then READ the page and report exactly what it shows. Do not guess at
 anything that is not written there.
 
@@ -2149,7 +2155,9 @@ price; the delivery address; the payment method exactly as written, such
 as "Visa ending 1234"; the delivery date or shipping choice; and the
 order total. If the page does not show one of them, say which one. In
 the JSON also put the order total, as written, in "total", the selected
-address in "chosen_address" and the card in "chosen_card"."""
+address in "chosen_address", the card in "chosen_card", and the saved
+choices in "addresses" and "cards" (lists). met is true only on the
+final review page with the items and the total shown."""
 
 CHECKOUT_CHANGES = """If a delivery address is wanted: open Change beside
 the delivery address, pick the saved address matching "{deliver_to}", and

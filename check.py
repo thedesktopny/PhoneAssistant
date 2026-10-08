@@ -4445,7 +4445,7 @@ def _():
     src = io.open("agent.py", encoding="utf-8").read()
     for name in ("search_site", "do_on_website", "find_best_price",
                  "check_site_orders", "sign_in_to_site", "find_out",
-                 "confirm_order", "connect_email"):
+                 "confirm_order", "connect_email", "review_checkout"):
         i = src.index(f"    async def {name}(")
         body = src[i:src.index("    @function_tool", i + 10)]
         assert "log_turn(" in body, f"{name} leaves no line in the record"
@@ -5116,6 +5116,39 @@ def _():
     row = db.query(main.Order).filter_by(id=r1["order_id"]).first()
     assert row.call_id == 2 and row.state == "draft" and not row.final_total
     db.close()
+
+
+@check("picking an unfinished order back up reads the shop's checkout into it")
+def _():
+    """Call 94: "the labels from last call" - the checkout was read twice
+    with no order open, so "place it now?" could not have gone anywhere;
+    the first read stopped on the payment page ("items not shown") and
+    still asked for a yes; and a hold line was spoken in the middle of
+    the read-back."""
+    src = io.open("agent.py", encoding="utf-8").read()
+    i = src.index("    async def review_checkout(")
+    body = src[i:src.index("    @function_tool", i + 10)]
+    assert 'backend_get("/orders"' in body and "self.order_id = oid" in body, \
+        "the unfinished order is not picked up"
+    assert body.index('backend_get("/orders"') < body.index("/jobs/checkout"), \
+        "the order is looked for after the job has started"
+    assert "Do NOT ask whether to place anything" in body, \
+        "a half-read checkout can still be offered for a yes"
+    assert "log_turn(" in body
+    w = src[src.index("    async def _watch(self"):src.index("    def _start_watch(")]
+    assert w.index("self.job_live = False") < w.index("if line or said:"), \
+        "the job still counts as live while its result is being read out"
+    assert "draft_order with that item" in src, \
+        "nothing says how to carry an unfinished order on"
+    inst = agent.Assistant({"account_id": 1, "name": "T", "pin": "1"},
+                           "+1555", 1)
+    assert "never remark on them" in inst.instructions, \
+        "a sneeze still gets 'Bless you'"
+    assert '"addresses"' in main.CHECKOUT_GOAL and \
+        "Other addresses" in main.CHECKOUT_GOAL, \
+        "a checkout read does not collect the saved choices"
+    assert "met is true only on the" in main.CHECKOUT_GOAL, \
+        "a payment page can still count as the checkout"
 
 
 @check("a text is never called sent when it cannot be delivered")
