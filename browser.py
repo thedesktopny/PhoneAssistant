@@ -2097,9 +2097,23 @@ _SNAPSHOT_JS = r"""
     let label = el.getAttribute('aria-label') || el.getAttribute('placeholder')
       || (el.innerText || '').trim() || el.getAttribute('name')
       || el.getAttribute('value') || el.getAttribute('title') || '';
+    const type = (el.getAttribute('type') || '').toLowerCase();
+    // A radio button has no words of its own: Amazon's address and card
+    // choices all read "input/radio" and nothing could tell Screenshot
+    // from Rodney Street. Its label, or the row it sits in, names it.
+    if (type === 'radio' || type === 'checkbox') {
+      let lt = '';
+      if (el.labels && el.labels.length)
+        lt = (el.labels[0].innerText || '').trim();
+      if (!lt) { const lab = el.closest('label');
+                 if (lab) lt = (lab.innerText || '').trim(); }
+      if (!lt) { const row = el.closest('li, tr, [class*=address], ' +
+                   '[class*=payment], [class*=radio], [class*=row]');
+                 if (row) lt = (row.innerText || '').trim(); }
+      if (lt) label = lt;
+    }
     label = label.replace(/\s+/g, ' ').slice(0, 70);
     if (!label && !typed.includes(tag)) continue;
-    const type = (el.getAttribute('type') || '').toLowerCase();
 
     // What matters on a shop page is buried under a hundred menu links,
     // so rank rather than take the first ones in the page's own order.
@@ -2757,6 +2771,7 @@ def _run_browse(jid: int, account_id: int, site: str):
     stuck = 0              # actions in a row that changed nothing
     dead_ends = 0          # addresses that led to the site's error page
     sigs = []              # what it has been trying, to spot a loop
+    picked = set()         # "address" / "card" chosen by the system
     try:
         with sync_playwright() as p:
             browser, page, ctx_id = _open_with_session(p, account_id, site_key)
@@ -2825,6 +2840,32 @@ def _run_browse(jid: int, account_id: int, site: str):
                     if len(items) >= 15 and len(text) >= 800:
                         break
                     settle(page, 1500)
+                    items, text = _page_snapshot(page, want=goal)
+                # A change the caller asked for is picked by the system,
+                # not left to the model: it saw "Screenshot" in the list
+                # and pressed on with the old address, twice.
+                for kind, wanted in (("address", payload.get("deliver_to")),
+                                     ("card", payload.get("pay_with"))):
+                    if not wanted or kind in picked:
+                        continue
+                    hit = _pick_choice(items, wanted)
+                    if hit is None:
+                        continue
+                    try:
+                        do_click(page, _handle(page, hit))
+                    except Exception as e:
+                        history.append(f"could not select the {kind}: "
+                                       f"{str(e)[:80]}")
+                        continue
+                    picked.add(kind)
+                    settle(page, 1500)
+                    history.append(
+                        f"The system has selected the {kind} "
+                        f"'{hit['desc'][:60]}'. Now press the button that "
+                        f"uses it - Use this address / Deliver to this "
+                        f"address / Use this payment method - and carry on.")
+                    _job_set(jid, "working",
+                             f"picked the {kind}: {hit['desc'][:60]}")
                     items, text = _page_snapshot(page, want=goal)
                 if looks_like_bot_check(text):
                     wall = record_block(account_id, site_key, text, page_url(page), jid)
@@ -3258,6 +3299,29 @@ def _money_of(text) -> float:
         return float(m.group(0).replace(",", "")) if m else 0.0
     except ValueError:
         return 0.0
+
+
+def _pick_choice(items: list, wanted: str):
+    """The page element for a saved address or card the caller named -
+    its radio button first, then its label or row. None when the page
+    does not offer it (the list may still be folded away)."""
+    best = None
+    for it in items:
+        desc = it.get("desc") or ""
+        tag, _, words = desc.partition(":")
+        if not _wanted_in(wanted, words):
+            continue
+        if tag.startswith("input/radio"):
+            rank = 0
+        elif tag.startswith("label"):
+            rank = 1
+        elif tag.startswith(("a", "button")):
+            continue                  # a link with those words is not it
+        else:
+            rank = 2
+        if best is None or rank < best[0]:
+            best = (rank, it)
+    return best[1] if best else None
 
 
 def _wanted_in(wanted: str, chosen: str) -> bool:

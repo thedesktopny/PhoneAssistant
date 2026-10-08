@@ -5193,6 +5193,37 @@ def _():
         "a change not made has no way to be tried again"
 
 
+@check("a saved address or card the caller named is picked by the system")
+def _():
+    """David's first test by hand, twice: the job saw 'Screenshot' in the
+    list and pressed on with Rodney Street. A radio button has no words
+    of its own, so nothing in the listing told the choices apart."""
+    import browser
+    items = [{"idx": 0, "desc": "a: Change"},
+             {"idx": 1, "desc": "input/radio: Desktop BASEMENT 144 RODNEY ST"},
+             {"idx": 2, "desc": "input/radio: SCREENSHOT 12 Main St Spring "
+                                "Valley 10977"},
+             {"idx": 3, "desc": "label: SCREENSHOT 12 Main St"},
+             {"idx": 4, "desc": "button: Use this address"},
+             {"idx": 5, "desc": "input/radio: Visa ending in 6158"},
+             {"idx": 6, "desc": "input/radio: Visa ending in 9090"}]
+    assert browser._pick_choice(items, "Screenshot")["idx"] == 2
+    assert browser._pick_choice(items, "ending 9090")["idx"] == 6
+    assert browser._pick_choice(items, "Monsey") is None
+    assert browser._pick_choice([{"idx": 0, "desc": "a: Screenshot"}],
+                                "Screenshot") is None, \
+        "a link with the words would be clicked as if it were the choice"
+    js = browser._SNAPSHOT_JS
+    assert "el.labels" in js and "closest('label')" in js, \
+        "a radio button still has no words of its own"
+    src = io.open("browser.py", encoding="utf-8").read()
+    i = src.index("def _run_browse(")
+    run = src[i:src.index("\ndef ", i + 10)]
+    assert "_pick_choice(items, wanted)" in run and "picked.add(kind)" in run
+    assert run.index("_pick_choice(items, wanted)") < run.index(
+        "act = _decide("), "the choice is picked after the model has acted"
+
+
 @check("a text is never called sent when it cannot be delivered")
 def _():
     """Call 76: a new customer with no email was told twice "I've sent you
