@@ -5327,7 +5327,8 @@ def _():
     src = io.open("browser.py", encoding="utf-8").read()
     i = src.index("def _run_browse(")
     run = src[i:src.index("\ndef ", i + 10)]
-    assert "_unfold(page, history)" in run and "unfolded.add(here)" in run
+    assert "_unfold(page, history)" in run and "unfolded" not in run,         "unfolding is still once per address, and a checkout keeps one"
+    assert "paUnfolded" in js, "something opened once could be pressed again"
     assert run.index("_unfold(page, history)") < run.index(
         "items, text = _page_snapshot(page, want=goal)"), \
         "the page is read before it is unfolded"

@@ -2774,7 +2774,6 @@ def _run_browse(jid: int, account_id: int, site: str):
     dead_ends = 0          # addresses that led to the site's error page
     sigs = []              # what it has been trying, to spot a loop
     picked = set()         # "address" / "card" chosen by the system
-    unfolded = set()       # pages whose folded lists have been opened
     try:
         with sync_playwright() as p:
             browser, page, ctx_id = _open_with_session(p, account_id, site_key)
@@ -2838,14 +2837,15 @@ def _run_browse(jid: int, account_id: int, site: str):
                 # A shop draws its results after the shell, and we were
                 # reading the page in between: "the page offers 9 things
                 # you can use" on a search results page full of products.
-                # Once per page: open what is folded before reading it.
-                here = page_url(page)
-                if here not in unfolded:
-                    unfolded.add(here)
-                    opened = _unfold(page, history)
-                    if opened:
-                        _job_set(jid, "working",
-                                 "opened: " + ", ".join(opened)[:120])
+                # Every step: open what is folded before reading it. Not
+                # once per address - a checkout keeps one address while it
+                # moves from step to step, and the address list opened
+                # after the first look (David: Screenshot still missing).
+                # What was opened before is marked and skipped.
+                opened = _unfold(page, history)
+                if opened:
+                    _job_set(jid, "working",
+                             "opened: " + ", ".join(opened)[:120])
                 items, text = _page_snapshot(page, want=goal)
                 for _ in range(3):
                     if len(items) >= 15 and len(text) >= 800:
