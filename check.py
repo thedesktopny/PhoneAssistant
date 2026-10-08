@@ -5227,6 +5227,15 @@ def _():
     assert "input[type=radio]').length > 1) return ''" in js, \
         "the search for the button can cross into another address's row"
     assert "deliver to this address" in js and "use this payment method" in js
+    # on the review page, Change beside the section is opened by the
+    # system before the job may finish (fourth run: finished without it)
+    assert "_open_change_if_needed(page, payload, picked" in run and \
+        run.index("_open_change_if_needed(") < run.index(
+            'if a == "done":\n                    answer = act.get'), \
+        "a basket job can finish without ever opening Change"
+    oj = browser._OPEN_CHANGE_JS
+    assert "beside" in oj and "payment" not in oj.split("change")[0].lower()
+    assert browser._open_change_if_needed.__doc__
     assert run.index("_pick_choice(items, wanted)") < run.index(
         "act = _decide("), "the choice is picked after the model has acted"
 

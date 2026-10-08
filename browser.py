@@ -2917,6 +2917,14 @@ def _run_browse(jid: int, account_id: int, site: str):
                 a = act.get("action")
                 why = act.get("why", "")[:120]
 
+                if a == "done" and payload.get("order_id"):
+                    opened = _open_change_if_needed(page, payload, picked,
+                                                    history)
+                    if opened:
+                        _job_set(jid, "working",
+                                 f"not finished: opening Change for the "
+                                 f"{opened} first")
+                        continue
                 if a == "done":
                     answer = act.get("answer", "")[:1500]
                     # A job can finish by REPORTING a wall - the probe does
@@ -3337,6 +3345,57 @@ _USE_ROW_BUTTON_JS = r"""
   return '';
 }
 """
+
+
+# The "Change" link that belongs to one section of a review page - the
+# delivery address, or the payment. Every section has a link that says
+# "Change"; the listing keeps one, so the model could never reach the
+# second, and on the fourth run of David's test it finished without
+# opening either. The link is found from its section's own heading.
+_OPEN_CHANGE_JS = r"""
+(words) => {
+  const re = new RegExp(words, 'i');
+  const change = /^(change|edit|choose another|select another|use a different)/i;
+  for (const h of document.querySelectorAll(
+         'h1, h2, h3, h4, h5, span, div, p, label, strong, b')) {
+    const t = (h.innerText || '').replace(/\s+/g, ' ').trim();
+    if (!t || t.length > 60 || !re.test(t)) continue;
+    let node = h;
+    for (let i = 0; i < 6 && node && node.parentElement; i++) {
+      node = node.parentElement;
+      for (const b of node.querySelectorAll('a, button, [role=button]')) {
+        const bt = (b.innerText || b.getAttribute('aria-label') || '')
+                     .replace(/\s+/g, ' ').trim();
+        if (change.test(bt)) { b.click(); return bt.slice(0, 30) + ' beside ' + t.slice(0, 30); }
+      }
+    }
+  }
+  return '';
+}
+"""
+
+
+def _open_change_if_needed(page, payload: dict, picked: set,
+                           history: list) -> str:
+    """Before a basket job with a change may finish: open the Change link
+    for the address or card that has not been chosen yet. Returns which
+    one was opened, or '' when there is nothing to open."""
+    for kind, wanted, words in (
+            ("address", payload.get("deliver_to"),
+             "delivery address|shipping address|ship to|deliver to"),
+            ("card", payload.get("pay_with"),
+             "payment method|paying with|pay with|payment")):
+        if not wanted or kind in picked or f"opened_{kind}" in picked:
+            continue
+        got = page_eval(page, _OPEN_CHANGE_JS, words) or ""
+        if got:
+            picked.add(f"opened_{kind}")
+            settle(page, 3000)
+            history.append(f"The system opened '{got}' so the {kind} "
+                           f"'{wanted}' can be chosen. Do not finish until "
+                           f"it has been.")
+            return kind
+    return ""
 
 
 def _pick_choice(items: list, wanted: str):
