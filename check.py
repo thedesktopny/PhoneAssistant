@@ -6076,6 +6076,60 @@ def _():
         'os.environ.get("PICTURE_GATHER_SECONDS", "8")' in src
 
 
+@check("a picture is looked at carefully, by the stronger model, and kept for follow-ups")
+def _():
+    """9 Oct: under-cabinet lighting was suggested for a kitchen that had
+    it; then 'you can clearly see it' was answered without the picture."""
+    main._LAST_PICTURE.clear()
+    assert main._picture_for(7, "PIC") == "PIC"
+    assert main._picture_for(7, "") == "PIC", "the picture was not kept"
+    main._LAST_PICTURE[7] = ("PIC", 0)
+    assert main._picture_for(7, "") == "", "an old picture was reused"
+    main._LAST_PICTURE.clear()
+    src = io.open("main.py", encoding="utf-8").read()
+    i = src.index("def text_brain(")
+    assert "model=MODEL_BROWSER if image_b64" in src[i:i + 9000]
+    assert "check what is ALREADY in it" in main.TEXT_RULES
+
+
+@check("'text me at 7:30' is scheduled, kept, and sent when due")
+def _():
+    """9 Oct: 'Send me a good morning message at 7:30' got 'I can't send
+    messages at specific times'."""
+    from datetime import datetime as _dt, timedelta as _td
+    when = (_dt.now() + _td(days=1)).strftime("%Y-%m-%dT07:30")
+    out = main._run_text_tool(1, "send_text_later",
+                              {"when": when, "message": "Good morning!"})
+    assert out.get("ok"), out
+    past = main._run_text_tool(1, "send_text_later",
+                               {"when": "2020-01-01T07:30", "message": "x"})
+    assert "passed" in past.get("error", ""), past
+    db = main.Session()
+    row = (db.query(main.ScheduledText).order_by(main.ScheduledText.id.desc())
+             .first())
+    row.send_at = main.datetime.utcnow() - _td(minutes=1)
+    db.commit()
+    rid = row.id
+    db.close()
+    sent = []
+    undo = everywhere("tool_send_sms",
+                      lambda to, msg, media=None: sent.append(msg)
+                      or {"sent": True})
+    try:
+        assert main.send_due_texts() >= 1
+    finally:
+        undo()
+    assert "Good morning!" in sent, sent
+    db = main.Session()
+    assert db.query(main.ScheduledText).filter_by(id=rid).first().state == \
+        "sent"
+    db.close()
+    names = {t["function"]["name"] for t in main.TEXT_TOOLS}
+    assert "send_text_later" in names and "send_text_later" in main.TEXT_RULES
+    src = io.open("main.py", encoding="utf-8").read()
+    assert "threading.Thread(target=_scheduled_text_loop" in src
+
+
 @check("a text is never called sent when it cannot be delivered")
 def _():
     """Call 76: a new customer with no email was told twice "I've sent you

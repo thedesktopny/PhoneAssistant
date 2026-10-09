@@ -406,6 +406,31 @@ def _run_text_tool(account_id: int, name: str, args: dict):
             return tool_create_event(account_id, args["title"],
                                      args["start_iso"],
                                      args.get("minutes", 60))
+        if name == "send_text_later":
+            try:
+                local = datetime.strptime(args.get("when", "")[:16],
+                                          "%Y-%m-%dT%H:%M")
+            except ValueError:
+                return {"error": "the time was not understood - ask them "
+                                 "for it again"}
+            utc = local.replace(tzinfo=_tz()).astimezone(
+                timezone.utc).replace(tzinfo=None)
+            if utc < datetime.utcnow():
+                return {"error": "that time has already passed - ask which "
+                                 "day they mean"}
+            db = Session()
+            row = (db.query(PhoneNumber).filter_by(account_id=account_id)
+                     .order_by(PhoneNumber.id).first())
+            number = row.number if row else ""
+            if not number:
+                db.close()
+                return {"error": "no phone number on the account"}
+            db.add(ScheduledText(account_id=account_id, to_number=number,
+                                 send_at=utc,
+                                 message=(args.get("message") or "")[:600]))
+            db.commit()
+            db.close()
+            return {"ok": True, "when": local_str(utc)}
         if name == "remember_this":
             fact = scrub(" ".join((args.get("fact") or "").split()))[:200]
             if not fact:
@@ -823,7 +848,11 @@ def text_brain(account_id: int, incoming: str, image_b64: str = ""):
     used_tools = []
     for _ in range(6):
         try:
-            data = _openai_chat(msgs, TEXT_TOOLS, model=MODEL_TEXT,
+            # A picture is looked at by the stronger model: the small one
+            # suggested under-cabinet lighting for a kitchen that had it.
+            data = _openai_chat(msgs, TEXT_TOOLS,
+                                model=MODEL_BROWSER if image_b64
+                                else MODEL_TEXT,
                                 account_id=account_id)
         except Exception as e:
             return f"Something went wrong: {str(e)[:80]}"
@@ -903,6 +932,41 @@ def text_brain(account_id: int, incoming: str, image_b64: str = ""):
 # ----------------------------------------------------------------- api
 
 app = FastAPI(title="Phone Assistant")
+
+
+def send_due_texts() -> int:
+    """Send every scheduled text whose time has come. Runs every minute."""
+    sent = 0
+    db = Session()
+    try:
+        due = (db.query(ScheduledText).filter(
+            ScheduledText.state == "waiting",
+            ScheduledText.send_at <= datetime.utcnow()).limit(20).all())
+        for row in due:
+            went = tool_send_sms(row.to_number, row.message)
+            row.state = "sent" if went.get("sent") else "failed"
+            mem_add(row.account_id, "sms", "assistant", row.message)
+            emit("sms", (row.to_number or "")[-4:],
+                 f"scheduled text {row.state}: {row.message[:80]}",
+                 "info" if went.get("sent") else "error", row.account_id)
+            sent += 1
+        db.commit()
+    finally:
+        db.close()
+    return sent
+
+
+def _scheduled_text_loop():
+    while True:
+        try:
+            send_due_texts()
+        except Exception as e:
+            emit("sms", "schedule", f"scheduled texts: {str(e)[:120]}",
+                 "warn")
+        time.sleep(60)
+
+
+threading.Thread(target=_scheduled_text_loop, daemon=True).start()
 
 
 def end_what_a_restart_cut_off() -> int:
@@ -2067,6 +2131,26 @@ _GATHER_LOCK = threading.Lock()
 _GATHER_SEQ = [0]
 
 
+# The last picture each customer sent, kept with the conversation for a
+# while: "you can clearly see the under-counter lighting" was answered
+# without the picture, so it could only apologise, not look again.
+_LAST_PICTURE = {}
+PICTURE_KEEP = 15 * 60
+
+
+def _picture_for(account_id: int, picture: str) -> str:
+    """The picture to show with this message: the one just sent, or the
+    last one if it was sent in the last quarter of an hour."""
+    now = time.time()
+    if picture:
+        _LAST_PICTURE[account_id] = (picture, now)
+        return picture
+    kept = _LAST_PICTURE.get(account_id)
+    if kept and now - kept[1] < PICTURE_KEEP:
+        return kept[0]
+    return ""
+
+
 def _gather(account_id: int, frm: str, text: str, picture: str,
             voice_said: str) -> float:
     """Put one arrival with the others from this number. Returns its
@@ -2103,7 +2187,8 @@ def _answer_after_pause(frm: str, stamp: float, wait: float = None):
     if len(items) > 1:
         emit("sms", frm[-4:], f"answering {len(items)} messages together",
              "info", account_id)
-    _answer_text(account_id, frm, text, pictures[0] if pictures else "",
+    _answer_text(account_id, frm, text,
+                 _picture_for(account_id, pictures[0] if pictures else ""),
                  " ".join(voices))
 
 

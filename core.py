@@ -214,6 +214,19 @@ class Media(Base):
     at = Column(DateTime, default=datetime.utcnow)
 
 
+class ScheduledText(Base):
+    """A text to send later - "send me a good morning message at 7:30".
+    In the database, so a restart does not lose it."""
+    __tablename__ = "scheduled_texts"
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"))
+    to_number = Column(String(20))
+    send_at = Column(DateTime)                 # UTC
+    message = Column(Text, default="")
+    state = Column(String(20), default="waiting")   # waiting/sent/failed
+    at = Column(DateTime, default=datetime.utcnow)
+
+
 class CallNote(Base):
     """What one call, or one text exchange, was about - written after it
     ends: what they asked for, what was done (with the record numbers),
@@ -828,6 +841,14 @@ TEXT_TOOLS = [
             "item": {"type": "string"}, "shop": {"type": "string"}},
             "required": ["item"]}}},
     {"type": "function", "function": {
+        "name": "send_text_later",
+        "description": "Schedule a text to them for later: a reminder, a "
+                       "good-morning message. when is their local time, "
+                       "YYYY-MM-DDTHH:MM. message is the exact words.",
+        "parameters": {"type": "object", "properties": {
+            "when": {"type": "string"}, "message": {"type": "string"}},
+            "required": ["when", "message"]}}},
+    {"type": "function", "function": {
         "name": "remember_this",
         "description": "Keep a standing instruction or fact about them for "
                        "every future call and text: 'never send me links', "
@@ -982,7 +1003,10 @@ SHOPPING AND FINDING OUT
 - A voice note THEY send reaches you already turned into words - answer
   those words like any text. Never say you cannot listen to voice notes.
   Do not repeat their words back to them unless they ask you to.
-- A picture THEY send: look at it and help - read a label, a letter or a
+- "Text me at 7:30", "remind me tomorrow at 9": send_text_later with the
+  time and the words. Confirm the time back in plain words.
+- A picture THEY send: look at it and help. Before suggesting anything,
+  check what is ALREADY in it - never suggest something it already has - read a label, a letter or a
   bill, say what a product or a thing is, answer their question about it.
   Describe what is there. A person in it: describe what you see - what
   they wear, what they are doing, where they are - and answer questions
