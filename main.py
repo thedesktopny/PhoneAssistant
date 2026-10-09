@@ -1907,11 +1907,15 @@ def _first_time(key: str) -> bool:
     return True
 
 
-def _answer_text(account_id: int, frm: str, text: str, picture: str):
+def _answer_text(account_id: int, frm: str, text: str, picture: str,
+                 voice_said: str = ""):
     """The reply to one incoming text - after the provider has its 200."""
     try:
         said = text.strip() or ("I sent you this picture. Tell me what it "
                                 "shows and help me with it.")
+        if voice_said:
+            said = ("[They sent a voice note and you heard it clearly. "
+                    "They said:] " + said)
         kept = (("(sent a picture) " + text.strip()).strip() if picture
                 else text)
         mem_add(account_id, "sms", "user", kept)
@@ -2009,7 +2013,7 @@ async def sms_incoming(request: Request, background: BackgroundTasks):
     emit("sms", frm[-4:], f"received: {len(text.strip())} characters, "
                           f"{len(media) if isinstance(media, list) else int(bool(media))}"
                           f" attachment(s)", "info")
-    picture, heard = "", []
+    picture, heard, voice_said = "", [], ""
     if media:
         urls = media if isinstance(media, list) else [media]
         picture, heard = _open_attachments(urls, frm)
@@ -2018,6 +2022,9 @@ async def sms_incoming(request: Request, background: BackgroundTasks):
         # answered "I can't listen to voice notes" with the words in front
         # of it (9 Oct).
         text = (text.strip() + " " + " ".join(heard)).strip()
+        # "Can you listen now to my voice?" - heard perfectly, and answered
+        # "I can't listen to voice notes": it did not know this WAS one.
+        voice_said = " ".join(heard)
     if media and not picture and not text.strip():
         acct = account_for_number(frm)
         if acct:
@@ -2038,7 +2045,8 @@ async def sms_incoming(request: Request, background: BackgroundTasks):
     key = ref or f"{frm}|{text.strip()}|{bool(media)}"
     if not _first_time(key):
         return {"ok": True, "repeat": True}
-    background.add_task(_answer_text, acct.id, frm, text, picture)
+    background.add_task(_answer_text, acct.id, frm, text, picture,
+                        voice_said)
     return {"ok": True}
 
 

@@ -5604,7 +5604,7 @@ def _():
         id = 1
     undo = [everywhere("account_for_number", lambda n: Acct()),
             everywhere("_answer_text",
-                       lambda a, f, t, p: calls.append((f, t)))]
+                       lambda a, f, t, p, *rest: calls.append((f, t)))]
     main._SEEN_TEXTS.clear()
     c = TestClient(main.app, raise_server_exceptions=False, base_url="https://t")
     try:
@@ -5839,6 +5839,30 @@ def _():
     assert '(voice note) {h}' not in body, \
         "the words still go to the model labelled as a voice note"
     assert "Never say you cannot listen to voice notes" in main.TEXT_RULES
+
+
+@check("the model is told it heard the voice note")
+def _():
+    """9 Oct: 'Can you listen now to my voice now?' was heard word for
+    word and answered 'I can't listen to voice notes'."""
+    seen = {}
+
+    def fake_brain(account_id, incoming, image_b64=""):
+        seen["incoming"] = incoming
+        return ("Yes - I heard you.", [])
+    undo = [everywhere("text_brain", fake_brain),
+            everywhere("tool_send_sms", lambda *a, **k: {"sent": True}),
+            everywhere("mem_add", lambda *a, **k: None),
+            everywhere("write_text_note", lambda *a, **k: None)]
+    try:
+        main._answer_text(1, "+15550100999", "Can you listen to my voice?",
+                          "", "Can you listen to my voice?")
+    finally:
+        for u in undo:
+            u()
+    assert seen["incoming"].startswith("[They sent a voice note and you "
+                                       "heard it clearly"), seen
+    assert "Can you listen to my voice?" in seen["incoming"]
 
 
 @check("a text is never called sent when it cannot be delivered")
