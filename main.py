@@ -565,9 +565,16 @@ def _plain_text_reply(said: str) -> str:
     return s.strip()[:600]
 
 
+CANT_SCHEDULE = _re_scrub.compile(
+    r"(?i)\b(can.?t|cannot|can not|unable to|not able to)\s+(send|set|"
+    r"schedule)\b[^.]{0,40}\b(at (a )?specific times?|later|reminders?|"
+    r"scheduled)")
+
+
 def _false_cant(said: str) -> bool:
     return bool(CANT_HEAR.search(said or "") or CANT_SEE.search(said or "")
-                or CANT_SEND_PIC.search(said or ""))
+                or CANT_SEND_PIC.search(said or "")
+                or CANT_SCHEDULE.search(said or ""))
 
 
 def _text_memory(account_id: int) -> str:
@@ -880,14 +887,16 @@ def text_brain(account_id: int, incoming: str, image_b64: str = ""):
             heard = incoming.startswith("[Voice note")
             wrong = ((heard and CANT_HEAR.search(said))
                      or (image_b64 and CANT_SEE.search(said))
-                     or CANT_SEND_PIC.search(said))
+                     or CANT_SEND_PIC.search(said)
+                     or CANT_SCHEDULE.search(said))
             if wrong and not retried:
                 retried = True
                 msgs.append({"role": "assistant", "content": said})
                 msgs.append({"role": "system", "content": (
                     "That is wrong. You DID hear the voice note - its words "
                     "are in their message - you CAN see pictures they send, "
-                    "and you CAN send pictures with send_picture_of. Answer "
+                    "you CAN send pictures with send_picture_of, and you CAN "
+                    "send a text later with send_text_later. Answer "
                     "what they actually asked.")})
                 continue
             if NOT_ALLOWED in said and not is_blocked(incoming) \

@@ -5875,7 +5875,8 @@ def _():
     for bad in ("I can't listen to voice notes, but you can share it.",
                 "I cannot hear audio messages.",
                 "I'm unable to view images.",
-                "I can't send pictures directly."):
+                "I can't send pictures directly.",
+                "I can't send messages or reminders at specific times."):
         assert main._false_cant(bad), bad
     for fine in ("I heard you: you asked about candle lighting.",
                  "Picture attached.", "I can't find that order."):
