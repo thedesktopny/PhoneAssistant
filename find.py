@@ -41,6 +41,13 @@ NEEDS_SOURCE = _re_scrub.compile(
     r"specific|instructions|manual|steps|button|buttons|settings?|"
     r"features?|options?|specs?|trims?|best|top rated|compare|which one|"
     r"which ones)\b"
+    # 9 Oct: "which Gemara..." was answered from memory with no source -
+    # "fairly sure it's Pesachim 11b"; the Mishnah is on 13b. A source is
+    # a fact about a page, so it is looked up on real pages.
+    r"|\b(gemara|gemora|gemorah|gomorrah|talmud|mishna|mishnah|mishnayos|"
+    r"daf|masechta|masechet|tractate|perek|pasuk|posuk|verse|rambam|"
+    r"shulchan aruch|mishna berura|mishnah berurah|midrash|rashi|tosafos|"
+    r"source|sources|where does it say|where is it written)\b"
     # "which minivans have leather seats" - a list of what exists, not a
     # fact anyone carries in their head
     r"|\b(which|what)\b.{0,40}\b(have|has|with|come|comes|include)\b")

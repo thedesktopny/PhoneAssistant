@@ -385,6 +385,10 @@ def _run_text_tool(account_id: int, name: str, args: dict):
             return {"of": what, "pictures": pics,
                     "note": ("sent with your reply" if pics else
                              "no picture could be found - say so")}
+        if name == "jewish_calendar":
+            return everyday.jewish_calendar(account_id, args.get("what", ""),
+                                            args.get("place", ""),
+                                            args.get("date", ""))
         if name == "find_out":
             d = find_out(args.get("question", ""), account_id)
             return {"answer": d.get("answer", ""), "found": d.get("found"),
@@ -419,6 +423,16 @@ def _run_text_tool(account_id: int, name: str, args: dict):
                 return {"error": "that time has already passed - ask which "
                                  "day they mean"}
             db = Session()
+            # "And e me a nice good morning message 730" arrived twice in
+            # 25 seconds and was answered "scheduled" twice (9 Oct).
+            same = (db.query(ScheduledText).filter_by(
+                account_id=account_id, send_at=utc, state="waiting").first())
+            if same:
+                db.close()
+                return {"ok": True, "when": local_str(utc),
+                        "already_scheduled": True,
+                        "note": "this was already scheduled - say so; "
+                                "only one will be sent"}
             row = (db.query(PhoneNumber).filter_by(account_id=account_id)
                      .order_by(PhoneNumber.id).first())
             number = row.number if row else ""
@@ -571,10 +585,53 @@ CANT_SCHEDULE = _re_scrub.compile(
     r"scheduled)")
 
 
+# "You may also learn the stuff to be human on text" got "I can't learn or
+# change how I respond" - but remember_this keeps how they want things.
+CANT_LEARN = _re_scrub.compile(
+    r"(?i)\b(can.?t|cannot|can not|unable to|not able to)\s+(learn|"
+    r"remember|change how i)\b")
+
+# A Gemara page named from memory. 9 Oct: Berachos 28b, Yoma 39a and
+# Menachos 11 were offered in turn, all with confidence, none looked up;
+# the story asked about (two todah loaves on the roof) is in Pesachim.
+SOURCE_CITED = _re_scrub.compile(
+    r"(?i)\b(berachos|brachos|berakhot|shabbos|shabbat|eruvin|pesachim|"
+    r"shekalim|yoma|sukkah|succah|beitzah|beitza|rosh hashanah|taanis|"
+    r"taanit|megillah|moed katan|chagigah|yevamos|yevamot|kesubos|"
+    r"ketubot|nedarim|nazir|sotah|gittin|kiddushin|bava kamma|bava metzia|"
+    r"bava basra|bava batra|sanhedrin|makkos|makot|shevuos|shevuot|"
+    r"avodah zarah|horayos|zevachim|menachos|menachot|chullin|bechoros|"
+    r"arachin|temurah|kerisus|meilah|tamid|niddah)\s+(daf\s+)?\d{1,3}"
+    r"\s*[ab]?\b")
+
+
 def _false_cant(said: str) -> bool:
     return bool(CANT_HEAR.search(said or "") or CANT_SEE.search(said or "")
                 or CANT_SEND_PIC.search(said or "")
-                or CANT_SCHEDULE.search(said or ""))
+                or CANT_SCHEDULE.search(said or "")
+                or CANT_LEARN.search(said or ""))
+
+
+def _jewish_today() -> str:
+    """The Hebrew date and this week's parsha, from the calendar - not the
+    model's memory, which said Noach, then Lech-Lecha, on the Friday of
+    Bereishis, and the 25th of Tishrei on the 28th (9 Oct)."""
+    try:
+        d = everyday.jewish_calendar(None, "hebrew_date")
+        t, n = d["today"], d["tonight"]
+        out = (f"\nThe Hebrew date is {t['spoken']}; after nightfall it is "
+               f"{n['spoken']}.")
+        if t.get("parsha") or n.get("parsha"):
+            out += (f" This week's parsha is "
+                    f"{t.get('parsha') or n.get('parsha')}.")
+        events = list(t.get("events") or []) + [
+            x for x in n.get("events") or [] if x not in (t.get("events")
+                                                          or [])]
+        if events:
+            out += " Also: " + "; ".join(events) + "."
+        return out
+    except Exception:
+        return ""
 
 
 def _text_memory(account_id: int) -> str:
@@ -826,12 +883,13 @@ def text_brain(account_id: int, incoming: str, image_b64: str = ""):
         return "The assistant isn't configured yet."
 
     # %-d is Linux-only and raises on Windows, where check.py runs
-    _now = datetime.now()
-    today = f"{_now:%A, %B} {_now.day}, {_now.year}"
+    _now = datetime.now(_tz())       # their time, not the server's
+    today = (f"{_now:%A, %B} {_now.day}, {_now.year}, "
+             f"{_now.strftime('%I:%M %p').lstrip('0')}")
     history = mem_recent(account_id, 16)
     msgs = [{"role": "system",
-             "content": TEXT_RULES + f"\n\nToday is {today}."
-             + _text_memory(account_id)}]
+             "content": TEXT_RULES + f"\n\nIt is now {today}."
+             + _jewish_today() + _text_memory(account_id)}]
     # The channel goes on what THEY said, never on what we said: with
     # "(sms) ..." on every past reply, the model began its own replies
     # with "(sms)" and the customer got it (8 Oct).
@@ -852,6 +910,7 @@ def text_brain(account_id: int, incoming: str, image_b64: str = ""):
 
     retried = False
     promised = False
+    sourced = False
     used_tools = []
     for _ in range(6):
         try:
@@ -884,19 +943,33 @@ def text_brain(account_id: int, incoming: str, image_b64: str = ""):
                     "then say it is done; or say plainly what you cannot "
                     "do.")})
                 continue
+            if SOURCE_CITED.search(said) and "find_out" not in used_tools \
+                    and not sourced:
+                sourced = True
+                msgs.append({"role": "assistant", "content": said})
+                msgs.append({"role": "system", "content": (
+                    "You named a page of Gemara from memory. Look it up "
+                    "NOW with find_out - the whole question, in their "
+                    "words - and give the place only if what you find "
+                    "names it, saying where it was found. If it does not, "
+                    "say you are not sure of the exact place.")})
+                continue
             heard = incoming.startswith("[Voice note")
             wrong = ((heard and CANT_HEAR.search(said))
                      or (image_b64 and CANT_SEE.search(said))
                      or CANT_SEND_PIC.search(said)
-                     or CANT_SCHEDULE.search(said))
+                     or CANT_SCHEDULE.search(said)
+                     or CANT_LEARN.search(said))
             if wrong and not retried:
                 retried = True
                 msgs.append({"role": "assistant", "content": said})
                 msgs.append({"role": "system", "content": (
                     "That is wrong. You DID hear the voice note - its words "
                     "are in their message - you CAN see pictures they send, "
-                    "you CAN send pictures with send_picture_of, and you CAN "
-                    "send a text later with send_text_later. Answer "
+                    "you CAN send pictures with send_picture_of, you CAN "
+                    "send a text later with send_text_later, and you CAN "
+                    "remember how they want things with remember_this. "
+                    "Answer "
                     "what they actually asked.")})
                 continue
             if NOT_ALLOWED in said and not is_blocked(incoming) \

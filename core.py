@@ -863,6 +863,16 @@ TEXT_TOOLS = [
         "parameters": {"type": "object", "properties": {
             "what": {"type": "string"}}, "required": ["what"]}}},
     {"type": "function", "function": {
+        "name": "jewish_calendar",
+        "description": "Jewish times and dates where they live: what = "
+                       "'shabbos' (candle lighting, havdalah, parsha), "
+                       "'zmanim', 'hebrew_date' or 'holidays'. place is a "
+                       "town or zip if not their home; date YYYY-MM-DD if "
+                       "not today.",
+        "parameters": {"type": "object", "properties": {
+            "what": {"type": "string"}, "place": {"type": "string"},
+            "date": {"type": "string"}}, "required": ["what"]}}},
+    {"type": "function", "function": {
         "name": "find_out",
         "description": "Find something out from the real pages - a model's "
                        "steps, hours, what exists - with the site named. "
@@ -982,6 +992,15 @@ Christmas, directions to a church, an email that mentions a holiday. A place,
 a date or a name is not a discussion.
 You are not a rav: relay what a source says and look things up, but for an
 actual shailah say they should ask their rav.
+The Hebrew date and this week's parsha are given below, from the Jewish
+calendar - use them, never your memory. Candle lighting, zmanim and Yom Tov
+dates: jewish_calendar. Never from memory.
+A source - a Gemara page, a pasuk, a Rambam, a Midrash: find_out FIRST,
+with the whole question ("which Gemara says two todah loaves were put on the
+roof as a sign on Erev Pesach"), and give the place only if what you found
+names it, saying where you found it. If it doesn't, say you aren't sure of
+the exact place. Never guess a page - a wrong page said with confidence is
+worse than "I'm not sure".
 If someone is in danger or a medical emergency, help them reach emergency
 services — that comes first.
 

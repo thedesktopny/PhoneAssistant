@@ -6133,6 +6133,95 @@ def _():
     assert "threading.Thread(target=_scheduled_text_loop" in src
 
 
+@check("by text, the parsha and Hebrew date come from the calendar, and a Gemara page is looked up")
+def _():
+    """9 Oct: 'Torah for this Shabbos' got Noach, then Lech-Lecha, on the
+    Friday of Bereishis; '25th of Tishrei' on the 28th; then Berachos 28b,
+    Yoma 39a and Menachos 11, none looked up, for a story in Pesachim."""
+    import everyday
+    real = everyday.jewish_calendar
+    everyday.jewish_calendar = lambda *a, **k: {
+        "today": {"spoken": "the 28th of Tishrei, 5787", "events": [],
+                  "parsha": "Bereshit"},
+        "tonight": {"spoken": "the 29th of Tishrei, 5787",
+                    "events": ["Shabbat Mevarchim Chodesh Cheshvan"],
+                    "parsha": "Bereshit"}}
+    try:
+        line = main._jewish_today()
+    finally:
+        everyday.jewish_calendar = real
+    assert "28th of Tishrei" in line and "Bereshit" in line, line
+    src = io.open("main.py", encoding="utf-8").read()
+    i = src.index("def text_brain(")
+    assert "_jewish_today()" in src[i:i + 2500], "the prompt lacks the date"
+    assert "datetime.now(_tz())" in src[i:i + 2500], "server time, not theirs"
+    names = {t["function"]["name"] for t in main.TEXT_TOOLS}
+    assert "jewish_calendar" in names
+    assert "never your memory" in main.TEXT_RULES
+
+    for bad in ("It is in Berachos 28b.", "See Yoma 39a.",
+                "This is in Menachos 11.", "Pesachim daf 13b"):
+        assert main.SOURCE_CITED.search(bad), bad
+    for fine in ("This Shabbos is Parshas Bereishis.",
+                 "Candle lighting is 6:12 PM."):
+        assert not main.SOURCE_CITED.search(fine), fine
+    import find as _find
+    for q in ("In which Gomorrah we found about some stages that was "
+              "outside of the temple", "Which Gemara says two todah loaves "
+              "were put on the roof", "where does it say to light candles"):
+        assert _find.needs_source(q), f"answered from memory: {q}"
+
+    seen, replies = [], iter([
+        {"content": "That is in Menachos 11."},
+        {"tool_calls": [{"id": "1", "function": {
+            "name": "find_out", "arguments": '{"question": "two loaves"}'}}]},
+        {"content": "The Mishnah in Pesachim 13b, as Sefaria shows it."}])
+
+    def fake_chat(messages, tools=None, model="", **k):
+        seen.append(list(messages))
+        return {"choices": [{"message": next(replies)}]}
+    undo = [everywhere("_openai_chat", fake_chat),
+            everywhere("OPENAI_API_KEY", "x"),
+            everywhere("_jewish_today", lambda: ""),
+            everywhere("mem_recent", lambda a, n: []),
+            everywhere("find_out", lambda q, a=None: {
+                "answer": "Pesachim 13b", "found": True,
+                "sources": [{"site": "sefaria.org"}]})]
+    try:
+        reply, _ = main.text_brain(1, "Where is the story of the two loaves "
+                                      "on the roof as a sign?")
+    finally:
+        for u in undo:
+            u()
+    assert reply.startswith("The Mishnah in Pesachim"), reply
+    assert any("from memory" in (m_.get("content") or "")
+               for m_ in seen[1] if isinstance(m_, dict)), \
+        "a page from memory was sent without being looked up"
+
+
+@check("'I can't learn' is never said, and a repeated request schedules one text")
+def _():
+    """9 Oct: 'learn to be human on text' got 'I can't learn or change how
+    I respond'; the same scheduling text twice was 'scheduled' twice."""
+    assert main._false_cant("I can't learn or change how I respond.")
+    assert not main._false_cant("I can't find that order.")
+    from datetime import datetime as _dt, timedelta as _td
+    when = (_dt.now() + _td(days=2)).strftime("%Y-%m-%dT07:45")
+    a = main._run_text_tool(1, "send_text_later",
+                            {"when": when, "message": "Good morning!"})
+    b = main._run_text_tool(1, "send_text_later",
+                            {"when": when, "message": "Good morning!"})
+    assert a.get("ok") and not a.get("already_scheduled"), a
+    assert b.get("already_scheduled"), b
+    db = main.Session()
+    n = db.query(main.ScheduledText).filter_by(state="waiting").count()
+    for r in db.query(main.ScheduledText).filter_by(state="waiting").all():
+        r.state = "sent"
+    db.commit()
+    db.close()
+    assert n == 1, f"{n} texts scheduled for one request"
+
+
 @check("a text is never called sent when it cannot be delivered")
 def _():
     """Call 76: a new customer with no email was told twice "I've sent you
