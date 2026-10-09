@@ -1456,6 +1456,31 @@ def test_contact(request: Request, account_id: int, name: str,
     return tool_find_contact(account_id, name, which)
 
 
+@app.get("/sms/setup")
+def sms_setup(request: Request):
+    """How texting is set up on the running system - provider, sending
+    number, whether texts are allowed out, where the provider must send
+    incoming texts - with no secret in it. Read this before touching the
+    provider's panel: it says what is already in place."""
+    require_auth(request)
+    digits = "".join(ch for ch in (SMS_FROM or "") if ch.isdigit())
+    return {
+        "provider": SMS_PROVIDER or "(none)",
+        "sending_number": digits or "(not set - SMS_FROM)",
+        "texts_go_out": bool(SMS_DELIVERS),
+        "texts_go_out_setting": "SMS_DELIVERS=1" if SMS_DELIVERS else
+                                "SMS_DELIVERS is off: nothing is sent, and "
+                                "the assistant never claims a text went",
+        "credentials_set": bool(
+            (SMS_PROVIDER == "bulkvs" and BULKVS_USER and BULKVS_PASS)
+            or (SMS_PROVIDER == "telnyx" and TELNYX_API_KEY)
+            or (SMS_PROVIDER == "twilio" and TWILIO_SID and TWILIO_TOKEN)),
+        "incoming_webhook_must_be": f"{PUBLIC_URL}/sms/incoming",
+        "webhook_method": "POST",
+        "delivery_receipts_also_to": f"{PUBLIC_URL}/sms/incoming",
+    }
+
+
 @app.get("/sms/status")
 def sms_status(request: Request, message_id: str):
     """Ask Telnyx what actually happened to a message."""

@@ -5385,6 +5385,27 @@ def _():
         "the tidy-up is defined but never run at start-up"
 
 
+@check("the office can read how texting is set up, without any secret")
+def _():
+    """David, with the BulkVS number panel open: 'is this what we
+    configured?' Nothing on our side said what was in place."""
+    from fastapi.testclient import TestClient
+    c = TestClient(main.app, raise_server_exceptions=False, base_url="https://t")
+    c.headers["Authorization"] = f"Bearer {main.SERVICE_TOKEN}" \
+        if getattr(main, "SERVICE_TOKEN", "") else ""
+    r = c.get("/sms/setup")
+    assert r.status_code == 200, r.text
+    d = r.json()
+    for key in ("provider", "sending_number", "texts_go_out",
+                "credentials_set", "incoming_webhook_must_be"):
+        assert key in d, f"missing {key}: {d}"
+    assert d["incoming_webhook_must_be"].endswith("/sms/incoming")
+    text = r.text.lower()
+    for secret in (main.BULKVS_PASS, main.TELNYX_API_KEY, main.TWILIO_TOKEN):
+        assert not secret or secret.lower() not in text, "a secret leaked"
+    assert "password" not in text and "token" not in text
+
+
 @check("a text is never called sent when it cannot be delivered")
 def _():
     """Call 76: a new customer with no email was told twice "I've sent you
