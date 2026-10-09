@@ -384,8 +384,39 @@ def _run_text_tool(account_id: int, name: str, args: dict):
 
 
 
-def text_brain(account_id: int, incoming: str) -> str:
-    """Answer one incoming text, using shared memory and the same tools."""
+def _text_turn(msg: str, image_b64: str = ""):
+    """A customer's text, with the picture they sent attached when there
+    is one - the same shape the browser uses for a screenshot."""
+    if not image_b64:
+        return {"role": "user", "content": msg}
+    return {"role": "user", "content": [
+        {"type": "text", "text": msg},
+        {"type": "image_url",
+         "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}]}
+
+
+def _fetch_picture(url: str) -> str:
+    """The picture behind a provider's media link, as base64 - or '' when
+    it cannot be fetched. Up to 8 MB, images only, one try."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            kind = (r.headers.get("Content-Type") or "").lower()
+            data = r.read(8 * 1024 * 1024)
+        if not data or ("image" not in kind and not data[:4] in
+                        (b"\xff\xd8\xff\xe0", b"\xff\xd8\xff\xe1",
+                         b"\x89PNG")):
+            return ""
+        return _b64.b64encode(data).decode()
+    except Exception as e:
+        emit("sms", "mms", f"could not fetch the picture: {str(e)[:120]}",
+             "warn")
+        return ""
+
+
+def text_brain(account_id: int, incoming: str, image_b64: str = "") -> str:
+    """Answer one incoming text, using shared memory and the same tools.
+    With image_b64, the customer sent a picture: the model sees it."""
     if is_blocked(incoming):
         return "I am not allowed to talk to you about this."
     if not OPENAI_API_KEY:
@@ -400,7 +431,7 @@ def text_brain(account_id: int, incoming: str) -> str:
             "role": "user" if h["who"] == "user" else "assistant",
             "content": f"({h['channel']}) {h['text']}",
         })
-    msgs.append({"role": "user", "content": incoming})
+    msgs.append(_text_turn(incoming, image_b64))
 
     for _ in range(4):
         try:
@@ -1616,15 +1647,22 @@ async def sms_incoming(request: Request):
     if not frm:
         return {"ok": False, "error": "no sender"}
 
-    # MMS: BulkVS blanks the text and sends media instead
-    if media and not text.strip():
+    # A picture (MMS). BulkVS blanks the text and sends media links; the
+    # first picture is fetched and shown to the model with whatever words
+    # came with it. Refusing pictures was a limit of ours, not a rule
+    # (David, 8 Oct 2026).
+    picture = ""
+    if media:
+        urls = media if isinstance(media, list) else [media]
+        picture = _fetch_picture(str(urls[0])) if urls and urls[0] else ""
+    if media and not picture and not text.strip():
         acct = account_for_number(frm)
         if acct:
-            tool_send_sms(frm, "I can't open pictures yet — "
-                               "send it as text and I'll help.")
-        return {"ok": True, "mms": True}
+            tool_send_sms(frm, "I couldn't open that picture. Could you "
+                               "send it again, or tell me what it says?")
+        return {"ok": True, "mms": True, "opened": False}
 
-    if not text.strip():
+    if not text.strip() and not picture:
         return {"ok": False, "error": "empty message"}
 
     acct = account_for_number(frm)
@@ -1633,10 +1671,13 @@ async def sms_incoming(request: Request):
                            "Please contact the office.")
         return {"ok": True, "known": False}
 
-    mem_add(acct.id, "sms", "user", text)
-    reply = text_brain(acct.id, text)
+    said = text.strip() or ("I sent you this picture. Tell me what it "
+                            "shows and help me with it.")
+    kept = ("(sent a picture) " + text.strip()).strip() if picture else text
+    mem_add(acct.id, "sms", "user", kept)
+    reply = text_brain(acct.id, said, image_b64=picture)
     mem_add(acct.id, "sms", "assistant", reply)
-    write_text_note(acct.id, text, reply)
+    write_text_note(acct.id, kept, reply)
     tool_send_sms(frm, reply)
     return {"ok": True}
 

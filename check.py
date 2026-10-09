@@ -4970,7 +4970,7 @@ def _():
     i = src.index('@app.post("/calls/end")')
     assert "background.add_task(write_call_note, call_id)" in src[i:i + 1500]
     i = src.index("async def sms_incoming(")
-    assert "write_text_note(acct.id, text, reply)" in src[i:i + 5000]
+    assert "write_text_note(acct.id, kept, reply)" in src[i:i + 6000]
     assert "/notes" in {r.path for r in main.app.routes}
 
 
@@ -5404,6 +5404,59 @@ def _():
     for secret in (main.BULKVS_PASS, main.TELNYX_API_KEY, main.TWILIO_TOKEN):
         assert not secret or secret.lower() not in text, "a secret leaked"
     assert "password" not in text and "token" not in text
+
+
+@check("a picture sent by text is looked at and answered")
+def _():
+    """David, 8 Oct: 'why is it not allowed to send pictures?' - it was
+    our own limit: an MMS got 'I can't open pictures yet'. The picture is
+    fetched and shown to the model with the words that came with it."""
+    from fastapi.testclient import TestClient
+    turn = main._text_turn("what is this", "QUJD")
+    assert turn["content"][1]["image_url"]["url"].startswith(
+        "data:image/jpeg;base64,QUJD")
+    assert main._text_turn("hi") == {"role": "user", "content": "hi"}
+    seen, sent = {}, []
+
+    class Acct:
+        id = 1
+
+    def fake_brain(account_id, incoming, image_b64=""):
+        seen["incoming"], seen["image"] = incoming, image_b64
+        return "It is a receipt for $12.40 from the pharmacy."
+    undo = [everywhere("_fetch_picture", lambda url: "QUJD"),
+            everywhere("text_brain", fake_brain),
+            everywhere("tool_send_sms",
+                       lambda to, msg: sent.append((to, msg)) or {"sent": True}),
+            everywhere("account_for_number", lambda n: Acct())]
+    c = TestClient(main.app, raise_server_exceptions=False, base_url="https://t")
+    try:
+        r = c.post("/sms/incoming", json={
+            "To": ["18459831774"], "From": "15550100777", "Message": "",
+            "MediaURLs": ["https://media.example/pic.jpg"]})
+        assert r.status_code == 200 and r.json().get("mms") is None or \
+            r.json().get("ok"), r.text
+        assert seen.get("image") == "QUJD", "the picture never reached the model"
+        assert "picture" in seen.get("incoming", "").lower()
+        assert sent and "receipt" in sent[-1][1], sent
+        # a picture that cannot be fetched is said so, not blamed on rules
+        sent.clear()
+        undo.append(everywhere("_fetch_picture", lambda url: ""))
+        r = c.post("/sms/incoming", json={
+            "To": ["18459831774"], "From": "15550100777", "Message": "",
+            "MediaURLs": ["https://media.example/pic.jpg"]})
+        assert sent and "couldn't open that picture" in sent[-1][1], sent
+    finally:
+        for u in undo:
+            u()
+    src = io.open("main.py", encoding="utf-8").read()
+    assert "can't open pictures yet" not in src
+    db = main.Session()
+    rows = (db.query(main.Memory).filter_by(account_id=1, channel="sms")
+              .order_by(main.Memory.id.desc()).limit(2).all())
+    db.close()
+    assert any("(sent a picture)" in (m.text or "") for m in rows), \
+        "the record does not say a picture was sent"
 
 
 @check("a text is never called sent when it cannot be delivered")
