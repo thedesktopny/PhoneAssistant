@@ -363,12 +363,19 @@ def _run_text_tool(account_id: int, name: str, args: dict):
         if name == "find_best_price":
             out = shopping_prices(args.get("item", ""),
                                   shop=args.get("shop", "") or "")
+            # A shop named: its own listing first, so the picture sent is
+            # that shop's photo of the thing (David: "I want the pictures
+            # from Amazon, not your made-up pictures").
+            offers = list(out.get("at_shop") or []) + [
+                o for o in (out.get("offers") or [])
+                if o not in (out.get("at_shop") or [])]
             return {"answer": out.get("answer", ""), "exact": out.get("exact"),
+                    "shop_asked": out.get("shop", ""),
                     "offers": [{"shop": o.get("shop"), "price": o.get("price"),
                                 "title": o.get("title"),
                                 "delivery": o.get("delivery"),
                                 "image": o.get("image", "")}
-                               for o in (out.get("offers") or [])[:4]],
+                               for o in offers[:4]],
                     "blocked": out.get("blocked", False)}
         if name == "send_picture_of":
             what = args.get("what", "")
@@ -493,6 +500,35 @@ CANT_SEND_PIC = _re_scrub.compile(
 def _false_cant(said: str) -> bool:
     return bool(CANT_HEAR.search(said or "") or CANT_SEE.search(said or "")
                 or CANT_SEND_PIC.search(said or ""))
+
+
+def _text_memory(account_id: int) -> str:
+    """The same memory a call starts with: the notes of the last calls and
+    texts, and orders written down but not placed. By text, "the labels"
+    meant nothing - and Amazon pictures of something else came back."""
+    out = ""
+    try:
+        from advisor import notes_block
+        notes = notes_block(account_id, 5)
+        if notes:
+            out += "\n\nNOTES OF THEIR LAST CALLS AND TEXTS:\n" + notes
+    except Exception:
+        pass
+    try:
+        db = Session()
+        rows = (db.query(Order).filter_by(account_id=account_id)
+                  .filter(Order.state.in_(["draft", "preparing", "ready",
+                                           "check"]))
+                  .order_by(Order.id.desc()).limit(3).all())
+        db.close()
+        if rows:
+            out += ("\n\nUNFINISHED ORDERS (real records):\n" + "\n".join(
+                f"- {o.quantity or 1} x {o.item} on {o.site}"
+                + (f", read back at {o.final_total}" if o.final_total
+                   else "") for o in rows))
+    except Exception:
+        pass
+    return out
 
 
 def _text_turn(msg: str, image_b64: str = ""):
@@ -702,7 +738,8 @@ def text_brain(account_id: int, incoming: str, image_b64: str = ""):
     today = f"{_now:%A, %B} {_now.day}, {_now.year}"
     history = mem_recent(account_id, 16)
     msgs = [{"role": "system",
-             "content": TEXT_RULES + f"\n\nToday is {today}."}]
+             "content": TEXT_RULES + f"\n\nToday is {today}."
+             + _text_memory(account_id)}]
     # The channel goes on what THEY said, never on what we said: with
     # "(sms) ..." on every past reply, the model began its own replies
     # with "(sms)" and the customer got it (8 Oct).

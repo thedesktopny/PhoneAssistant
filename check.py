@@ -5902,6 +5902,42 @@ def _():
     assert past == ["hello"], f"an old 'can't listen' was replayed: {past}"
 
 
+@check("by text, 'the labels from Amazon' means the order, and the picture is Amazon's")
+def _():
+    """9 Oct: 'I want the pictures from Amazon, not your made-up pictures'.
+    The text side had no notes and no orders, so 'the labels' meant
+    nothing, and a product picture came from a general image search."""
+    db = main.Session()
+    db.add(main.Order(account_id=1, site="amazon", item="MUNBYN 4x6 labels "
+                      "880 pcs", quantity=1, state="ready", final_total="$39.16"))
+    db.commit()
+    db.close()
+    mem = main._text_memory(1)
+    assert "UNFINISHED ORDERS" in mem and "MUNBYN" in mem and "$39.16" in mem
+    seen = {}
+
+    def fake_prices(item, limit=8, shop=""):
+        return {"answer": "x", "exact": True, "shop": shop,
+                "offers": [{"shop": "LabelValue", "price": "$0.20",
+                            "title": "labels", "image": "https://i/lv.jpg"},
+                           {"shop": "Amazon", "price": "$35.97",
+                            "title": "MUNBYN", "image": "https://i/amz.jpg"}],
+                "at_shop": [{"shop": "Amazon", "price": "$35.97",
+                             "title": "MUNBYN", "image": "https://i/amz.jpg"}]}
+    undo = everywhere("shopping_prices", fake_prices)
+    try:
+        out = main._run_text_tool(1, "find_best_price",
+                                  {"item": "MUNBYN 4x6 labels", "shop": "Amazon"})
+    finally:
+        undo()
+    assert out["offers"][0]["shop"] == "Amazon" and \
+        out["offers"][0]["image"] == "https://i/amz.jpg", out["offers"]
+    assert "shop's own" in main.TEXT_RULES
+    src = io.open("main.py", encoding="utf-8").read()
+    i = src.index("def text_brain(")
+    assert "_text_memory(account_id)" in src[i:i + 2500]
+
+
 @check("a text is never called sent when it cannot be delivered")
 def _():
     """Call 76: a new customer with no email was told twice "I've sent you
