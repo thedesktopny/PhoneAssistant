@@ -5608,7 +5608,7 @@ def _():
         id = 1
     undo = [everywhere("account_for_number", lambda n: Acct()),
             everywhere("_answer_text",
-                       lambda a, f, t, p, *rest: calls.append((f, t)))]
+                       lambda a, f, t, p, *rest, **kw: calls.append((f, t)))]
     main._SEEN_TEXTS.clear()
     c = TestClient(main.app, raise_server_exceptions=False, base_url="https://t")
     try:
@@ -6053,7 +6053,7 @@ def _():
     """9 Oct: 'I mean oven' was answered five seconds before the oven
     photo it was about arrived - picture messages travel slower."""
     answered = []
-    undo = [everywhere("_answer_text", lambda a, f, t, p, v="":
+    undo = [everywhere("_answer_text", lambda a, f, t, p, v="", **kw:
                        answered.append((t, p, v)))]
     main._GATHER.clear()
     try:
@@ -6090,6 +6090,8 @@ def _():
     i = src.index("def text_brain(")
     assert "model=MODEL_BROWSER if image_b64" in src[i:i + 9000]
     assert "check what is ALREADY in it" in main.TEXT_RULES
+    i = src.index("def _answer_after_pause(")
+    assert "fresh=bool(pictures)" in src[i:i + 2000],         "a kept picture is recorded as sent again"
 
 
 @check("'text me at 7:30' is scheduled, kept, and sent when due")

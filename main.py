@@ -2189,11 +2189,11 @@ def _answer_after_pause(frm: str, stamp: float, wait: float = None):
              "info", account_id)
     _answer_text(account_id, frm, text,
                  _picture_for(account_id, pictures[0] if pictures else ""),
-                 " ".join(voices))
+                 " ".join(voices), fresh=bool(pictures))
 
 
 def _answer_text(account_id: int, frm: str, text: str, picture: str,
-                 voice_said: str = ""):
+                 voice_said: str = "", fresh: bool = True):
     """The reply to one incoming text - after the provider has its 200."""
     try:
         said = text.strip() or ("I sent you this picture. Tell me what it "
@@ -2203,8 +2203,10 @@ def _answer_text(account_id: int, frm: str, text: str, picture: str,
             # and repeat them back (9 Oct).
             said = ("[Voice note, already transcribed - answer it as if "
                     "they had typed it:] " + said)
-        kept = (("(sent a picture) " + text.strip()).strip() if picture
-                else text)
+        # only a picture sent NOW is recorded as sent; one kept from a few
+        # minutes ago is still shown to the model, but was not sent again
+        kept = (("(sent a picture) " + text.strip()).strip()
+                if picture and fresh else text)
         mem_add(account_id, "sms", "user", kept)
         out = text_brain(account_id, said, image_b64=picture)
         reply, pictures = out if isinstance(out, tuple) else (out, [])
