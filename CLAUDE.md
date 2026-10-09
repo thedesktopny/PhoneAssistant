@@ -44,6 +44,11 @@ Other useful reads: `/usage/summary?days=7`, `/browser/where`,
 - `scenarios.py` — replays real problems from real calls against the LIVE
   backend. `check.py` proves the code holds together; this proves the
   running system behaves. Needs `SERVICE_TOKEN` in the environment.
+- `textbench.py` — which model answers TEXTS best: real texts that went
+  wrong, replayed through `/text/try` (nothing sent, saved or scheduled),
+  scored by plain rules, with cost. `python textbench.py gpt-5.6-luna:none
+  x3`. Run it before changing `MODEL_TEXT`, and add a case for every text
+  that goes wrong.
 - `requirements.txt`, `Procfile`.
 
 ## Rules that exist because something broke
@@ -121,6 +126,14 @@ Railway auto-deploys both services from `main` on push.
   real question callers had asked: 3-7s each instead of 4-13 minutes,
   no walls, site named. A copied page can be days old - a listed price is
   "about $X, as listed", never today's price.
+
+- Texts run on `gpt-5.6-luna` with thinking "none" (9 Oct 2026, chosen on
+  textbench: 13/13 against 10/13 for gpt-4o-mini, ~$1.20 per 1,000 texts).
+  The 5.6 models refuse tools in chat completions unless effort is "none".
+  Facts we HAVE are checked in code before a text goes out: the parsha and
+  Hebrew date against the calendar (`calendar_mistake`). Torah sources:
+  `find.py` has a stronger model guess places, then reads each on Sefaria;
+  a place is said only if its text bears it out.
 
 ## When David reports a failed call
 1. Pull `/events` for the window he describes, and `/jobs` and `/calls/<id>`.
