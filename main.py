@@ -87,11 +87,11 @@ def _digits_e164(number: str) -> str:
 
 # Pictures we send by text, served from here. A link to someone else's
 # website was accepted by BulkVS and never arrived (8 Oct): sites refuse a
-# carrier's download, or serve files too big for a picture text. In memory
-# for an hour - long enough for the carrier to fetch it once.
-_MEDIA = {}
+# carrier's download, or serve files too big for a picture text. Kept in
+# the database for a week - in memory, a restart lost them before the
+# phone had downloaded them.
 MEDIA_MAX_BYTES = 600 * 1024
-MEDIA_KEEP = 3600
+MEDIA_KEEP = 7 * 86400
 
 
 def _host_picture(url: str) -> str:
@@ -118,11 +118,15 @@ def _host_picture(url: str) -> str:
         emit("sms", "mms", f"could not prepare a picture: {str(e)[:120]}",
              "warn")
         return ""
-    now = time.time()
-    for k in [k for k, v in _MEDIA.items() if now - v[2] > MEDIA_KEEP]:
-        _MEDIA.pop(k, None)
     token = secrets.token_urlsafe(18)
-    _MEDIA[token] = (data, "image/jpeg", now)
+    db = Session()
+    try:
+        db.query(Media).filter(Media.at < datetime.utcnow() - timedelta(
+            seconds=MEDIA_KEEP)).delete()
+        db.add(Media(token=token, kind="image/jpeg", data=data))
+        db.commit()
+    finally:
+        db.close()
     return f"{PUBLIC_URL}/media/{token}.jpg"
 
 
@@ -469,6 +473,9 @@ def _run_text_tool(account_id: int, name: str, args: dict):
 
 
 
+NOT_ALLOWED = "I am not allowed to talk to you about this"
+
+
 def _text_turn(msg: str, image_b64: str = ""):
     """A customer's text, with the picture they sent attached when there
     is one - the same shape the browser uses for a screenshot."""
@@ -532,7 +539,8 @@ def text_brain(account_id: int, incoming: str, image_b64: str = ""):
         })
     msgs.append(_text_turn(incoming, image_b64))
 
-    for _ in range(4):
+    retried = False
+    for _ in range(5):
         try:
             data = _openai_chat(msgs, TEXT_TOOLS, model=MODEL_TEXT,
                                 account_id=account_id)
@@ -544,6 +552,19 @@ def text_brain(account_id: int, incoming: str, image_b64: str = ""):
         if not calls:
             said = (choice.get("content") or "").strip()
             said = _re_scrub.sub(r"^\s*\((sms|voice)\)\s*", "", said)
+            # The not-allowed line is for a blocked subject, never an
+            # all-purpose "I can't". "Can you send me any picture" and
+            # "now from you" (a picture of the assistant) both got it, and
+            # neither touches one. Sent back once to answer plainly.
+            if NOT_ALLOWED in said and not is_blocked(incoming) \
+                    and not retried:
+                retried = True
+                msgs.append({"role": "assistant", "content": said})
+                msgs.append({"role": "system", "content": (
+                    "That subject is NOT blocked - the not-allowed line was "
+                    "wrong. Answer plainly. If you cannot do it, say so in "
+                    "a few words and what you can do instead.")})
+                continue
             return said[:600], pictures[:2]
 
         msgs.append(choice)
@@ -1599,10 +1620,12 @@ def media_get(name: str):
     """A picture we are sending by text, for the carrier to fetch. The
     random name is the key; it lasts an hour."""
     token = name.rsplit(".", 1)[0]
-    hit = _MEDIA.get(token)
-    if not hit or time.time() - hit[2] > MEDIA_KEEP:
+    db = Session()
+    row = db.query(Media).filter_by(token=token).first()
+    db.close()
+    if not row or not row.data:
         raise HTTPException(404, "Gone.")
-    data, kind, _ = hit
+    data, kind = bytes(row.data), row.kind or "image/jpeg"
     return Response(content=data, media_type=kind,
                     headers={"Content-Length": str(len(data)),
                              "Cache-Control": "public, max-age=3600"})

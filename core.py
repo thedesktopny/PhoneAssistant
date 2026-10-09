@@ -29,7 +29,7 @@ from pydantic import BaseModel
 from cryptography.fernet import Fernet
 from sqlalchemy import (create_engine, Column, Integer, String, DateTime,
                         Float,
-                        Text, ForeignKey)
+                        Text, ForeignKey, LargeBinary)
 from sqlalchemy.orm import declarative_base, sessionmaker
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
@@ -200,6 +200,18 @@ class CallTurn(Base):
     text = Column(Text)
     tool = Column(String(60), default="")
     latency_ms = Column(Integer, default=0)
+
+
+class Media(Base):
+    """A picture we sent by text, for the phone to download. In memory it
+    was lost on every restart - a deploy a minute after sending, and the
+    customer's phone could not open the picture (8 Oct)."""
+    __tablename__ = "media"
+    id = Column(Integer, primary_key=True)
+    token = Column(String(40), unique=True, index=True)
+    kind = Column(String(40), default="image/jpeg")
+    data = Column(LargeBinary)
+    at = Column(DateTime, default=datetime.utcnow)
 
 
 class CallNote(Base):
@@ -930,7 +942,8 @@ material, addiction, humor, culture, dating, underwear, nudity, fertility,
 puberty, marriage, relationships, anything arousing, news, sports,
 entertainment, personal feelings, jokes. Reply to any of these with exactly:
 "I am not allowed to talk to you about this." Nothing more. Never explain
-the rules.
+the rules. That line is ONLY for those subjects - never for something you
+simply cannot do; then say plainly that you can't, and what you can.
 
 Jewish religious subjects ARE allowed - Shabbos and Yom Tov, kashrus, zmanim,
 davening, brochos, the parsha, minhagim. This service is for Jewish people.

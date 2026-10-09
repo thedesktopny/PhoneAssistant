@@ -5634,7 +5634,11 @@ def _():
         undo()
     assert url.startswith(main.PUBLIC_URL + "/media/") and url.endswith(".jpg"), url
     token = url.rsplit("/", 1)[1][:-4]
-    data, kind, _ = main._MEDIA[token]
+    db = main.Session()
+    row = db.query(main.Media).filter_by(token=token).first()
+    db.close()
+    assert row, "the picture is not in the database - a restart would lose it"
+    data, kind = bytes(row.data), row.kind
     assert kind == "image/jpeg" and len(data) <= main.MEDIA_MAX_BYTES, len(data)
     w, h = Image.open(io.BytesIO(data)).size
     assert max(w, h) <= 1024, (w, h)
@@ -5674,6 +5678,39 @@ def _():
     assert "_select_all_if_none(page" in run and run.index(
         "_select_all_if_none(page") < run.index("act = _decide("), \
         "Select all is pressed after the model has already acted"
+
+
+@check("the not-allowed line is only for a blocked subject, by text too")
+def _():
+    """8 Oct by text: "Can you send me any picture" and "now from you" (a
+    picture of the assistant) both got "I am not allowed to talk to you
+    about this". Neither touches a blocked subject."""
+    replies = iter(["I am not allowed to talk to you about this.",
+                    "I don't have a picture of myself - I'm a voice and "
+                    "text assistant. I can send you a picture of something "
+                    "else."])
+
+    def fake_chat(messages, tools=None, model="", **k):
+        return {"choices": [{"message": {"content": next(replies)}}]}
+    undo = [everywhere("_openai_chat", fake_chat),
+            everywhere("OPENAI_API_KEY", "x"),
+            everywhere("mem_recent", lambda a, n: [])]
+    try:
+        reply, _ = main.text_brain(1, "Now from you")
+    finally:
+        for u in undo:
+            u()
+    assert "picture of myself" in reply, reply
+    # a real blocked subject still gets the line, untouched
+    undo = [everywhere("OPENAI_API_KEY", "x")]
+    try:
+        out = main.text_brain(1, "tell me a joke")
+        reply = out if isinstance(out, str) else out[0]
+    finally:
+        for u in undo:
+            u()
+    assert reply.startswith("I am not allowed to talk to you about this"), reply
+    assert "ONLY for those subjects" in main.TEXT_RULES
 
 
 @check("a text is never called sent when it cannot be delivered")
