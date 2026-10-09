@@ -331,6 +331,42 @@ def shopping_prices(item: str, limit: int = 8, shop: str = "") -> dict:
             "live_sources": live_sources()}
 
 
+def _serper_images(q: str) -> dict:
+    """An image search. Its own function so a check can stand in."""
+    payload = json.dumps({"q": q, "num": 6}).encode()
+    req = urllib.request.Request(
+        "https://google.serper.dev/images", data=payload,
+        headers={"X-API-KEY": SERPER_API_KEY,
+                 "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read().decode())
+
+
+def picture_of(what: str, limit: int = 2) -> list:
+    """Public picture links for "send me a picture of a forest" - sent
+    with a text reply. Nothing for a blocked subject, nothing without a
+    search key. Only plain image files the carriers will carry."""
+    what = " ".join((what or "").split())[:120]
+    if not what or is_blocked(what) or not SERPER_API_KEY:
+        return []
+    try:
+        d = _serper_images(what)
+    except Exception:
+        return []
+    out = []
+    for x in d.get("images") or []:
+        url = (x.get("imageUrl") or "").strip()
+        low = url.lower().split("?")[0]
+        if not url.startswith("https://"):
+            continue
+        if not low.endswith((".jpg", ".jpeg", ".png", ".gif")):
+            continue
+        out.append(url[:400])
+        if len(out) >= limit:
+            break
+    return out
+
+
 def tool_web_search(query: str, near: str = "") -> dict:
     """Google-backed web search with a content filter."""
     if is_blocked(query):

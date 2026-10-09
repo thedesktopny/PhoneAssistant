@@ -5513,6 +5513,44 @@ def _():
         "the picture is found but never sent"
 
 
+@check("'send me a picture of a forest' sends one, and every text out is logged")
+def _():
+    """David, by text: "Can you send me any picture" got "I am not allowed
+    to talk to you about this" and "Send me a pic from a Forest" got "I
+    can't send pictures directly". Neither subject is blocked; the model
+    had no way to send one. And a text that went out left no line in the
+    live log, so nobody could see what was said."""
+    import search
+    made = {"images": [{"imageUrl": "https://pics.example/forest.jpg"},
+                       {"imageUrl": "http://insecure.example/x.jpg"},
+                       {"imageUrl": "https://pics.example/page.html"},
+                       {"imageUrl": "https://pics.example/trees.png"}]}
+    undo = [everywhere("_serper_images", lambda q: made),
+            everywhere("SERPER_API_KEY", "k")]
+    try:
+        got = search.picture_of("a forest")
+        assert got == ["https://pics.example/forest.jpg",
+                       "https://pics.example/trees.png"], got
+        assert search.picture_of("nudity") == [], "a blocked subject got a picture"
+        out = main._run_text_tool(1, "send_picture_of", {"what": "a forest"})
+    finally:
+        for u in undo:
+            u()
+    assert out["pictures"] and "sent with your reply" in out["note"], out
+    names = {t["function"]["name"] for t in main.TEXT_TOOLS}
+    assert "send_picture_of" in names
+    assert "send_picture_of" in main.TEXT_RULES and \
+        "never a blocked subject by" in main.TEXT_RULES
+    src = io.open("main.py", encoding="utf-8").read()
+    i = src.index("def text_brain(")
+    assert 'result.get("pictures")' in src[i:i + 4000], \
+        "a picture found is never attached to the reply"
+    i = src.index("async def sms_incoming(")
+    body = src[i:i + 8000]
+    assert 'emit("sms", frm[-4:]' in body and "NOT sent" in body, \
+        "a text going out leaves no line in the live log"
+
+
 @check("a text is never called sent when it cannot be delivered")
 def _():
     """Call 76: a new customer with no email was told twice "I've sent you

@@ -56,7 +56,7 @@ from browser import (_order_set, PREPARE_GOAL, BROWSE_SYSTEM, BUY_BUTTONS, CHECK
 import everyday
 import signup
 from browser import (site_url, _JOB_STARTED, _LAST_LIMIT_FLAG, _LAST_PROXY_FLAG, _PENDING, _SNAPSHOT_JS, _TASK_CACHE, _action_index, _action_sig, _agent_fallback, _as_placeholder, _bb_connect_url, _bb_session, _body_mark, _decide, _do_site_login, _find_recipe, _first_json, _flag_account_limit, _flag_proxy_fallback, _flag_proxy_unavailable, _forget_context, _get_context, _going_in_circles, _handle, _is_nav_error, _job_set, _match_element, _new_browserbase_context, _ob_set, _open_with_session, _page_snapshot, _queue_lock, _recipe_result, _recipe_value, _record_request, _replay_recipe, _run_browse, _run_checkout, _run_reset, _run_signin, _run_site_login, _run_site_orders, _run_site_search, _save_context, _save_recipe, _shape, _slots, _stuck_note, _task_label, _task_shape, _user_turn, _waiting, _where_for_account, _where_for_phone)
-from search import (shopping_prices, tool_web_search)
+from search import (shopping_prices, tool_web_search, picture_of)
 from search import (_money, _search_serper, _search_tavily, _serper_shopping)
 # The foundations: configuration, the database and its tables, the
 # scrubber, the live log, the vault, and the clock helpers. Imported
@@ -315,6 +315,14 @@ def _run_text_tool(account_id: int, name: str, args: dict):
                                 "image": o.get("image", "")}
                                for o in (out.get("offers") or [])[:4]],
                     "blocked": out.get("blocked", False)}
+        if name == "send_picture_of":
+            what = args.get("what", "")
+            if is_blocked(what):
+                return {"blocked": True, "pictures": []}
+            pics = picture_of(what)
+            return {"of": what, "pictures": pics,
+                    "note": ("sent with your reply" if pics else
+                             "no picture could be found - say so")}
         if name == "find_out":
             d = find_out(args.get("question", ""), account_id)
             return {"answer": d.get("answer", ""), "found": d.get("found"),
@@ -487,6 +495,8 @@ def text_brain(account_id: int, incoming: str, image_b64: str = ""):
             if isinstance(result, dict) and result.get("offers"):
                 pictures += [o["image"] for o in result["offers"][:2]
                              if o.get("image")]
+            if isinstance(result, dict) and result.get("pictures"):
+                pictures += list(result["pictures"])[:2]
             if isinstance(result, dict) and result.get("error"):
                 db = Session()
                 db.add(Followup(account_id=account_id, reason=fn[:60],
@@ -1715,7 +1725,14 @@ async def sms_incoming(request: Request):
     shown = reply + (" [picture sent]" if pictures else "")
     mem_add(acct.id, "sms", "assistant", shown)
     write_text_note(acct.id, kept, shown)
-    tool_send_sms(frm, reply, pictures)
+    went = tool_send_sms(frm, reply, pictures)
+    # every text that goes out, or fails to, is in the live log
+    emit("sms", frm[-4:],
+         (f"sent: {reply[:100]}" + (f" (+{len(pictures)} picture(s))"
+                                    if pictures else ""))
+         if went.get("sent") else
+         f"NOT sent: {went.get('error', '')} {went.get('detail', '')[:120]}",
+         "info" if went.get("sent") else "error", acct.id)
     return {"ok": True}
 
 

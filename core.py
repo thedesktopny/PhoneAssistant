@@ -816,6 +816,13 @@ TEXT_TOOLS = [
             "item": {"type": "string"}, "shop": {"type": "string"}},
             "required": ["item"]}}},
     {"type": "function", "function": {
+        "name": "send_picture_of",
+        "description": "Send them a picture of something: a place, a "
+                       "thing, an animal, what an item looks like. The "
+                       "picture goes with your reply.",
+        "parameters": {"type": "object", "properties": {
+            "what": {"type": "string"}}, "required": ["what"]}}},
+    {"type": "function", "function": {
         "name": "find_out",
         "description": "Find something out from the real pages - a model's "
                        "steps, hours, what exists - with the site named. "
@@ -947,6 +954,10 @@ SHOPPING AND FINDING OUT
 - Anything exact - a model number, hours, "which ones have X", how to do
   something on a particular appliance: find_out. Say which site it came
   from. Never guess a step, a price or a part number.
+- A picture of something - "send me a picture of a forest", "what does
+  a sukkah look like": send_picture_of. It goes out with your reply; say
+  "picture attached". Asking for a picture is never a blocked subject by
+  itself - only what the picture is of can be.
 - Placing an order is done by phone, not by text yet: say so.
 
 Before sending an email or booking anything, state what you're about to do
