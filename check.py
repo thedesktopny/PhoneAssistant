@@ -5753,7 +5753,7 @@ def _():
     try:
         pic, heard = main._open_attachments(
             ["https://m/pic.png", "https://m/voice.amr", "https://m/locked"],
-            "+13476752334")
+            "+13476752334")[:2]
     finally:
         for u in undo:
             u()
@@ -5959,7 +5959,7 @@ def _():
     undo = [everywhere("account_for_number", lambda n: Acct()),
             everywhere("_answer_text", lambda *a, **k: calls.append(1)),
             everywhere("_open_attachments",
-                       lambda urls, frm: opened.append(1) or ("", ["hi"]))]
+                       lambda urls, frm: opened.append(1) or ("", ["hi"], []))]
     main._SEEN_TEXTS.clear()
     cl = TestClient(main.app, raise_server_exceptions=False, base_url="https://t")
     try:
@@ -6020,6 +6020,29 @@ def _():
     names = {t["function"]["name"] for t in main.TEXT_TOOLS}
     assert "remember_this" in names
     assert "remember_this" in main.TEXT_RULES
+
+
+@check("words typed with a picture are read as what they wrote")
+def _():
+    """9 Oct: a picture with a question typed under it - the question came
+    as a text/plain attachment, logged 'not a picture or voice note', and
+    the oven was described with the question never seen."""
+    def fake_fetch(url):
+        if url.endswith(".txt"):
+            return b"how do I clean the lower oven?", "text/plain", ""
+        return _real_png((600, 400)), "image/png", ""
+    undo = [everywhere("_fetch_media", fake_fetch)]
+    try:
+        got = main._open_attachments(["https://m/pic.png", "https://m/t.txt"],
+                                     "+15550100999")
+    finally:
+        for u in undo:
+            u()
+    assert got[0], "the picture was lost"
+    assert got[2] == ["how do I clean the lower oven?"], got[2]
+    src = io.open("main.py", encoding="utf-8").read()
+    i = src.index("async def sms_incoming(")
+    assert "typed = got[2]" in src[i:i + 7000]
 
 
 @check("a text is never called sent when it cannot be delivered")

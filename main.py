@@ -737,7 +737,7 @@ def _transcribe(data: bytes, name: str) -> str:
 def _open_attachments(urls: list, frm: str):
     """What came with a text: the first picture as base64, any voice notes
     as words, and a line for the live log about each attachment."""
-    picture, heard, seen = "", [], []
+    picture, heard, seen, typed = "", [], [], []
     for url in [str(u) for u in urls if u][:3]:
         data, kind, why = _fetch_media(url)
         host = (url.split("/")[2] if url.count("/") >= 2 else "?")
@@ -765,12 +765,21 @@ def _open_attachments(urls: list, frm: str):
                         + (", heard" if words else ", could NOT be heard"))
         elif "smil" in kind or url.lower().split("?")[0].endswith(".smil"):
             continue                # the MMS layout file - not content
+        elif kind.startswith("text/plain") or url.lower().split(
+                "?")[0].endswith(".txt"):
+            # What they typed WITH the picture: BulkVS sends it as a small
+            # text file, which was logged as "not a picture or voice note"
+            # and never read - the oven was described, the question unseen.
+            words = data.decode("utf-8", "ignore").strip()
+            if words:
+                typed.append(words[:1500])
+                seen.append(f"their words ({len(words)} characters)")
         else:
             seen.append(f"{kind or 'unknown type'} {len(data) // 1024} KB, "
                         f"not a picture or voice note")
     emit("sms", frm[-4:], "attachments: " + ("; ".join(seen) or "none"),
          "info" if (picture or heard) else "warn")
-    return picture, heard
+    return picture, heard, typed
 
 
 def text_brain(account_id: int, incoming: str, image_b64: str = ""):
@@ -2161,7 +2170,11 @@ async def sms_incoming(request: Request, background: BackgroundTasks):
     picture, heard, voice_said = "", [], ""
     if media:
         urls = media if isinstance(media, list) else [media]
-        picture, heard = _open_attachments(urls, frm)
+        got = _open_attachments(urls, frm)
+        picture, heard = got[0], got[1]
+        typed = got[2] if len(got) > 2 else []
+        if typed:
+            text = (text.strip() + " " + " ".join(typed)).strip()
     if heard:
         # Said as what they SAID. Labelled "(voice note)", the model
         # answered "I can't listen to voice notes" with the words in front
