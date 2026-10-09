@@ -406,6 +406,23 @@ def _run_text_tool(account_id: int, name: str, args: dict):
             return tool_create_event(account_id, args["title"],
                                      args["start_iso"],
                                      args.get("minutes", 60))
+        if name == "remember_this":
+            fact = scrub(" ".join((args.get("fact") or "").split()))[:200]
+            if not fact:
+                return {"error": "nothing to remember"}
+            db = Session()
+            row = db.query(Profile).filter_by(account_id=account_id).first()
+            if not row:
+                row = Profile(account_id=account_id, notes="")
+                db.add(row)
+            lines = [ln for ln in (row.notes or "").splitlines() if ln.strip()]
+            if fact not in lines:
+                lines.append(fact)
+            row.notes = "\n".join(lines[-40:])
+            row.updated = datetime.utcnow()
+            db.commit()
+            db.close()
+            return {"ok": True, "remembered": fact}
         if name == "leave_note_for_office":
             db = Session()
             db.add(Followup(account_id=account_id,
@@ -497,6 +514,16 @@ CANT_SEND_PIC = _re_scrub.compile(
     r"\b(picture|image|photo|pic)")
 
 
+# A text reply cannot do anything later. "Let me find the images once
+# more" and "I will make sure to pass it along" were said and neither was
+# done (9 Oct). A promise is kept with a tool in the same turn, or not made.
+PROMISE = _re_scrub.compile(
+    r"(?i)\b(let me (find|look|check|search|get|send|pull)|i.?ll (find|look|"
+    r"check|search|get back|send|pass|let)|i will (find|look|check|search|"
+    r"send|pass|make sure to pass|let)|pass (it|this|that|your \w+) "
+    r"(along|on)|let (the office|my boss|them) know)\b")
+
+
 def _plain_text_reply(said: str) -> str:
     """A text is plain words. The reply to "a few pictures from Amazon"
     came out as markdown - **bold**, list marks and long image links
@@ -523,6 +550,14 @@ def _text_memory(account_id: int) -> str:
     texts, and orders written down but not placed. By text, "the labels"
     meant nothing - and Amazon pictures of something else came back."""
     out = ""
+    try:
+        from advisor import profile_for
+        known = profile_for(account_id)
+        if known:
+            out += ("\n\nWHAT WE KNOW ABOUT THIS PERSON - standing facts and "
+                    "instructions; follow them:\n" + known)
+    except Exception:
+        pass
     try:
         from advisor import notes_block
         notes = notes_block(account_id, 5)
@@ -775,7 +810,9 @@ def text_brain(account_id: int, incoming: str, image_b64: str = ""):
     msgs.append(_text_turn(incoming, image_b64))
 
     retried = False
-    for _ in range(5):
+    promised = False
+    used_tools = []
+    for _ in range(6):
         try:
             data = _openai_chat(msgs, TEXT_TOOLS, model=MODEL_TEXT,
                                 account_id=account_id)
@@ -791,6 +828,17 @@ def text_brain(account_id: int, incoming: str, image_b64: str = ""):
             # all-purpose "I can't". "Can you send me any picture" and
             # "now from you" (a picture of the assistant) both got it, and
             # neither touches one. Sent back once to answer plainly.
+            if PROMISE.search(said) and not used_tools and not promised:
+                promised = True
+                msgs.append({"role": "assistant", "content": said})
+                msgs.append({"role": "system", "content": (
+                    "You promised to do something and did nothing. A text "
+                    "cannot do anything later. Do it NOW with the right tool "
+                    "- leave_note_for_office to pass something on, "
+                    "find_best_price or send_picture_of for pictures - and "
+                    "then say it is done; or say plainly what you cannot "
+                    "do.")})
+                continue
             heard = incoming.startswith("[Voice note")
             wrong = ((heard and CANT_HEAR.search(said))
                      or (image_b64 and CANT_SEE.search(said))
@@ -823,6 +871,7 @@ def text_brain(account_id: int, incoming: str, image_b64: str = ""):
             except Exception:
                 args = {}
             result = _run_text_tool(account_id, fn, args)
+            used_tools.append(fn)
             if isinstance(result, dict) and result.get("offers"):
                 pictures += [o["image"] for o in result["offers"][:2]
                              if o.get("image")]

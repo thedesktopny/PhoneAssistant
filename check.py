@@ -5979,6 +5979,49 @@ def _():
     assert "exact item name and its shop" in main.TEXT_RULES
 
 
+@check("by text a promise is kept now, and a standing instruction is remembered")
+def _():
+    """9 Oct: "Let me find the images once more" and "I will make sure to
+    pass it along" - neither done; and "never send me links" was not kept
+    for next time."""
+    for p in ("Let me find the images you requested once more.",
+              "I will make sure to pass it along.",
+              "I'll let the office know."):
+        assert main.PROMISE.search(p), p
+    for fine in ("Here is the picture.", "I passed it on to the office."):
+        assert not main.PROMISE.search(fine), fine
+    calls = {"n": 0}
+
+    def fake_chat(messages, tools=None, model="", **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"choices": [{"message": {
+                "content": "I will make sure to pass it along."}}]}
+        if calls["n"] == 2:
+            return {"choices": [{"message": {"content": None, "tool_calls": [
+                {"id": "c1", "type": "function", "function": {
+                    "name": "leave_note_for_office",
+                    "arguments": '{"note": "feedback: early phase"}'}}]}}]}
+        return {"choices": [{"message": {
+            "content": "Done - the office has your message."}}]}
+    undo = [everywhere("_openai_chat", fake_chat),
+            everywhere("OPENAI_API_KEY", "x"),
+            everywhere("mem_recent", lambda a, n: [])]
+    try:
+        reply, _ = main.text_brain(1, "tell your boss this AI is early")
+    finally:
+        for u in undo:
+            u()
+    assert reply.startswith("Done"), reply
+    out = main._run_text_tool(1, "remember_this",
+                              {"fact": "Never send links unless asked."})
+    assert out.get("ok"), out
+    assert "Never send links unless asked." in main._text_memory(1)
+    names = {t["function"]["name"] for t in main.TEXT_TOOLS}
+    assert "remember_this" in names
+    assert "remember_this" in main.TEXT_RULES
+
+
 @check("a text is never called sent when it cannot be delivered")
 def _():
     """Call 76: a new customer with no email was told twice "I've sent you

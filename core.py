@@ -828,6 +828,13 @@ TEXT_TOOLS = [
             "item": {"type": "string"}, "shop": {"type": "string"}},
             "required": ["item"]}}},
     {"type": "function", "function": {
+        "name": "remember_this",
+        "description": "Keep a standing instruction or fact about them for "
+                       "every future call and text: 'never send me links', "
+                       "'always use the Visa ending 9090'. One short line.",
+        "parameters": {"type": "object", "properties": {
+            "fact": {"type": "string"}}, "required": ["fact"]}}},
+    {"type": "function", "function": {
         "name": "send_picture_of",
         "description": "Send them a picture of something: a place, a "
                        "thing, an animal, what an item looks like. The "
@@ -957,6 +964,10 @@ actual shailah say they should ask their rav.
 If someone is in danger or a medical emergency, help them reach emergency
 services — that comes first.
 
+When they tell you how they want things done from now on - "never
+send links", "always...", "don't ... again" - remember_this, then confirm.
+Never promise to do something later: a text cannot. Do it now with a tool,
+or say you can't. "I'll pass it along" only after leave_note_for_office.
 Only say you've done something after the tool actually did it. If you can't
 do what they ask, say so and use leave_note_for_office, then tell them it's
 been passed on. Never promise a follow-up you haven't recorded.
