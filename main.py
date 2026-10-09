@@ -497,6 +497,22 @@ CANT_SEND_PIC = _re_scrub.compile(
     r"\b(picture|image|photo|pic)")
 
 
+def _plain_text_reply(said: str) -> str:
+    """A text is plain words. The reply to "a few pictures from Amazon"
+    came out as markdown - **bold**, list marks and long image links
+    pasted into the message (9 Oct). The pictures go separately."""
+    s = said or ""
+    s = _re_scrub.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", s)     # images
+    s = _re_scrub.sub(r"\[([^\]]+)\]\((https?://[^)]*)\)", r"\1", s)
+    s = _re_scrub.sub(r"https?://\S+", "", s)                  # bare links
+    s = _re_scrub.sub(r"(\*\*|__|`|^#+\s*)", "", s, flags=_re_scrub.M)
+    s = _re_scrub.sub(r"^\s*[-*]\s+", "", s, flags=_re_scrub.M)
+    s = _re_scrub.sub(r"[ \t]+", " ", s)
+    s = _re_scrub.sub(r"\n{3,}", "\n\n", s)
+    s = "\n".join(line.strip() for line in s.splitlines())
+    return s.strip()[:600]
+
+
 def _false_cant(said: str) -> bool:
     return bool(CANT_HEAR.search(said or "") or CANT_SEE.search(said or "")
                 or CANT_SEND_PIC.search(said or ""))
@@ -775,7 +791,7 @@ def text_brain(account_id: int, incoming: str, image_b64: str = ""):
             # all-purpose "I can't". "Can you send me any picture" and
             # "now from you" (a picture of the assistant) both got it, and
             # neither touches one. Sent back once to answer plainly.
-            heard = incoming.startswith("[They sent a voice note")
+            heard = incoming.startswith("[Voice note")
             wrong = ((heard and CANT_HEAR.search(said))
                      or (image_b64 and CANT_SEE.search(said))
                      or CANT_SEND_PIC.search(said))
@@ -797,7 +813,7 @@ def text_brain(account_id: int, incoming: str, image_b64: str = ""):
                     "wrong. Answer plainly. If you cannot do it, say so in "
                     "a few words and what you can do instead.")})
                 continue
-            return said[:600], pictures[:2]
+            return _plain_text_reply(said), pictures[:2]
 
         msgs.append(choice)
         for c in calls:
@@ -1985,8 +2001,10 @@ def _answer_text(account_id: int, frm: str, text: str, picture: str,
         said = text.strip() or ("I sent you this picture. Tell me what it "
                                 "shows and help me with it.")
         if voice_said:
-            said = ("[They sent a voice note and you heard it clearly. "
-                    "They said:] " + said)
+            # Not "they said:" - that made every reply begin "You said:"
+            # and repeat them back (9 Oct).
+            said = ("[Voice note, already transcribed - answer it as if "
+                    "they had typed it:] " + said)
         kept = (("(sent a picture) " + text.strip()).strip() if picture
                 else text)
         mem_add(account_id, "sms", "user", kept)
@@ -2084,6 +2102,13 @@ async def sms_incoming(request: Request, background: BackgroundTasks):
     emit("sms", frm[-4:], f"received: {len(text.strip())} characters, "
                           f"{len(media) if isinstance(media, list) else int(bool(media))}"
                           f" attachment(s)", "info")
+    ref = str(pick("RefId", "MessageId", "MessageSid", "id", "Id") or "")
+    murls = media if isinstance(media, list) else ([media] if media else [])
+    key = ref or f"{frm}|{text.strip()}|{'|'.join(str(u) for u in murls)}"
+    # Before any work: each voice note came twice and was transcribed twice
+    # before the repeat was noticed.
+    if not _first_time(key):
+        return {"ok": True, "repeat": True}
     picture, heard, voice_said = "", [], ""
     if media:
         urls = media if isinstance(media, list) else [media]
@@ -2112,10 +2137,6 @@ async def sms_incoming(request: Request, background: BackgroundTasks):
                            "Please contact the office.")
         return {"ok": True, "known": False}
 
-    ref = str(pick("RefId", "MessageId", "MessageSid", "id", "Id") or "")
-    key = ref or f"{frm}|{text.strip()}|{bool(media)}"
-    if not _first_time(key):
-        return {"ok": True, "repeat": True}
     background.add_task(_answer_text, acct.id, frm, text, picture,
                         voice_said)
     return {"ok": True}

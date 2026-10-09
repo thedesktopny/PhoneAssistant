@@ -5456,6 +5456,7 @@ def _():
         assert sent and "receipt" in sent[-1][1], sent
         # a picture that cannot be fetched is said so, not blamed on rules
         sent.clear()
+        main._SEEN_TEXTS.clear()
         undo.append(everywhere("_fetch_media",
                                lambda url: (b"", "", "HTTP 404")))
         r = c.post("/sms/incoming", json={
@@ -5860,8 +5861,7 @@ def _():
     finally:
         for u in undo:
             u()
-    assert seen["incoming"].startswith("[They sent a voice note and you "
-                                       "heard it clearly"), seen
+    assert seen["incoming"].startswith("[Voice note, already transcribed"), seen
     assert "Can you listen to my voice?" in seen["incoming"]
 
 
@@ -5892,8 +5892,8 @@ def _():
                  "text": "I can't listen to voice notes, but share it."}])]
     try:
         reply, _ = main.text_brain(
-            1, "[They sent a voice note and you heard it clearly. They "
-               "said:] Can you listen to this voice now?")
+            1, "[Voice note, already transcribed - answer it as if they "
+               "had typed it:] Can you listen to this voice now?")
     finally:
         for u in undo:
             u()
@@ -5936,6 +5936,47 @@ def _():
     src = io.open("main.py", encoding="utf-8").read()
     i = src.index("def text_brain(")
     assert "_text_memory(account_id)" in src[i:i + 2500]
+
+
+@check("a text reply is plain words, and a repeat delivery does no work")
+def _():
+    """9 Oct: the reply to 'a few pictures from Amazon' came out as **bold**
+    with long image links pasted in; and each voice note was delivered
+    twice and transcribed twice before the repeat was noticed."""
+    raw = ("Here are a few options for the 4x6 labels you wanted from Amazon:"
+           "\n\n1. **Munbyn** - $13.99\n   - ![Munbyn Blue 4x6](https://encr"
+           "ypted-tbn3.gstatic.com/shopping?q=tbn:ANd9)\n2. See "
+           "[the listing](https://amazon.com/dp/X) or https://x.y/z")
+    out = main._plain_text_reply(raw)
+    for bad in ("**", "![", "](", "http", "gstatic"):
+        assert bad not in out, (bad, out)
+    assert "Munbyn" in out and "$13.99" in out and "the listing" in out, out
+    from fastapi.testclient import TestClient
+    calls, opened = [], []
+
+    class Acct:
+        id = 1
+    undo = [everywhere("account_for_number", lambda n: Acct()),
+            everywhere("_answer_text", lambda *a, **k: calls.append(1)),
+            everywhere("_open_attachments",
+                       lambda urls, frm: opened.append(1) or ("", ["hi"]))]
+    main._SEEN_TEXTS.clear()
+    cl = TestClient(main.app, raise_server_exceptions=False, base_url="https://t")
+    try:
+        body = {"To": ["18459831774"], "From": "15550100777", "Message": "",
+                "MediaURLs": ["https://m/voice-1.amr"]}
+        cl.post("/sms/incoming", json=body)
+        cl.post("/sms/incoming", json=body)
+    finally:
+        for u in undo:
+            u()
+        main._SEEN_TEXTS.clear()
+    assert len(opened) == 1, f"a repeat was opened {len(opened)} times"
+    assert len(calls) == 1
+    src = io.open("main.py", encoding="utf-8").read()
+    i = src.index("def text_brain(")
+    assert "_plain_text_reply(said)" in src[i:i + 9000]
+    assert "exact item name and its shop" in main.TEXT_RULES
 
 
 @check("a text is never called sent when it cannot be delivered")
