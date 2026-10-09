@@ -183,8 +183,15 @@ SEFARIA_REFS = """Name the places in Jewish texts most likely to contain
 what is asked - Talmud Bavli (e.g. "Pesachim 13b"), Mishnah (e.g. "Mishnah
 Pesachim 1:5"), Tanakh (e.g. "Genesis 12:1"), Mishneh Torah, Shulchan
 Arukh, Midrash - in Sefaria's reference style. The person may spell
-things by sound ("Gomorrah" for Gemara). Up to four, likeliest first.
+things by sound ("Gomorrah" for Gemara) and describe a story loosely. Think
+where the story or teaching is really found; give a Mishnah together with
+the daf where the Gemara explains it. Up to six, likeliest first.
 Reply with JSON only: {"refs": ["...", "..."]}"""
+
+# The guesses come from a stronger model: with 4o, "bread put outside the
+# Temple as a sign" was guessed as Shekalim and Middot, and the Mishnah in
+# Pesachim was never read. A few hundred words, so it costs under a cent.
+MODEL_SOURCES = os.environ.get("MODEL_SOURCES", "gpt-5.6-terra")
 
 
 def _sefaria_text(ref: str) -> str:
@@ -208,20 +215,26 @@ def _sefaria_text(ref: str) -> str:
 def _sefaria_pages(question: str, account_id=0, call_id=0) -> list:
     """The likeliest places, each read from Sefaria. Empty if none read."""
     try:
-        d = _openai_chat(model=MODEL_BROWSER, account_id=account_id,
-                         call_id=call_id, messages=[
+        d = _openai_chat(model=MODEL_SOURCES, account_id=account_id,
+                         call_id=call_id, effort="low", messages=[
                              {"role": "system", "content": SEFARIA_REFS},
                              {"role": "user", "content": question[:600]}])
         raw = (d["choices"][0]["message"].get("content") or "").strip()
         refs = json.loads(raw[raw.find("{"):raw.rfind("}") + 1]).get("refs")
     except Exception:
         return []
-    out = []
-    for ref in [str(r) for r in (refs or [])][:4]:
+    refs = [str(r) for r in (refs or [])][:6]
+
+    def read(ref):
         try:
-            text = _sefaria_text(ref)
+            return _sefaria_text(ref)
         except Exception:
-            continue
+            return ""
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(6) as pool:
+        texts = list(pool.map(read, refs))
+    out = []
+    for ref, text in zip(refs, texts):
         if text:
             out.append({"title": ref[:120], "site": "sefaria.org",
                         "url": "https://www.sefaria.org/"
