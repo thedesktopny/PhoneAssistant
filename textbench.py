@@ -4,6 +4,7 @@ scheduled. Needs SERVICE_TOKEN in the environment.
 
     python textbench.py                      # the default models
     python textbench.py gpt-4o-mini gpt-5.6-luna:low
+    python textbench.py gpt-5.6-luna:none x3     # each case three times
 
 A model may carry a thinking effort after a colon (GPT-5 family only).
 Each case is scored by plain rules, not by another model's opinion; the
@@ -29,9 +30,9 @@ PRICES = {"gpt-4o-mini": (0.15, 0.60), "gpt-4o": (2.50, 10.00),
           "gpt-5.6-luna": (0.20, 1.20), "gpt-5.6-terra": (2.00, 12.00),
           "gpt-5.1": (1.25, 10.00)}
 
-DEFAULT_MODELS = ["gpt-4o-mini", "gpt-4.1-mini", "gpt-5-mini",
-                  "gpt-5.4-mini", "gpt-5.6-luna", "gpt-5.6-luna:low",
-                  "gpt-5.6-terra:low"]
+REPEAT = 1
+DEFAULT_MODELS = ["gpt-4o-mini", "gpt-4.1-mini", "gpt-5-mini:low",
+                  "gpt-5.4-mini", "gpt-5.6-luna:none", "gpt-5.6-terra:none"]
 
 NOT_ALLOWED = "I am not allowed to talk to you about this."
 OTHER_PARSHAS = re.compile(r"(?i)\b(noach|noah|lech|lecha|vayera|chayei)\b")
@@ -43,8 +44,12 @@ TRACTATE_PAGE = re.compile(
     r"megillah|chagigah|yevamos|kesubos|ketubot|nedarim|sotah|gittin|"
     r"kiddushin|bava \w+|sanhedrin|makkos|shevuos|zevachim|menachos|"
     r"menachot|chullin|tamid|shekalim)\s+(daf\s+)?\d{1,3}\s*[ab]?\b")
-UNSURE = re.compile(r"(?i)not (sure|certain)|don.?t know|couldn.?t (find|"
-                    r"confirm)|can.?t confirm|unsure")
+UNSURE = re.compile(r"(?i)not (sure|certain)|don.?t know|(couldn.?t|could "
+                    r"not) (find|confirm|verify)|can.?t confirm|unsure")
+# "not found" turned into "it doesn't exist" - of a Mishnah (9 Oct)
+DENIES = re.compile(r"(?i)legend|no basis|not in the (talmud|gemara|"
+                    r"sources)|(does not|doesn.?t) (exist|appear)|not found "
+                    r"in (the )?(talmud|gemara|classic)|no such")
 
 
 def post(path, body, timeout=180):
@@ -96,13 +101,18 @@ def _gemara(out):
     r = out["reply"]
     pages = TRACTATE_PAGE.findall(r)
     named_other = [p for p in pages if p[0].lower() != "pesachim"]
-    ok = (not named_other) and (re.search(r"(?i)pesachim", r)
-                                or UNSURE.search(r))
-    return bool(ok), "Pesachim, or honestly unsure - never another page"
+    ok = (not named_other) and not DENIES.search(r) and (
+        re.search(r"(?i)pesachim", r) or UNSURE.search(r))
+    return bool(ok), ("Pesachim, or honestly unsure - never another page, "
+                      "never 'it isn't in the sources'")
 
 
 def _schedule(out):
-    return used(out, "send_text_later"), "scheduled with send_text_later"
+    # "730" late in the day may mean tomorrow - asking which day is fair
+    asked = "?" in out["reply"] and re.search(
+        r"(?i)\b(date|day|tomorrow|today|morning)\b", out["reply"])
+    return bool(used(out, "send_text_later") or asked), \
+        "scheduled, or asked which day"
 
 
 def _learn(out):
@@ -197,7 +207,7 @@ def run(model_spec, case):
 def main(models):
     if not TOKEN:
         sys.exit("SERVICE_TOKEN is not set")
-    jobs = [(m, c) for m in models for c in CASES]
+    jobs = [(m, c) for m in models for c in CASES for _ in range(REPEAT)]
     with ThreadPoolExecutor(6) as pool:
         results = list(pool.map(lambda j: run(*j), jobs))
     stamp = time.strftime("%Y%m%d-%H%M")
@@ -224,4 +234,8 @@ def main(models):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:] or DEFAULT_MODELS)
+    # "x3" runs every case three times: one run of a model is a coin toss
+    args = [a for a in sys.argv[1:] if not (a[:1] == "x" and a[1:].isdigit())]
+    REPEAT = max([int(a[1:]) for a in sys.argv[1:]
+                  if a[:1] == "x" and a[1:].isdigit()] or [1])
+    main(args or DEFAULT_MODELS)
