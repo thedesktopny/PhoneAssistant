@@ -5408,6 +5408,14 @@ def _():
     assert "password" not in text and "token" not in text
 
 
+def _real_png(size=(40, 30)):
+    """A real small PNG - a picture reader rejects made-up bytes."""
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", size, (30, 90, 160)).save(buf, "PNG")
+    return buf.getvalue()
+
+
 @check("a picture sent by text is looked at and answered")
 def _():
     """David, 8 Oct: 'why is it not allowed to send pictures?' - it was
@@ -5426,7 +5434,7 @@ def _():
     def fake_brain(account_id, incoming, image_b64=""):
         seen["incoming"], seen["image"] = incoming, image_b64
         return "It is a receipt for $12.40 from the pharmacy."
-    png = bytes([137]) + b"PNG" + b"0" * 64
+    png = _real_png()
     undo = [everywhere("_fetch_media", lambda url: (png, "image/png", "")),
             everywhere("text_brain", fake_brain),
             everywhere("tool_send_sms",
@@ -5441,7 +5449,9 @@ def _():
         assert r.status_code == 200 and r.json().get("mms") is None or \
             r.json().get("ok"), r.text
         import base64 as _b64m
-        assert seen.get("image") == _b64m.b64encode(png).decode(),             "the picture never reached the model"
+        got = _b64m.b64decode(seen.get("image") or "")
+        assert got[:2] == bytes([0xFF, 0xD8]), \
+            "the picture never reached the model as a JPEG"
         assert "picture" in seen.get("incoming", "").lower()
         assert sent and "receipt" in sent[-1][1], sent
         # a picture that cannot be fetched is said so, not blamed on rules
@@ -5730,7 +5740,7 @@ def _():
 
     def fake_fetch(url):
         if "pic" in url:
-            return b"\x89PNG" + b"0" * 2048, "image/png", ""
+            return _real_png((900, 700)), "image/png", ""
         if "voice" in url:
             return b"#!AMR\n" + b"0" * 4096, "audio/amr", ""
         return b"", "", "HTTP 403, then with our login: HTTP 403"
@@ -5748,7 +5758,7 @@ def _():
             u()
     assert pic and heard == ["please order more labels"], (pic, heard)
     line = " ".join(logged)
-    assert "picture 2 KB" in line and "voice note 4 KB, heard" in line, line
+    assert "PNG -> JPEG" in line and "voice note 4 KB, heard" in line, line
     assert "NOT downloaded (HTTP 403" in line, line
     src = io.open("main.py", encoding="utf-8").read()
     i = src.index("async def sms_incoming(")
@@ -5794,6 +5804,28 @@ def _():
     assert "imageio-ffmpeg" in io.open("requirements.txt",
                                        encoding="utf-8").read()
     assert main._is_audio(b"#!AMR\n", "audio/amr", "x")
+
+
+@check("a picture they send becomes a real JPEG the model can see")
+def _():
+    """8 Oct: a 970 KB picture arrived, was handed to the model labelled
+    as JPEG whatever it was, and the answer was 'I can't identify or
+    describe the content of the image'."""
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (3000, 2000), (200, 30, 30)).save(buf, "PNG")
+    jpg, fmt = main._to_jpeg(buf.getvalue())
+    assert fmt == "PNG" and jpg[:2] == bytes([0xFF, 0xD8]), fmt
+    assert max(Image.open(io.BytesIO(jpg)).size) <= 1600
+    bad, why = main._to_jpeg(b"not a picture at all")
+    assert bad == b"" and why.startswith("unreadable"), why
+    src = io.open("main.py", encoding="utf-8").read()
+    i = src.index("def _open_attachments(")
+    assert "_to_jpeg(data)" in src[i:i + 2500], \
+        "a picture still reaches the model in whatever format the phone used"
+    assert "say who a" in main.TEXT_RULES and "read a label" in main.TEXT_RULES
+    assert "pillow-heif" in io.open("requirements.txt",
+                                    encoding="utf-8").read().lower()
 
 
 @check("a text is never called sent when it cannot be delivered")

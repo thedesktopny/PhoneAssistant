@@ -538,6 +538,29 @@ def _fetch_media(url: str):
         return b"", "", str(e)[:100]
 
 
+def _to_jpeg(data: bytes):
+    """(jpeg bytes, what it was) for any picture a phone sends - HEIC from
+    an iPhone included - at most 1600px. The model was handed a 970 KB
+    picture labelled JPEG and answered that it could not see it (8 Oct).
+    (b"", reason) when it cannot be read."""
+    try:
+        from PIL import Image
+        try:
+            import pillow_heif
+            pillow_heif.register_heif_opener()
+        except Exception:
+            pass
+        img = Image.open(io.BytesIO(data))
+        fmt = (img.format or "?").upper()
+        img = img.convert("RGB")
+        img.thumbnail((1600, 1600))
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=85)
+        return buf.getvalue(), fmt
+    except Exception as e:
+        return b"", f"unreadable: {str(e)[:80]}"
+
+
 def _is_image(data: bytes, kind: str) -> bool:
     return "image" in kind or data[:4] in (b"\xff\xd8\xff\xe0",
                                            b"\xff\xd8\xff\xe1",
@@ -615,10 +638,16 @@ def _open_attachments(urls: list, frm: str):
         if not data:
             seen.append(f"{host}: NOT downloaded ({why})")
             continue
-        if _is_image(data, kind):
+        if _is_image(data, kind) or "heic" in kind or "heif" in kind:
+            jpg, fmt = _to_jpeg(data)
+            if not jpg:
+                seen.append(f"picture {len(data) // 1024} KB ({kind}), "
+                            f"NOT readable: {fmt}")
+                continue
             if not picture:
-                picture = _b64.b64encode(data).decode()
-            seen.append(f"picture {len(data) // 1024} KB")
+                picture = _b64.b64encode(jpg).decode()
+            seen.append(f"picture {len(data) // 1024} KB, {fmt} -> JPEG "
+                        f"{len(jpg) // 1024} KB")
         elif _is_audio(data, kind, url):
             name = url.lower().split("?")[0].rsplit("/", 1)[-1] or "note.amr"
             if "." not in name:

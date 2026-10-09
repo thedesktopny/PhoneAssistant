@@ -17,3 +17,4 @@ tzdata==2025.2
 pypdf==5.1.0
 Pillow
 imageio-ffmpeg
+pillow-heif
