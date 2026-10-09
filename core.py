@@ -808,6 +808,21 @@ def _fmt_address(a) -> str:
 
 TEXT_TOOLS = [
     {"type": "function", "function": {
+        "name": "find_best_price",
+        "description": "What an item costs and where, cheapest first, with "
+                       "a picture of the top listing sent to them. item is "
+                       "the thing; shop only if they named one.",
+        "parameters": {"type": "object", "properties": {
+            "item": {"type": "string"}, "shop": {"type": "string"}},
+            "required": ["item"]}}},
+    {"type": "function", "function": {
+        "name": "find_out",
+        "description": "Find something out from the real pages - a model's "
+                       "steps, hours, what exists - with the site named. "
+                       "Write the whole question, make and model included.",
+        "parameters": {"type": "object", "properties": {
+            "question": {"type": "string"}}, "required": ["question"]}}},
+    {"type": "function", "function": {
         "name": "check_email",
         "description": "Their unread emails — count, senders, subjects.",
         "parameters": {"type": "object", "properties": {
@@ -924,6 +939,15 @@ services — that comes first.
 Only say you've done something after the tool actually did it. If you can't
 do what they ask, say so and use leave_note_for_office, then tell them it's
 been passed on. Never promise a follow-up you haven't recorded.
+
+SHOPPING AND FINDING OUT
+- What something costs or where to get it: find_best_price. The picture
+  of the top listing is sent with your reply by itself - say "picture
+  attached". Prices are as listed and can be a few days old.
+- Anything exact - a model number, hours, "which ones have X", how to do
+  something on a particular appliance: find_out. Say which site it came
+  from. Never guess a step, a price or a part number.
+- Placing an order is done by phone, not by text yet: say so.
 
 Before sending an email or booking anything, state what you're about to do
 and wait for a yes.

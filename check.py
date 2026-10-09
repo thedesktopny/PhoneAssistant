@@ -4970,7 +4970,7 @@ def _():
     i = src.index('@app.post("/calls/end")')
     assert "background.add_task(write_call_note, call_id)" in src[i:i + 1500]
     i = src.index("async def sms_incoming(")
-    assert "write_text_note(acct.id, kept, reply)" in src[i:i + 6000]
+    assert "write_text_note(acct.id, kept, shown)" in src[i:i + 7000]
     assert "/notes" in {r.path for r in main.app.routes}
 
 
@@ -5427,7 +5427,8 @@ def _():
     undo = [everywhere("_fetch_picture", lambda url: "QUJD"),
             everywhere("text_brain", fake_brain),
             everywhere("tool_send_sms",
-                       lambda to, msg: sent.append((to, msg)) or {"sent": True}),
+                       lambda to, msg, media=None:
+                       sent.append((to, msg)) or {"sent": True}),
             everywhere("account_for_number", lambda n: Acct())]
     c = TestClient(main.app, raise_server_exceptions=False, base_url="https://t")
     try:
@@ -5457,6 +5458,59 @@ def _():
     db.close()
     assert any("(sent a picture)" in (m.text or "") for m in rows), \
         "the record does not say a picture was sent"
+
+
+@check("by text it can shop and find out, and sends the picture of what it suggests")
+def _():
+    """David: 'if he suggests an item from a site he should be able to
+    send me pics'. The text side had email, calendar and a plain web
+    search - no prices, no find_out, and no way to send a picture."""
+    names = {t["function"]["name"] for t in main.TEXT_TOOLS}
+    assert {"find_best_price", "find_out"} <= names, names
+    assert "find_best_price" in main.TEXT_RULES and "find_out" in main.TEXT_RULES
+    assert "by phone, not by text" in main.TEXT_RULES
+    # a listing carries its picture
+    made = {"shopping": [{"source": "B&H", "title": "Epson ET-5850",
+                          "price": "$699.99", "imageUrl": "https://i/x.jpg"}]}
+    undo = [everywhere("_serper_shopping", lambda item: made),
+            everywhere("SERPER_API_KEY", "k"),
+            everywhere("live_prices", lambda item, shop="": [])]
+    try:
+        out = main._run_text_tool(1, "find_best_price", {"item": "Epson ET-5850"})
+    finally:
+        for u in undo:
+            u()
+    assert out["offers"] and out["offers"][0]["image"] == "https://i/x.jpg", out
+    # the reply carries the picture, and the text goes out with it
+    calls = {"n": 0}
+
+    def fake_chat(messages, tools=None, model="", **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"choices": [{"message": {"content": None, "tool_calls": [
+                {"id": "c1", "type": "function", "function": {
+                    "name": "find_best_price",
+                    "arguments": '{"item": "Epson ET-5850"}'}}]}}]}
+        return {"choices": [{"message": {
+            "content": "B&H has the Epson ET-5850 at about $699.99. "
+                       "Picture attached."}}]}
+    undo = [everywhere("_openai_chat", fake_chat),
+            everywhere("OPENAI_API_KEY", "x"),
+            everywhere("_run_text_tool", lambda a, n, args: {
+                "answer": "x", "exact": True, "offers": [
+                    {"shop": "B&H", "price": "$699.99", "title": "Epson",
+                     "image": "https://i/x.jpg"}]})]
+    try:
+        reply, pictures = main.text_brain(1, "how much is the Epson ET-5850")
+    finally:
+        for u in undo:
+            u()
+    assert "699.99" in reply and pictures == ["https://i/x.jpg"], (reply, pictures)
+    src = io.open("main.py", encoding="utf-8").read()
+    assert 'bulk["MediaURLs"] = media' in src, "BulkVS is never given the picture"
+    i = src.index("async def sms_incoming(")
+    assert "tool_send_sms(frm, reply, pictures)" in src[i:i + 7000], \
+        "the picture is found but never sent"
 
 
 @check("a text is never called sent when it cannot be delivered")

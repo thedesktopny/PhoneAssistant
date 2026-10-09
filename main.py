@@ -83,9 +83,11 @@ def _digits_e164(number: str) -> str:
     return "+" + d
 
 
-def tool_send_sms(to: str, message: str) -> dict:
-    """Send a text message. Provider set by SMS_PROVIDER."""
+def tool_send_sms(to: str, message: str, media: list = None) -> dict:
+    """Send a text message, with pictures (public links) when given.
+    Provider set by SMS_PROVIDER."""
     to = _digits_e164(to)
+    media = [m for m in (media or []) if m and str(m).startswith("http")][:3]
     if not SMS_PROVIDER or not SMS_FROM:
         return {"sent": False, "error": "SMS isn't configured."}
     if not SMS_DELIVERS:
@@ -101,9 +103,11 @@ def tool_send_sms(to: str, message: str) -> dict:
 
     try:
         if SMS_PROVIDER == "twilio":
-            body = urllib.parse.urlencode({
-                "To": to, "From": _digits_e164(SMS_FROM), "Body": message[:1500],
-            }).encode()
+            fields = {"To": to, "From": _digits_e164(SMS_FROM),
+                      "Body": message[:1500]}
+            if media:
+                fields["MediaUrl"] = media[0]
+            body = urllib.parse.urlencode(fields).encode()
             auth = _b64.b64encode(
                 f"{TWILIO_SID}:{TWILIO_TOKEN}".encode()).decode()
             req = urllib.request.Request(
@@ -119,6 +123,8 @@ def tool_send_sms(to: str, message: str) -> dict:
         if SMS_PROVIDER == "telnyx":
             body = {"from": _digits_e164(SMS_FROM), "to": to,
                     "text": message[:1500]}
+            if media:
+                body["media_urls"] = media
             if TELNYX_PROFILE_ID:
                 body["messaging_profile_id"] = TELNYX_PROFILE_ID
             req = urllib.request.Request(
@@ -131,11 +137,15 @@ def tool_send_sms(to: str, message: str) -> dict:
             return {"sent": True, "id": d.get("data", {}).get("id", "")}
 
         if SMS_PROVIDER == "bulkvs":
-            payload = json.dumps({
+            bulk = {
                 "From": _digits_e164(SMS_FROM).lstrip("+"),
                 "To": [to.lstrip("+")],
                 "Message": message[:1500],
-            }).encode()  # BulkVS: To is a list, numbers without +
+            }
+            if media:
+                # the same field BulkVS uses when it delivers an MMS to us
+                bulk["MediaURLs"] = media
+            payload = json.dumps(bulk).encode()  # To is a list, no +
             auth = _b64.b64encode(
                 f"{BULKVS_USER}:{BULKVS_PASS}".encode()).decode()
             req = urllib.request.Request(
@@ -295,6 +305,22 @@ def queue_health() -> dict:
 
 def _run_text_tool(account_id: int, name: str, args: dict):
     try:
+        if name == "find_best_price":
+            out = shopping_prices(args.get("item", ""),
+                                  shop=args.get("shop", "") or "")
+            return {"answer": out.get("answer", ""), "exact": out.get("exact"),
+                    "offers": [{"shop": o.get("shop"), "price": o.get("price"),
+                                "title": o.get("title"),
+                                "delivery": o.get("delivery"),
+                                "image": o.get("image", "")}
+                               for o in (out.get("offers") or [])[:4]],
+                    "blocked": out.get("blocked", False)}
+        if name == "find_out":
+            d = find_out(args.get("question", ""), account_id)
+            return {"answer": d.get("answer", ""), "found": d.get("found"),
+                    "freshness": d.get("freshness"),
+                    "from": [x.get("site") for x in d.get("sources") or []],
+                    "blocked": d.get("blocked", False)}
         if name == "check_email":
             return tool_unread_summary(account_id, args.get("how_many", 5))
         if name == "search_email":
@@ -414,15 +440,20 @@ def _fetch_picture(url: str) -> str:
         return ""
 
 
-def text_brain(account_id: int, incoming: str, image_b64: str = "") -> str:
+def text_brain(account_id: int, incoming: str, image_b64: str = ""):
     """Answer one incoming text, using shared memory and the same tools.
-    With image_b64, the customer sent a picture: the model sees it."""
+    With image_b64, the customer sent a picture: the model sees it.
+    Returns (reply, pictures): the listing pictures a shopping answer
+    carries, sent with the reply so they can SEE what is suggested."""
+    pictures = []
     if is_blocked(incoming):
         return "I am not allowed to talk to you about this."
     if not OPENAI_API_KEY:
         return "The assistant isn't configured yet."
 
-    today = datetime.now().strftime("%A, %B %-d, %Y")
+    # %-d is Linux-only and raises on Windows, where check.py runs
+    _now = datetime.now()
+    today = f"{_now:%A, %B} {_now.day}, {_now.year}"
     history = mem_recent(account_id, 16)
     msgs = [{"role": "system",
              "content": TEXT_RULES + f"\n\nToday is {today}."}]
@@ -443,7 +474,7 @@ def text_brain(account_id: int, incoming: str, image_b64: str = "") -> str:
         choice = data["choices"][0]["message"]
         calls = choice.get("tool_calls") or []
         if not calls:
-            return (choice.get("content") or "").strip()[:600]
+            return (choice.get("content") or "").strip()[:600], pictures[:2]
 
         msgs.append(choice)
         for c in calls:
@@ -453,6 +484,9 @@ def text_brain(account_id: int, incoming: str, image_b64: str = "") -> str:
             except Exception:
                 args = {}
             result = _run_text_tool(account_id, fn, args)
+            if isinstance(result, dict) and result.get("offers"):
+                pictures += [o["image"] for o in result["offers"][:2]
+                             if o.get("image")]
             if isinstance(result, dict) and result.get("error"):
                 db = Session()
                 db.add(Followup(account_id=account_id, reason=fn[:60],
@@ -463,7 +497,8 @@ def text_brain(account_id: int, incoming: str, image_b64: str = "") -> str:
             msgs.append({"role": "tool", "tool_call_id": c["id"],
                          "content": json.dumps(result)[:3000]})
 
-    return "I couldn't finish that one — try asking a different way."
+    return ("I couldn't finish that one — try asking a different way.",
+            pictures[:2])
 
 
 # ----------------------------------------------------------------- api
@@ -1675,10 +1710,12 @@ async def sms_incoming(request: Request):
                             "shows and help me with it.")
     kept = ("(sent a picture) " + text.strip()).strip() if picture else text
     mem_add(acct.id, "sms", "user", kept)
-    reply = text_brain(acct.id, said, image_b64=picture)
-    mem_add(acct.id, "sms", "assistant", reply)
-    write_text_note(acct.id, kept, reply)
-    tool_send_sms(frm, reply)
+    out = text_brain(acct.id, said, image_b64=picture)
+    reply, pictures = out if isinstance(out, tuple) else (out, [])
+    shown = reply + (" [picture sent]" if pictures else "")
+    mem_add(acct.id, "sms", "assistant", shown)
+    write_text_note(acct.id, kept, shown)
+    tool_send_sms(frm, reply, pictures)
     return {"ok": True}
 
 

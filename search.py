@@ -247,6 +247,8 @@ def shopping_prices(item: str, limit: int = 8, shop: str = "") -> dict:
             "delivery": (x.get("delivery") or "").strip()[:60],
             "rating": x.get("rating"),
             "link": (x.get("link") or "")[:400],
+            # the listing's own picture - sent with a text reply
+            "image": (x.get("imageUrl") or "")[:400],
         })
     # Shopping results match loosely: asking for an ECCO New Jersey
     # returns the Byway, the S Lite and the Move, and the cheapest of
