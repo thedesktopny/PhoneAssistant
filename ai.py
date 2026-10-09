@@ -58,8 +58,16 @@ def _openai_chat(messages: list, tools=None, model: str = "",
             e._from_openai = True
         except Exception:
             pass
+        # urllib throws the body away, and the body is where OpenAI says
+        # what it objects to ("400: Bad Request" for gpt-5.6, 9 Oct).
+        if isinstance(e, urllib.error.HTTPError):
+            try:
+                said = e.read().decode("utf-8", "replace")
+                e.msg = f"{e.msg} - {' '.join(said.split())[:400]}"
+            except Exception:
+                pass
         emit("openai", "chat", f"{payload['model']} call failed: "
-                               f"{str(e)[:180]}", "error", account_id)
+                               f"{str(e)[:500]}", "error", account_id)
         raise
 
     # Until now these tokens were never counted anywhere.
