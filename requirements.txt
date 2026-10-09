@@ -16,3 +16,4 @@ azure-identity==1.19.0
 tzdata==2025.2
 pypdf==5.1.0
 Pillow
+imageio-ffmpeg

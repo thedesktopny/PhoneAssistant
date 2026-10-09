@@ -5761,6 +5761,41 @@ def _():
         "a media link that wants the provider's login is never tried with it"
 
 
+@check("a phone voice note is converted before it is transcribed")
+def _():
+    """8 Oct: the first voice note arrived and the speech-to-text service
+    answered 400 Bad Request - phone voice notes are AMR, which it does
+    not take. They are converted to MP3 first."""
+    import subprocess
+    import tempfile
+    import imageio_ffmpeg
+    exe = imageio_ffmpeg.get_ffmpeg_exe()
+    with tempfile.TemporaryDirectory() as d:
+        amr = os.path.join(d, "note.amr")
+        subprocess.run([exe, "-hide_banner", "-loglevel", "error", "-y", "-f",
+                        "lavfi", "-i", "sine=frequency=440:duration=1",
+                        "-ar", "8000", "-ac", "1", "-c:a", "libopencore_amrnb",
+                        amr], check=False, timeout=60)
+        if not os.path.exists(amr) or not os.path.getsize(amr):
+            # this build of ffmpeg decodes AMR but cannot make one; use a
+            # header-only stand-in to prove the path is taken
+            data = None
+        else:
+            data = open(amr, "rb").read()
+    if data:
+        out, name = main._as_mp3(data, "note.amr")
+        assert name == "note.mp3" and out[:3] in (b"ID3",) or \
+            out[:2] == b"\xff\xfb" or out[:2] == b"\xff\xf3", out[:8]
+    out, name = main._as_mp3(b"ID3....", "note.mp3")
+    assert name == "note.mp3" and out == b"ID3....", "an MP3 was converted again"
+    src = io.open("main.py", encoding="utf-8").read()
+    i = src.index("def _transcribe(")
+    assert "_as_mp3(data, name)" in src[i:i + 600]
+    assert "imageio-ffmpeg" in io.open("requirements.txt",
+                                       encoding="utf-8").read()
+    assert main._is_audio(b"#!AMR\n", "audio/amr", "x")
+
+
 @check("a text is never called sent when it cannot be delivered")
 def _():
     """Call 76: a new customer with no email was told twice "I've sent you

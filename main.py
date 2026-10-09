@@ -550,10 +550,42 @@ def _is_audio(data: bytes, kind: str, url: str) -> bool:
             or data[:6] == b"#!AMR\n")
 
 
+def _as_mp3(data: bytes, name: str):
+    """A phone voice note is usually AMR, which the speech-to-text service
+    refuses ("400 Bad Request", 8 Oct). Converted to MP3 with the ffmpeg
+    that ships inside the imageio-ffmpeg package - nothing to install on
+    the server. Returns (bytes, name); the original if conversion fails."""
+    low = name.lower()
+    if low.endswith((".mp3", ".m4a", ".wav", ".ogg", ".oga", ".webm",
+                     ".mp4", ".mpeg", ".flac")) and not data.startswith(
+                         b"#!AMR"):
+        return data, name
+    try:
+        import subprocess
+        import tempfile
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "in" + (os.path.splitext(low)[1] or ".amr"))
+            dst = os.path.join(d, "out.mp3")
+            with open(src, "wb") as f:
+                f.write(data)
+            subprocess.run([exe, "-hide_banner", "-loglevel", "error", "-y",
+                            "-i", src, "-ac", "1", "-ar", "16000", dst],
+                           check=True, timeout=60)
+            with open(dst, "rb") as f:
+                return f.read(), "note.mp3"
+    except Exception as e:
+        emit("sms", "voice", f"could not convert the voice note: "
+                             f"{str(e)[:120]}", "warn")
+        return data, name
+
+
 def _transcribe(data: bytes, name: str) -> str:
     """A voice note in words. '' when it cannot be heard."""
     if not OPENAI_API_KEY or not data:
         return ""
+    data, name = _as_mp3(data, name)
     edge = "----pa" + secrets.token_hex(8)
     body = (f"--{edge}\r\nContent-Disposition: form-data; name=\"model\""
             f"\r\n\r\nwhisper-1\r\n--{edge}\r\nContent-Disposition: "
@@ -596,6 +628,8 @@ def _open_attachments(urls: list, frm: str):
                 heard.append(words)
             seen.append(f"voice note {len(data) // 1024} KB"
                         + (", heard" if words else ", could NOT be heard"))
+        elif "smil" in kind or url.lower().split("?")[0].endswith(".smil"):
+            continue                # the MMS layout file - not content
         else:
             seen.append(f"{kind or 'unknown type'} {len(data) // 1024} KB, "
                         f"not a picture or voice note")
