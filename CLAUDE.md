@@ -102,8 +102,12 @@ Railway auto-deploys both services from `main` on push.
   checkout completes. No end-to-end order has been proven on any site yet.
 - No site on that list allows guest checkout (zero `GUEST_OK`), so every
   automated order needs stored credentials.
-- SMS is blocked on 10DLC campaign registration (BulkVS / Telnyx). Not a
-  code problem.
+- Texting WORKS (8 Oct 2026). BulkVS, number 845 983 1774 (voice is
+  484 518 2072 - tell customers texts come from the 845 number). 10DLC
+  campaign CSMPGMO approved; BulkVS webhook "StaticNumber" posts to
+  /sms/incoming; Railway `SMS_DELIVERS=1` on the web service. `/sms/setup`
+  shows the whole setup with no secrets. If texts stop: check that page
+  first, then the campaign in BulkVS.
 - Real cost is ~$0.44/min, ~94% of it the OpenAI Realtime model. Rates
   are Railway vars `RATE_*`; verify against invoices.
 - Google OAuth app is in testing mode — accounts must be on the test-user
