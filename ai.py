@@ -32,12 +32,17 @@ def _summarise_page(text: str, question: str) -> str:
 
 
 def _openai_chat(messages: list, tools=None, model: str = "",
-                 account_id=None, call_id=None, cheap: bool = True) -> dict:
+                 account_id=None, call_id=None, cheap: bool = True,
+                 effort: str = "") -> dict:
     """One chat call. 'cheap' decides which column the tokens are billed to,
-    so the Costs tab separates the browser's brain from the helpers."""
+    so the Costs tab separates the browser's brain from the helpers.
+    effort is how long a GPT-5 model thinks first ("none", "low",
+    "medium"); left out for older models, which refuse it."""
     payload = {"model": model or MODEL_TEXT, "messages": messages}
     if tools:
         payload["tools"] = tools
+    if effort:
+        payload["reasoning_effort"] = effort
     req = urllib.request.Request(
         "https://api.openai.com/v1/chat/completions",
         data=json.dumps(payload).encode(),

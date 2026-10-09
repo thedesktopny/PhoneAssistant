@@ -871,11 +871,25 @@ def _open_attachments(urls: list, frm: str):
     return picture, heard, typed
 
 
-def text_brain(account_id: int, incoming: str, image_b64: str = ""):
+# Tools that only READ. On the test bench these run for real; anything
+# that sends, saves, schedules or changes something is only pretended.
+READ_ONLY_TEXT_TOOLS = {"find_best_price", "send_picture_of",
+                        "jewish_calendar", "find_out", "check_email",
+                        "search_email", "find_contact", "check_calendar",
+                        "list_mailboxes", "check_connect", "web_search"}
+
+
+def text_brain(account_id: int, incoming: str, image_b64: str = "",
+               trial: dict = None):
     """Answer one incoming text, using shared memory and the same tools.
     With image_b64, the customer sent a picture: the model sees it.
     Returns (reply, pictures): the listing pictures a shopping answer
-    carries, sent with the reply so they can SEE what is suggested."""
+    carries, sent with the reply so they can SEE what is suggested.
+
+    trial: the test bench. {"model", "effort", "history"} - the model to
+    try, and the conversation so far instead of the stored one. Nothing is
+    sent, saved or scheduled; tools that change things are pretended. It
+    fills in trial["tools"] and trial["usage"]."""
     pictures = []
     if is_blocked(incoming):
         return "I am not allowed to talk to you about this."
@@ -886,7 +900,10 @@ def text_brain(account_id: int, incoming: str, image_b64: str = ""):
     _now = datetime.now(_tz())       # their time, not the server's
     today = (f"{_now:%A, %B} {_now.day}, {_now.year}, "
              f"{_now.strftime('%I:%M %p').lstrip('0')}")
-    history = mem_recent(account_id, 16)
+    history = (mem_recent(account_id, 16) if trial is None else
+               [{"who": h.get("who", "user"), "channel": "sms",
+                 "text": h.get("text", "")}
+                for h in trial.get("history") or []])
     msgs = [{"role": "system",
              "content": TEXT_RULES + f"\n\nIt is now {today}."
              + _jewish_today() + _text_memory(account_id)}]
@@ -916,10 +933,20 @@ def text_brain(account_id: int, incoming: str, image_b64: str = ""):
         try:
             # A picture is looked at by the stronger model: the small one
             # suggested under-cabinet lighting for a kitchen that had it.
-            data = _openai_chat(msgs, TEXT_TOOLS,
-                                model=MODEL_BROWSER if image_b64
-                                else MODEL_TEXT,
-                                account_id=account_id)
+            if trial is not None:
+                data = _openai_chat(msgs, TEXT_TOOLS,
+                                    model=trial.get("model") or MODEL_TEXT,
+                                    effort=trial.get("effort", ""))
+                u = data.get("usage") or {}
+                got = trial.setdefault("usage", {"in": 0, "out": 0})
+                got["in"] += int(u.get("prompt_tokens", 0) or 0)
+                got["out"] += int(u.get("completion_tokens", 0) or 0)
+            else:
+                data = _openai_chat(msgs, TEXT_TOOLS,
+                                    model=MODEL_BROWSER if image_b64
+                                    else MODEL_TEXT,
+                                    effort=MODEL_TEXT_EFFORT,
+                                    account_id=account_id)
         except Exception as e:
             return f"Something went wrong: {str(e)[:80]}"
 
@@ -990,8 +1017,14 @@ def text_brain(account_id: int, incoming: str, image_b64: str = ""):
                 args = json.loads(c["function"].get("arguments") or "{}")
             except Exception:
                 args = {}
-            result = _run_text_tool(account_id, fn, args)
+            if trial is not None and fn not in READ_ONLY_TEXT_TOOLS:
+                result = {"ok": True, "test_run": True, "would_have": args}
+            else:
+                result = _run_text_tool(account_id, fn, args)
             used_tools.append(fn)
+            if trial is not None:
+                trial.setdefault("tools", []).append(
+                    {"name": fn, "args": args})
             if isinstance(result, dict) and result.get("offers"):
                 pictures += [o["image"] for o in result["offers"][:2]
                              if o.get("image")]
@@ -1014,6 +1047,7 @@ def text_brain(account_id: int, incoming: str, image_b64: str = ""):
 # ----------------------------------------------------------------- api
 
 app = FastAPI(title="Phone Assistant")
+
 
 
 def send_due_texts() -> int:
@@ -1089,6 +1123,35 @@ def end_what_a_restart_cut_off() -> int:
 
 
 end_what_a_restart_cut_off()
+
+
+class TextTry(BaseModel):
+    account_id: int = 1
+    text: str
+    model: str = ""
+    effort: str = ""
+    history: list = []
+    picture_url: str = ""
+
+
+@app.post("/text/try")
+def text_try(t: TextTry, request: Request):
+    """The test bench: how would this model answer this text? Nothing is
+    sent, saved or scheduled. Staff only. textbench.py replays real
+    conversations through it, model against model."""
+    require_auth(request)
+    trial = {"model": t.model or MODEL_TEXT, "effort": t.effort,
+             "history": t.history[-16:]}
+    picture = _fetch_picture(t.picture_url) if t.picture_url else ""
+    t0 = time.time()
+    try:
+        out = text_brain(t.account_id, t.text, image_b64=picture, trial=trial)
+    except Exception as e:
+        return {"reply": "", "error": str(e)[:300], "model": trial["model"]}
+    reply, pics = out if isinstance(out, tuple) else (out, [])
+    return {"reply": reply, "pictures": len(pics), "model": trial["model"],
+            "tools": trial.get("tools", []), "usage": trial.get("usage", {}),
+            "seconds": round(time.time() - t0, 1)}
 
 
 # NB: this file must NOT be called site.py - Python has a built-in module

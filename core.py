@@ -135,6 +135,8 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 MODEL_BROWSER = os.environ.get("MODEL_BROWSER", "gpt-4o")
 MODEL_SUMMARY = os.environ.get("MODEL_SUMMARY", "gpt-4o-mini")
 MODEL_TEXT = os.environ.get("MODEL_TEXT", "gpt-4o-mini")
+# How long a GPT-5 text model thinks first; blank for older models.
+MODEL_TEXT_EFFORT = os.environ.get("MODEL_TEXT_EFFORT", "")
 # Send the browser a picture of the page as well as its text. Set to 0 to
 # go back to text only.
 BROWSER_VISION = os.environ.get("BROWSER_VISION", "1") not in ("0", "false")

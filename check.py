@@ -6222,6 +6222,53 @@ def _():
     assert n == 1, f"{n} texts scheduled for one request"
 
 
+@check("the test bench sends, saves and schedules nothing")
+def _():
+    """textbench.py tries models on real texts through /text/try. A test
+    must never text the customer, schedule a text or change their notes."""
+    replies = iter([
+        {"tool_calls": [
+            {"id": "1", "function": {"name": "send_text_later", "arguments":
+                '{"when": "2030-01-01T07:30", "message": "Good morning"}'}},
+            {"id": "2", "function": {"name": "remember_this",
+                                     "arguments": '{"what": "no links"}'}}]},
+        {"content": "Scheduled for 7:30."}])
+    asked = []
+
+    def fake_chat(messages, tools=None, model="", effort="", **k):
+        asked.append((model, effort))
+        return {"choices": [{"message": next(replies)}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 10}}
+    ran = []
+    undo = [everywhere("_openai_chat", fake_chat),
+            everywhere("OPENAI_API_KEY", "x"),
+            everywhere("_jewish_today", lambda: ""),
+            everywhere("_run_text_tool", lambda a, n, g: ran.append(n)),
+            everywhere("mem_recent", lambda a, n: 1 / 0)]
+    trial = {"model": "gpt-test", "effort": "low",
+             "history": [{"who": "user", "text": "hi"}]}
+    try:
+        reply, _ = main.text_brain(1, "send me good morning at 7:30",
+                                   trial=trial)
+    finally:
+        for u in undo:
+            u()
+    assert reply == "Scheduled for 7:30.", reply
+    assert ran == [], f"a test run really did: {ran}"
+    assert [t["name"] for t in trial["tools"]] == ["send_text_later",
+                                                   "remember_this"]
+    assert trial["usage"] == {"in": 200, "out": 20}, trial["usage"]
+    assert asked[0] == ("gpt-test", "low"), asked
+    assert "find_out" in main.READ_ONLY_TEXT_TOOLS
+    for n in ("send_text_later", "remember_this", "send_email",
+              "leave_note_for_office", "delete_my_account", "create_event",
+              "disconnect_email", "submit_code", "connect_email"):
+        assert n not in main.READ_ONLY_TEXT_TOOLS, n
+    src = io.open("main.py", encoding="utf-8").read()
+    i = src.index("def text_try(")
+    assert "require_auth(request)" in src[i:i + 600]
+
+
 @check("a text is never called sent when it cannot be delivered")
 def _():
     """Call 76: a new customer with no email was told twice "I've sent you
