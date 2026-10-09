@@ -6299,6 +6299,62 @@ def _():
     assert "unless a tool just showed you" in main.TEXT_RULES
 
 
+@check("a wrong parsha or Hebrew date is caught against the calendar before it is sent")
+def _():
+    """textbench, 9 Oct: told 'it's not Noach', the text model answered
+    Lech Lecha one time in three - with Bereshit in front of it."""
+    facts = {"parsha": "Bereshit", "day": 28, "tonight_day": 29,
+             "month": "Tishrei", "spoken": "the 28th of Tishrei, 5787",
+             "tonight_spoken": "the 29th of Tishrei, 5787"}
+    bad = ["This Shabbos, October 10, 2026, is Parshas Lech Lecha.",
+           "This week's parsha is Noach.",
+           "Today is the 25th of Tishrei, 5787.",
+           "The Jewish date is 25 Tishrei 5787."]
+    good = ["This Shabbos is Parshas Bereishis.",
+            "This week's parsha is Bereshit. Noach is next week.",
+            "Today is the 28th of Tishrei; after nightfall, 29 Tishrei.",
+            "Chanukah begins on the 25th of Kislev.",
+            "I can send you a good morning text."]
+    for b in bad:
+        assert main.calendar_mistake(b, facts), b
+    for g in good:
+        assert not main.calendar_mistake(g, facts), g
+    assert not main.calendar_mistake("This Shabbos is Lech Lecha.", {})
+
+    replies = iter(["This Shabbos is Parshas Lech Lecha.",
+                    "Sorry - this Shabbos is Parshas Bereishis."])
+
+    def fake_chat(messages, tools=None, model="", effort="", **k):
+        return {"choices": [{"message": {"content": next(replies)}}]}
+
+    def fake_today():
+        main._JEWISH_LAST.clear()
+        main._JEWISH_LAST.update(facts)
+        return "\nThis week's parsha is Bereshit."
+    undo = [everywhere("_openai_chat", fake_chat),
+            everywhere("OPENAI_API_KEY", "x"),
+            everywhere("_jewish_today", fake_today),
+            everywhere("mem_recent", lambda a, n: [])]
+    try:
+        reply, _ = main.text_brain(1, "It's not Noach this Shabbos.")
+    finally:
+        for u in undo:
+            u()
+    assert "Bereishis" in reply, reply
+
+    replies = iter(["This Shabbos is Lech Lecha.", "It is Lech Lecha."])
+    undo = [everywhere("_openai_chat", fake_chat),
+            everywhere("OPENAI_API_KEY", "x"),
+            everywhere("_jewish_today", fake_today),
+            everywhere("mem_recent", lambda a, n: [])]
+    try:
+        reply, _ = main.text_brain(1, "Which parsha is this Shabbos?")
+    finally:
+        for u in undo:
+            u()
+    assert "Bereshit" in reply and "Lech" not in reply, reply
+
+
 @check("a text is never called sent when it cannot be delivered")
 def _():
     """Call 76: a new customer with no email was told twice "I've sent you

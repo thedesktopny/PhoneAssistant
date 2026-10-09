@@ -612,13 +612,88 @@ def _false_cant(said: str) -> bool:
                 or CANT_LEARN.search(said or ""))
 
 
+# Every parsha, as it may be spelled. Used to CHECK a reply, not to write
+# one: told the parsha in so many words, the text model still said Lech
+# Lecha one time in three after "it's not Noach" (textbench, 9 Oct).
+PARSHAS = [(k, _re_scrub.compile(r"(?i)\b(" + p + r")")) for k, p in [
+    ("bereishis", r"bere'?i?sh[ie]?(s|t)"), ("noach", r"noach\b|noah\b"),
+    ("lech", r"lech[\s-]*l[e']?cha"), ("vayera", r"vayei?ra\b"),
+    ("chayei", r"chayei|chaye sara"), ("toldos", r"tole?d(o|ot|os)\b"),
+    ("vayetzei", r"vayei?tzei?\b"), ("vayishlach", r"vayishlach"),
+    ("vayeshev", r"vayei?shev"), ("miketz", r"mikei?tz"),
+    ("vayigash", r"vayigash"), ("vayechi", r"vay[e']?chi\b"),
+    ("shemos", r"shem(ot|os)\b"), ("vaera", r"va'?eh?i?ra\b"),
+    ("bo", r"parsh(a|as|at) bo\b"), ("beshalach", r"beshalach"),
+    ("yisro", r"yi(s|t)ro\b"), ("mishpatim", r"mishpatim"),
+    ("terumah", r"terumah"), ("tetzaveh", r"tetzaveh"),
+    ("ki sisa", r"ki (s|t)isa"), ("vayakhel", r"vayakhel"),
+    ("pekudei", r"pekudei"), ("vayikra", r"vayikra"), ("tzav", r"tzav\b"),
+    ("shemini", r"shemini"), ("tazria", r"tazria"), ("metzora", r"metzora"),
+    ("acharei", r"acharei"), ("kedoshim", r"kedoshim"), ("emor", r"emor\b"),
+    ("behar", r"behar\b"), ("bechukosai", r"bechuko(s|t)ai"),
+    ("bamidbar", r"bamidbar"), ("naso", r"naso\b"),
+    ("behaaloscha", r"beha'?alo(s|t)e?cha"), ("shelach", r"sh'?lach\b|shelach"),
+    ("korach", r"korach"), ("chukas", r"chuka(s|t)\b"), ("balak", r"balak\b"),
+    ("pinchas", r"pinchas"), ("matos", r"mat(ot|os)\b"), ("masei", r"masei"),
+    ("devarim", r"devarim"), ("vaeschanan", r"va'?e(s|t)chanan"),
+    ("eikev", r"e(i)?kev\b"), ("reeh", r"re'?eh\b"), ("shoftim", r"shoftim"),
+    ("ki seitzei", r"ki (s|t)ei?tzei"), ("ki savo", r"ki (s|t)avo"),
+    ("nitzavim", r"nitzavim"), ("vayelech", r"vayei?lech"),
+    ("haazinu", r"ha'?azinu"), ("vezos", r"ve(z|h)o(s|t) haberach")]]
+_HEB_MONTHS = ("Tishrei|Cheshvan|Heshvan|Kislev|Teves|Tevet|Shevat|Sh'vat|"
+               "Adar I{0,2}|Nissan|Nisan|Iyar|Sivan|Tammuz|Tamuz|Av|Elul")
+_JEWISH_LAST = {}
+
+
+def _parshas_in(text: str) -> set:
+    return {k for k, rx in PARSHAS if rx.search(text or "")}
+
+
+def calendar_mistake(reply: str, facts: dict, asked: str = "") -> str:
+    """What a reply says about this week's parsha or today's Hebrew date
+    that the calendar contradicts - or "" when nothing does. asked is
+    their message: "which parsha?" answered "It is Lech Lecha" names no
+    week, but the question did."""
+    if not facts or not reply:
+        return ""
+    about = f"{reply} {asked}"
+    right = _parshas_in(facts.get("parsha", ""))
+    said = _parshas_in(reply)
+    # Another parsha named WITH the right one is a story about it
+    # (Bereishis ends with Noach); named instead of it is the mistake.
+    if right and said and not (said & right) and _re_scrub.search(
+            r"(?i)this (week|shabbos|shabbat)|parsh|parash|torah portion",
+            about):
+        return (f"this week's parsha is {facts['parsha']}, from the Jewish "
+                f"calendar")
+    days = {str(facts.get("day")), str(facts.get("tonight_day"))}
+    for mm in _re_scrub.finditer(
+            r"(?i)\b(\d{1,2})(st|nd|rd|th)?\s+(of\s+)?(" + _HEB_MONTHS
+            + r")\b|\b(" + _HEB_MONTHS + r")\s+(\d{1,2})\b", reply):
+        day = mm.group(1) or mm.group(6)
+        month = (mm.group(4) or mm.group(5) or "").lower()
+        if month[:3] == str(facts.get("month", "")).lower()[:3] and \
+                day not in days and _re_scrub.search(
+                    r"(?i)\b(today|tonight|now|date is|it is)\b", about):
+            return (f"the Hebrew date is {facts['spoken']} (after nightfall "
+                    f"{facts['tonight_spoken']}), from the Jewish calendar")
+    return ""
+
+
 def _jewish_today() -> str:
     """The Hebrew date and this week's parsha, from the calendar - not the
     model's memory, which said Noach, then Lech-Lecha, on the Friday of
-    Bereishis, and the 25th of Tishrei on the 28th (9 Oct)."""
+    Bereishis, and the 25th of Tishrei on the 28th (9 Oct). What it says
+    is kept in _JEWISH_LAST, so the reply can be checked against it."""
+    _JEWISH_LAST.clear()
     try:
         d = everyday.jewish_calendar(None, "hebrew_date")
         t, n = d["today"], d["tonight"]
+        _JEWISH_LAST.update({
+            "parsha": t.get("parsha") or n.get("parsha") or "",
+            "day": t.get("day"), "tonight_day": n.get("day"),
+            "month": t.get("month") or "", "spoken": t.get("spoken", ""),
+            "tonight_spoken": n.get("spoken", "")})
         out = (f"\nThe Hebrew date is {t['spoken']}; after nightfall it is "
                f"{n['spoken']}.")
         if t.get("parsha") or n.get("parsha"):
@@ -906,7 +981,8 @@ def text_brain(account_id: int, incoming: str, image_b64: str = "",
                 for h in trial.get("history") or []])
     msgs = [{"role": "system",
              "content": TEXT_RULES + f"\n\nIt is now {today}."
-             + _jewish_today() + _text_memory(account_id)}]
+             + (jewish_line := _jewish_today()) + _text_memory(account_id)}]
+    facts = dict(_JEWISH_LAST) if jewish_line else {}
     # The channel goes on what THEY said, never on what we said: with
     # "(sms) ..." on every past reply, the model began its own replies
     # with "(sms)" and the customer got it (8 Oct).
@@ -928,6 +1004,7 @@ def text_brain(account_id: int, incoming: str, image_b64: str = "",
     retried = False
     promised = False
     sourced = False
+    corrected = False
     used_tools = []
     for _ in range(6):
         try:
@@ -973,6 +1050,21 @@ def text_brain(account_id: int, incoming: str, image_b64: str = "",
                     "then say it is done; or say plainly what you cannot "
                     "do.")})
                 continue
+            # Checked against the calendar in code, not trusted: the
+            # parsha and the Hebrew date are facts we HAVE.
+            wrong_fact = calendar_mistake(said, facts, incoming)
+            if wrong_fact and not corrected:
+                corrected = True
+                msgs.append({"role": "assistant", "content": said})
+                msgs.append({"role": "system", "content": (
+                    f"That is wrong: {wrong_fact}. Say it again, correctly, "
+                    f"and nothing you are not sure of.")})
+                continue
+            if wrong_fact:
+                emit("sms", "calendar", f"reply still wrong after a "
+                     f"correction ({wrong_fact}) - sent the calendar's words",
+                     "warn", account_id)
+                said = f"Sorry - {wrong_fact[0].upper()}{wrong_fact[1:]}."
             if SOURCE_CITED.search(said) and "find_out" not in used_tools \
                     and not sourced:
                 sourced = True
