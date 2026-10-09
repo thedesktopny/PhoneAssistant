@@ -5765,7 +5765,8 @@ def _():
     body = src[i:i + 7000]
     assert 'f"received: ' in body, "an arriving text leaves no line"
     assert "_open_attachments(urls, frm)" in body
-    assert "(voice note)" in body, "a voice note never reaches the reply"
+    assert "text.strip() + \" \" + \" \".join(heard)" in body, \
+        "a voice note never reaches the reply"
     i = src.index("def _fetch_media(")
     assert "BULKVS_USER" in src[i:i + 1500], \
         "a media link that wants the provider's login is never tried with it"
@@ -5823,9 +5824,21 @@ def _():
     i = src.index("def _open_attachments(")
     assert "_to_jpeg(data)" in src[i:i + 2500], \
         "a picture still reaches the model in whatever format the phone used"
-    assert "say who a" in main.TEXT_RULES and "read a label" in main.TEXT_RULES
+    assert "never say who they are" in main.TEXT_RULES and         "read a label" in main.TEXT_RULES
     assert "pillow-heif" in io.open("requirements.txt",
                                     encoding="utf-8").read().lower()
+
+
+@check("a voice note's words are answered, never 'I can't listen'")
+def _():
+    """9 Oct: the voice note was heard and turned into words, labelled
+    '(voice note)', and the reply was 'I can't listen to voice notes'."""
+    src = io.open("main.py", encoding="utf-8").read()
+    i = src.index("async def sms_incoming(")
+    body = src[i:i + 7000]
+    assert '(voice note) {h}' not in body, \
+        "the words still go to the model labelled as a voice note"
+    assert "Never say you cannot listen to voice notes" in main.TEXT_RULES
 
 
 @check("a text is never called sent when it cannot be delivered")

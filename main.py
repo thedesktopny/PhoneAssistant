@@ -2014,8 +2014,10 @@ async def sms_incoming(request: Request, background: BackgroundTasks):
         urls = media if isinstance(media, list) else [media]
         picture, heard = _open_attachments(urls, frm)
     if heard:
-        text = (text.strip() + " " + " ".join(
-            f"(voice note) {h}" for h in heard)).strip()
+        # Said as what they SAID. Labelled "(voice note)", the model
+        # answered "I can't listen to voice notes" with the words in front
+        # of it (9 Oct).
+        text = (text.strip() + " " + " ".join(heard)).strip()
     if media and not picture and not text.strip():
         acct = account_for_number(frm)
         if acct:
