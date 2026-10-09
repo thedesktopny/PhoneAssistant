@@ -29,7 +29,9 @@ import urllib.error
 import base64 as _b64
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import (RedirectResponse, HTMLResponse,
-                               JSONResponse)
+                               JSONResponse, Response)
+import io
+import secrets
 from pydantic import BaseModel
 from cryptography.fernet import Fernet
 from sqlalchemy import (create_engine, Column, Integer, String, DateTime,
@@ -83,11 +85,54 @@ def _digits_e164(number: str) -> str:
     return "+" + d
 
 
+# Pictures we send by text, served from here. A link to someone else's
+# website was accepted by BulkVS and never arrived (8 Oct): sites refuse a
+# carrier's download, or serve files too big for a picture text. In memory
+# for an hour - long enough for the carrier to fetch it once.
+_MEDIA = {}
+MEDIA_MAX_BYTES = 600 * 1024
+MEDIA_KEEP = 3600
+
+
+def _host_picture(url: str) -> str:
+    """Fetch a picture, shrink it to a carrier-safe JPEG and serve it from
+    here. Returns our link, or '' when it cannot be had."""
+    b64 = _fetch_picture(url)
+    if not b64:
+        return ""
+    try:
+        from PIL import Image
+        raw = _b64.b64decode(b64)
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
+        img.thumbnail((1024, 1024))
+        data = b""
+        for quality in (82, 70, 55, 40):
+            buf = io.BytesIO()
+            img.save(buf, "JPEG", quality=quality, optimize=True)
+            data = buf.getvalue()
+            if len(data) <= MEDIA_MAX_BYTES:
+                break
+        if len(data) > MEDIA_MAX_BYTES:
+            return ""
+    except Exception as e:
+        emit("sms", "mms", f"could not prepare a picture: {str(e)[:120]}",
+             "warn")
+        return ""
+    now = time.time()
+    for k in [k for k, v in _MEDIA.items() if now - v[2] > MEDIA_KEEP]:
+        _MEDIA.pop(k, None)
+    token = secrets.token_urlsafe(18)
+    _MEDIA[token] = (data, "image/jpeg", now)
+    return f"{PUBLIC_URL}/media/{token}.jpg"
+
+
 def tool_send_sms(to: str, message: str, media: list = None) -> dict:
-    """Send a text message, with pictures (public links) when given.
-    Provider set by SMS_PROVIDER."""
+    """Send a text message, with pictures when given - each one fetched,
+    shrunk and served from here. Provider set by SMS_PROVIDER."""
     to = _digits_e164(to)
     media = [m for m in (media or []) if m and str(m).startswith("http")][:3]
+    if media and SMS_DELIVERS:
+        media = [u for u in (_host_picture(m) for m in media) if u][:2]
     if not SMS_PROVIDER or not SMS_FROM:
         return {"sent": False, "error": "SMS isn't configured."}
     if not SMS_DELIVERS:
@@ -155,7 +200,13 @@ def tool_send_sms(to: str, message: str, media: list = None) -> dict:
                          "Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=15) as r:
                 d = json.loads(r.read().decode())
-            return {"sent": True, "raw": str(d)[:200]}
+            results = d.get("Results") or [{}]
+            status = (results[0] or {}).get("Status", "")
+            return {"sent": status in ("", "SUCCESS"),
+                    "type": d.get("MessageType", ""), "status": status,
+                    "ref": d.get("RefId", ""), "pictures": len(media),
+                    "raw": str(d)[:200],
+                    "error": "" if status in ("", "SUCCESS") else status}
 
         return {"sent": False, "error": f"Unknown provider {SMS_PROVIDER}"}
     except urllib.error.HTTPError as e:
@@ -1543,6 +1594,20 @@ def test_contact(request: Request, account_id: int, name: str,
     return tool_find_contact(account_id, name, which)
 
 
+@app.get("/media/{name}")
+def media_get(name: str):
+    """A picture we are sending by text, for the carrier to fetch. The
+    random name is the key; it lasts an hour."""
+    token = name.rsplit(".", 1)[0]
+    hit = _MEDIA.get(token)
+    if not hit or time.time() - hit[2] > MEDIA_KEEP:
+        raise HTTPException(404, "Gone.")
+    data, kind, _ = hit
+    return Response(content=data, media_type=kind,
+                    headers={"Content-Length": str(len(data)),
+                             "Cache-Control": "public, max-age=3600"})
+
+
 @app.get("/sms/setup")
 def sms_setup(request: Request):
     """How texting is set up on the running system - provider, sending
@@ -1639,8 +1704,56 @@ def dlr_list(request: Request, limit: int = 30):
     return out
 
 
+# Every text arrived twice, 2-3 seconds apart, and got two replies (8 Oct).
+# The reply - model, picture search, sending - ran before the provider was
+# told "got it", so it sent the message again. Now the provider is answered
+# at once and the work runs after; and the same message from the same
+# number inside half a minute is answered once.
+_SEEN_TEXTS = {}
+SEEN_WINDOW = 30
+
+
+def _first_time(key: str) -> bool:
+    now = time.time()
+    for k in [k for k, t in _SEEN_TEXTS.items() if now - t > SEEN_WINDOW]:
+        _SEEN_TEXTS.pop(k, None)
+    if key in _SEEN_TEXTS:
+        return False
+    _SEEN_TEXTS[key] = now
+    return True
+
+
+def _answer_text(account_id: int, frm: str, text: str, picture: str):
+    """The reply to one incoming text - after the provider has its 200."""
+    try:
+        said = text.strip() or ("I sent you this picture. Tell me what it "
+                                "shows and help me with it.")
+        kept = (("(sent a picture) " + text.strip()).strip() if picture
+                else text)
+        mem_add(account_id, "sms", "user", kept)
+        out = text_brain(account_id, said, image_b64=picture)
+        reply, pictures = out if isinstance(out, tuple) else (out, [])
+        shown = reply + (" [picture sent]" if pictures else "")
+        mem_add(account_id, "sms", "assistant", shown)
+        write_text_note(account_id, kept, shown)
+        went = tool_send_sms(frm, reply, pictures)
+        # every text that goes out, or fails to, is in the live log
+        emit("sms", frm[-4:],
+             (f"sent: {reply[:100]}"
+              + (f" (+{went.get('pictures', 0)} of {len(pictures)} "
+                 f"picture(s), {went.get('type') or '?'}, "
+                 f"{went.get('status') or '?'})" if pictures else ""))
+             if went.get("sent") else
+             f"NOT sent: {went.get('error', '')} "
+             f"{went.get('detail', '')[:120]}",
+             "info" if went.get("sent") else "error", account_id)
+    except Exception as e:
+        emit("sms", frm[-4:], f"could not answer a text: {str(e)[:160]}",
+             "error", account_id)
+
+
 @app.post("/sms/incoming")
-async def sms_incoming(request: Request):
+async def sms_incoming(request: Request, background: BackgroundTasks):
     """Inbound text webhook.
 
     BulkVS posts JSON: To (list), From (string), Message (URL-encoded),
@@ -1727,23 +1840,11 @@ async def sms_incoming(request: Request):
                            "Please contact the office.")
         return {"ok": True, "known": False}
 
-    said = text.strip() or ("I sent you this picture. Tell me what it "
-                            "shows and help me with it.")
-    kept = ("(sent a picture) " + text.strip()).strip() if picture else text
-    mem_add(acct.id, "sms", "user", kept)
-    out = text_brain(acct.id, said, image_b64=picture)
-    reply, pictures = out if isinstance(out, tuple) else (out, [])
-    shown = reply + (" [picture sent]" if pictures else "")
-    mem_add(acct.id, "sms", "assistant", shown)
-    write_text_note(acct.id, kept, shown)
-    went = tool_send_sms(frm, reply, pictures)
-    # every text that goes out, or fails to, is in the live log
-    emit("sms", frm[-4:],
-         (f"sent: {reply[:100]}" + (f" (+{len(pictures)} picture(s))"
-                                    if pictures else ""))
-         if went.get("sent") else
-         f"NOT sent: {went.get('error', '')} {went.get('detail', '')[:120]}",
-         "info" if went.get("sent") else "error", acct.id)
+    ref = str(pick("RefId", "MessageId", "MessageSid", "id", "Id") or "")
+    key = ref or f"{frm}|{text.strip()}|{bool(media)}"
+    if not _first_time(key):
+        return {"ok": True, "repeat": True}
+    background.add_task(_answer_text, acct.id, frm, text, picture)
     return {"ok": True}
 
 

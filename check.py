@@ -4969,8 +4969,8 @@ def _():
     src = io.open("main.py", encoding="utf-8").read()
     i = src.index('@app.post("/calls/end")')
     assert "background.add_task(write_call_note, call_id)" in src[i:i + 1500]
-    i = src.index("async def sms_incoming(")
-    assert "write_text_note(acct.id, kept, shown)" in src[i:i + 7000]
+    i = src.index("def _answer_text(")
+    assert "write_text_note(account_id, kept, shown)" in src[i:i + 3000]
     assert "/notes" in {r.path for r in main.app.routes}
 
 
@@ -5510,8 +5510,8 @@ def _():
     assert "699.99" in reply and pictures == ["https://i/x.jpg"], (reply, pictures)
     src = io.open("main.py", encoding="utf-8").read()
     assert 'bulk["MediaURLs"] = media' in src, "BulkVS is never given the picture"
-    i = src.index("async def sms_incoming(")
-    assert "tool_send_sms(frm, reply, pictures)" in src[i:i + 7000], \
+    i = src.index("def _answer_text(")
+    assert "tool_send_sms(frm, reply, pictures)" in src[i:i + 3000], \
         "the picture is found but never sent"
 
 
@@ -5547,8 +5547,8 @@ def _():
     i = src.index("def text_brain(")
     assert 'result.get("pictures")' in src[i:i + 4000], \
         "a picture found is never attached to the reply"
-    i = src.index("async def sms_incoming(")
-    body = src[i:i + 8000]
+    i = src.index("def _answer_text(")
+    body = src[i:i + 3000]
     assert 'emit("sms", frm[-4:]' in body and "NOT sent" in body, \
         "a text going out leaves no line in the live log"
 
@@ -5578,6 +5578,82 @@ def _():
     assert reply == "Picture attached.", reply
     past = [m["content"] for m in seen["msgs"][1:-1]]
     assert past == ["hi", "Hello.", "[on a call] the labels"], past
+
+
+@check("a text is answered once, and the provider is answered at once")
+def _():
+    """8 Oct: every text arrived twice, 2-3 seconds apart, and got two
+    replies. The reply ran before the provider was told 'got it'."""
+    from fastapi.testclient import TestClient
+    calls = []
+
+    class Acct:
+        id = 1
+    undo = [everywhere("account_for_number", lambda n: Acct()),
+            everywhere("_answer_text",
+                       lambda a, f, t, p: calls.append((f, t)))]
+    main._SEEN_TEXTS.clear()
+    c = TestClient(main.app, raise_server_exceptions=False, base_url="https://t")
+    try:
+        body = {"To": ["18459831774"], "From": "15550100888",
+                "Message": "Send%20me%20a%20pic%20from%20a%20Forest"}
+        r1 = c.post("/sms/incoming", json=body)
+        r2 = c.post("/sms/incoming", json=body)
+        assert r1.status_code == 200 and r2.status_code == 200
+        assert r2.json().get("repeat") is True, r2.text
+        assert len(calls) == 1, f"answered {len(calls)} times"
+        c.post("/sms/incoming", json=dict(body, Message="something%20else"))
+        assert len(calls) == 2, "a different message was swallowed"
+    finally:
+        for u in undo:
+            u()
+        main._SEEN_TEXTS.clear()
+    src = io.open("main.py", encoding="utf-8").read()
+    i = src.index("async def sms_incoming(")
+    body = src[i:i + 7000]
+    assert "background.add_task(_answer_text" in body and \
+        "text_brain(" not in body, \
+        "the reply still runs before the provider gets its answer"
+
+
+@check("a picture sent by text is ours to serve, small enough for a carrier")
+def _():
+    """8 Oct: two texts went out 'with 2 pictures' and none arrived. BulkVS
+    took the links - its own API says MediaURLs, as we send - but they
+    pointed at other people's websites, which refuse a carrier or serve
+    files too big for a picture text. We fetch, shrink and serve them."""
+    import base64
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (3000, 2000), (20, 120, 40)).save(buf, "PNG")
+    big = base64.b64encode(buf.getvalue()).decode()
+    undo = everywhere("_fetch_picture", lambda url: big)
+    try:
+        url = main._host_picture("https://elsewhere.example/forest.png")
+    finally:
+        undo()
+    assert url.startswith(main.PUBLIC_URL + "/media/") and url.endswith(".jpg"), url
+    token = url.rsplit("/", 1)[1][:-4]
+    data, kind, _ = main._MEDIA[token]
+    assert kind == "image/jpeg" and len(data) <= main.MEDIA_MAX_BYTES, len(data)
+    w, h = Image.open(io.BytesIO(data)).size
+    assert max(w, h) <= 1024, (w, h)
+    from fastapi.testclient import TestClient
+    cl = TestClient(main.app, raise_server_exceptions=False, base_url="https://t")
+    r = cl.get(f"/media/{token}.jpg")
+    assert r.status_code == 200 and r.headers["content-type"] == "image/jpeg"
+    assert int(r.headers["content-length"]) == len(data)
+    assert cl.get("/media/nope.jpg").status_code == 404
+    undo = everywhere("_fetch_picture", lambda url: "")
+    try:
+        assert main._host_picture("https://x.example/a.jpg") == ""
+    finally:
+        undo()
+    src = io.open("main.py", encoding="utf-8").read()
+    i = src.index("def tool_send_sms(")
+    assert "_host_picture(m)" in src[i:i + 1500], \
+        "pictures are still sent as other people's links"
+    assert "Pillow" in io.open("requirements.txt", encoding="utf-8").read()
 
 
 @check("a text is never called sent when it cannot be delivered")
