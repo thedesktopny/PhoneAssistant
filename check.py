@@ -17,6 +17,9 @@ os.environ.setdefault("PUBLIC_URL", "https://example.com")
 os.environ.setdefault("ENCRYPTION_KEY",
                       "yVNCegp4QZYxqPeZtybDoMIwk2P_PCA98G0zeVQ-_bk=")
 os.environ.setdefault("BACKEND_URL", "https://example.com")
+# texts are answered at once in checks, not after the gathering pause
+os.environ.setdefault("TEXT_GATHER_SECONDS", "0")
+os.environ.setdefault("PICTURE_GATHER_SECONDS", "0")
 os.environ.setdefault("LIVEKIT_URL", "wss://x")
 os.environ.setdefault("LIVEKIT_API_KEY", "x")
 os.environ.setdefault("LIVEKIT_API_SECRET", "x")
@@ -5625,7 +5628,7 @@ def _():
     src = io.open("main.py", encoding="utf-8").read()
     i = src.index("async def sms_incoming(")
     body = src[i:i + 7000]
-    assert "background.add_task(_answer_text" in body and \
+    assert "background.add_task(_answer_after_pause" in body and \
         "text_brain(" not in body, \
         "the reply still runs before the provider gets its answer"
 
@@ -6043,6 +6046,34 @@ def _():
     src = io.open("main.py", encoding="utf-8").read()
     i = src.index("async def sms_incoming(")
     assert "typed = got[2]" in src[i:i + 7000]
+
+
+@check("a picture that arrives after the text it goes with is answered with it")
+def _():
+    """9 Oct: 'I mean oven' was answered five seconds before the oven
+    photo it was about arrived - picture messages travel slower."""
+    answered = []
+    undo = [everywhere("_answer_text", lambda a, f, t, p, v="":
+                       answered.append((t, p, v)))]
+    main._GATHER.clear()
+    try:
+        s1 = main._gather(1, "+15550100999", "I mean oven", "", "")
+        s2 = main._gather(1, "+15550100999", "", "JPEGDATA", "")
+        main._answer_after_pause("+15550100999", s1)      # older: stands down
+        assert answered == [], "the first message was answered on its own"
+        main._answer_after_pause("+15550100999", s2)      # newest: answers
+    finally:
+        for u in undo:
+            u()
+        main._GATHER.clear()
+    assert answered == [("I mean oven", "JPEGDATA", "")], answered
+    src = io.open("main.py", encoding="utf-8").read()
+    i = src.index("async def sms_incoming(")
+    body = src[i:i + 7000]
+    assert "background.add_task(_answer_after_pause, frm, stamp," in body
+    assert "PICTURE_GATHER_SECONDS if (picture or media)" in body
+    assert 'os.environ.get("TEXT_GATHER_SECONDS", "5")' in src and \
+        'os.environ.get("PICTURE_GATHER_SECONDS", "8")' in src
 
 
 @check("a text is never called sent when it cannot be delivered")

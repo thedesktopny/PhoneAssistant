@@ -2052,6 +2052,61 @@ def _first_time(key: str) -> bool:
     return True
 
 
+# A picture message travels slower than a plain text: "I mean oven" was
+# answered five seconds before the oven photo it was about arrived (9 Oct).
+# Each arrival waits a few seconds; anything else from the same number in
+# that time joins it, and the lot is answered once, as one message.
+# A plain text waits a little - the photo it goes with is usually a few
+# seconds behind; a picture waits a little longer, for its words or the
+# next picture. David: "only when I send a photo" - but the text comes
+# FIRST, so a text that waits not at all is answered before its photo.
+GATHER_SECONDS = float(os.environ.get("TEXT_GATHER_SECONDS", "5"))
+PICTURE_GATHER_SECONDS = float(os.environ.get("PICTURE_GATHER_SECONDS", "8"))
+_GATHER = {}
+_GATHER_LOCK = threading.Lock()
+_GATHER_SEQ = [0]
+
+
+def _gather(account_id: int, frm: str, text: str, picture: str,
+            voice_said: str) -> float:
+    """Put one arrival with the others from this number. Returns its
+    stamp: only the newest arrival's wait goes on to answer."""
+    with _GATHER_LOCK:
+        g = _GATHER.setdefault(frm, {"items": [], "last": 0.0,
+                                     "account": account_id})
+        g["items"].append((text, picture, voice_said))
+        # a count, not the clock: two arrivals in one clock tick must differ
+        _GATHER_SEQ[0] += 1
+        g["last"] = _GATHER_SEQ[0]
+        return g["last"]
+
+
+def _answer_after_pause(frm: str, stamp: float, wait: float = None):
+    """Wait; if nothing newer arrived, answer everything gathered."""
+    wait = GATHER_SECONDS if wait is None else wait
+    if wait > 0:
+        time.sleep(wait)
+    with _GATHER_LOCK:
+        g = _GATHER.get(frm)
+        if not g or g["last"] != stamp:
+            return                  # something newer came; its wait answers
+        items = g["items"]
+        account_id = g["account"]
+        _GATHER.pop(frm, None)
+    texts = [t.strip() for t, _, _ in items if t and t.strip()]
+    pictures = [p for _, p, _ in items if p]
+    voices = [v for _, _, v in items if v]
+    text = " ".join(texts)
+    if len(pictures) > 1:
+        text = (text + f" (They sent {len(pictures)} pictures; you can see "
+                f"the first.)").strip()
+    if len(items) > 1:
+        emit("sms", frm[-4:], f"answering {len(items)} messages together",
+             "info", account_id)
+    _answer_text(account_id, frm, text, pictures[0] if pictures else "",
+                 " ".join(voices))
+
+
 def _answer_text(account_id: int, frm: str, text: str, picture: str,
                  voice_said: str = ""):
     """The reply to one incoming text - after the provider has its 200."""
@@ -2199,8 +2254,10 @@ async def sms_incoming(request: Request, background: BackgroundTasks):
                            "Please contact the office.")
         return {"ok": True, "known": False}
 
-    background.add_task(_answer_text, acct.id, frm, text, picture,
-                        voice_said)
+    stamp = _gather(acct.id, frm, text, picture, voice_said)
+    background.add_task(_answer_after_pause, frm, stamp,
+                        PICTURE_GATHER_SECONDS if (picture or media)
+                        else GATHER_SECONDS)
     return {"ok": True}
 
 
