@@ -942,10 +942,13 @@ def text_brain(account_id: int, incoming: str, image_b64: str = "",
                 got["in"] += int(u.get("prompt_tokens", 0) or 0)
                 got["out"] += int(u.get("completion_tokens", 0) or 0)
             else:
+                # the thinking setting belongs to the text model only:
+                # the picture model is older and refuses it outright
                 data = _openai_chat(msgs, TEXT_TOOLS,
                                     model=MODEL_BROWSER if image_b64
                                     else MODEL_TEXT,
-                                    effort=MODEL_TEXT_EFFORT,
+                                    effort="" if image_b64
+                                    else MODEL_TEXT_EFFORT,
                                     account_id=account_id)
         except Exception as e:
             return f"Something went wrong: {str(e)[:80]}"

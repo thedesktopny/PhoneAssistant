@@ -6269,6 +6269,36 @@ def _():
     assert "require_auth(request)" in src[i:i + 600]
 
 
+@check("texts use the model the bench chose, and a picture never gets its thinking setting")
+def _():
+    """9 Oct: textbench.py chose gpt-5.6-luna. Its 'thinking: none' must
+    not reach the picture model, an older one that refuses the setting -
+    every picture text would fail."""
+    import core
+    if not os.environ.get("MODEL_TEXT"):
+        assert core.MODEL_TEXT == "gpt-5.6-luna", core.MODEL_TEXT
+        assert core.MODEL_TEXT_EFFORT == "none", core.MODEL_TEXT_EFFORT
+    asked = []
+
+    def fake_chat(messages, tools=None, model="", effort="", **k):
+        asked.append((model, effort))
+        return {"choices": [{"message": {"content": "A kitchen."}}]}
+    undo = [everywhere("_openai_chat", fake_chat),
+            everywhere("OPENAI_API_KEY", "x"),
+            everywhere("_jewish_today", lambda: ""),
+            everywhere("mem_recent", lambda a, n: []),
+            everywhere("MODEL_TEXT_EFFORT", "none")]
+    try:
+        main.text_brain(1, "what is this", image_b64="QUJD")
+        main.text_brain(1, "hello")
+    finally:
+        for u in undo:
+            u()
+    assert asked[0] == (main.MODEL_BROWSER, ""), asked
+    assert asked[1][1] == "none", asked
+    assert "unless a tool just showed you" in main.TEXT_RULES
+
+
 @check("a text is never called sent when it cannot be delivered")
 def _():
     """Call 76: a new customer with no email was told twice "I've sent you

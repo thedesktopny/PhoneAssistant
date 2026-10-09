@@ -134,9 +134,15 @@ _JOBS = {}          # job_id -> {"code": str|None, "cancelled": bool}
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 MODEL_BROWSER = os.environ.get("MODEL_BROWSER", "gpt-4o")
 MODEL_SUMMARY = os.environ.get("MODEL_SUMMARY", "gpt-4o-mini")
-MODEL_TEXT = os.environ.get("MODEL_TEXT", "gpt-4o-mini")
-# How long a GPT-5 text model thinks first; blank for older models.
-MODEL_TEXT_EFFORT = os.environ.get("MODEL_TEXT_EFFORT", "")
+# Texts: textbench.py, 9 Oct 2026 - 13 real texts that had gone wrong.
+# gpt-4o-mini passed 10 (answered Yiddish "I can only text in English",
+# promised a note it never left); gpt-5.6-luna passed 13, for about $1.15
+# per thousand texts against $0.80. Re-run the bench before changing it.
+MODEL_TEXT = os.environ.get("MODEL_TEXT", "gpt-5.6-luna")
+# How long a GPT-5 text model thinks first; blank for older models. The
+# 5.6 models refuse tools in chat completions unless it is "none".
+MODEL_TEXT_EFFORT = os.environ.get(
+    "MODEL_TEXT_EFFORT", "none" if MODEL_TEXT.startswith("gpt-5.6") else "")
 # Send the browser a picture of the page as well as its text. Set to 0 to
 # go back to text only.
 BROWSER_VISION = os.environ.get("BROWSER_VISION", "1") not in ("0", "false")
@@ -997,6 +1003,10 @@ actual shailah say they should ask their rav.
 The Hebrew date and this week's parsha are given below, from the Jewish
 calendar - use them, never your memory. Candle lighting, zmanim and Yom Tov
 dates: jewish_calendar. Never from memory.
+Never say WHO said something or WHERE it is written - Rashi, a Gemara, a
+Midrash, a study, a website - unless a tool just showed you that. Without
+it, give the thought plainly, with no name on it. (A thought on the parsha
+was put in Rashi's mouth; it is a Midrash.)
 A source - a Gemara page, a pasuk, a Rambam, a Midrash: find_out FIRST,
 with the whole question ("which Gemara says two todah loaves were put on the
 roof as a sign on Erev Pesach"), and give the place only if what you found
