@@ -697,8 +697,11 @@ def _jewish_today() -> str:
         out = (f"\nThe Hebrew date is {t['spoken']}; after nightfall it is "
                f"{n['spoken']}.")
         if t.get("parsha") or n.get("parsha"):
+            # "The calendar needs your ZIP code to verify the parsha" -
+            # it doesn't; outside Israel it is the same everywhere
             out += (f" This week's parsha is "
-                    f"{t.get('parsha') or n.get('parsha')}.")
+                    f"{t.get('parsha') or n.get('parsha')} - the same in "
+                    f"every town outside Israel; no town is needed for it.")
         events = list(t.get("events") or []) + [
             x for x in n.get("events") or [] if x not in (t.get("events")
                                                           or [])]
