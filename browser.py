@@ -2861,10 +2861,22 @@ def _run_browse(jid: int, account_id: int, site: str):
                 # moves from step to step, and the address list opened
                 # after the first look (David: Screenshot still missing).
                 # What was opened before is marked and skipped.
-                opened = _unfold(page, history)
+                seen_here = [] if payload.get("capture") else None
+                opened = _unfold(page, history, seen_here)
                 if opened:
                     _job_set(jid, "working",
                              "opened: " + ", ".join(opened)[:120])
+                if seen_here:
+                    _job_set(jid, "working",
+                             "CAPTURE " + " ".join(seen_here)[:900])
+                if payload.get("capture"):
+                    words = page_text(page, 6000) or ""
+                    low = words.lower()
+                    k = low.find("address")
+                    if k >= 0 and ("deliver" in low or "ship" in low):
+                        _job_set(jid, "working",
+                                 "CAPTURE page: " + " ".join(
+                                     words[max(0, k - 200):k + 1600].split()))
                 items, text = _page_snapshot(page, want=goal)
                 for _ in range(3):
                     if len(items) >= 15 and len(text) >= 800:
@@ -3478,9 +3490,16 @@ _UNFOLD_JS = r"""
 () => {
   const open = /^(see|show|view|load|display)\s+(all|more|\d+\s+more|other|all\s+\d+)|^more\s+(options|choices|addresses|payment|cards|results|details)|^(expand|show\s+details)|other\s+(addresses|payment\s+methods|cards)|^\+\s*\d+\s+more/i;
   const never = /buy|place|order|pay\s|add\s+to|remove|delete|sign\s*out|log\s*out|cancel|subscribe|less$|fewer/i;
-  const done = [];
+  const done = [], left = [];
+  const maybe = /more|all\b|other|expand|show|view/i;
+  const note = (t, why, el) => {
+    if (left.length < 15 && t && t.length <= 60 && maybe.test(t))
+      left.push(t.slice(0, 40) + ' [' + el.tagName.toLowerCase() + ': '
+                + why + ']');
+  };
   for (const el of document.querySelectorAll(
-         'button, [role=button], a, summary, [aria-expanded="false"]')) {
+         'button, [role=button], a, summary, span, div, ' +
+         '[aria-expanded="false"]')) {
     if (done.length >= 6) break;
     const r = el.getBoundingClientRect();
     if (!r.width || !r.height) continue;
@@ -3488,26 +3507,44 @@ _UNFOLD_JS = r"""
     if (el.dataset && el.dataset.paUnfolded) continue;
     const t = (el.innerText || el.getAttribute('aria-label') || '')
                 .replace(/\s+/g, ' ').trim();
-    if (!t || t.length > 40 || !open.test(t) || never.test(t)) continue;
-    if (el.tagName === 'A') {
+    const tag = el.tagName;
+    const clickable = tag === 'BUTTON' || tag === 'A' || tag === 'SUMMARY'
+      || el.getAttribute('role') === 'button'
+      || el.hasAttribute('aria-expanded')
+      || el.hasAttribute('data-action') || el.onclick
+      || getComputedStyle(el).cursor === 'pointer';
+    if (!t || t.length > 40) continue;
+    if (!open.test(t)) { if (clickable) note(t, 'wording', el); continue; }
+    if (never.test(t)) { note(t, 'never', el); continue; }
+    if (!clickable) { note(t, 'not clickable', el); continue; }
+    // a span or div is only pressed when no clickable parent holds it
+    if ((tag === 'SPAN' || tag === 'DIV')
+        && el.parentElement && el.parentElement.closest('a, button')) {
+      continue;
+    }
+    if (tag === 'A') {
       const h = el.getAttribute('href') || '';
       const here = location.pathname + location.search;
       const stays = !h || h === '#' || h.startsWith('#')
                     || h.startsWith('javascript') || h === here;
-      if (!stays) continue;
+      if (!stays) { note(t, 'leaves the page', el); continue; }
     }
     el.dataset.paUnfolded = '1';
     el.click();
     done.push(t.slice(0, 30));
   }
-  return done;
+  return {done: done, left: left};
 }
 """
 
 
-def _unfold(page, history: list) -> list:
-    """Open what the page has folded away. Returns what was opened."""
-    got = page_eval(page, _UNFOLD_JS) or []
+def _unfold(page, history: list, capture: list = None) -> list:
+    """Open what the page has folded away. Returns what was opened. With
+    capture, what it left alone, and why, is added to it."""
+    res = page_eval(page, _UNFOLD_JS) or {}
+    got = res.get("done", []) if isinstance(res, dict) else list(res)
+    if capture is not None and isinstance(res, dict) and res.get("left"):
+        capture.append("left alone: " + " | ".join(res["left"]))
     if got:
         settle(page, 1500)
         history.append("The system opened what the page had folded away: "

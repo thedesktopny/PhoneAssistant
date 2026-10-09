@@ -5327,9 +5327,11 @@ def _():
     src = io.open("browser.py", encoding="utf-8").read()
     i = src.index("def _run_browse(")
     run = src[i:src.index("\ndef ", i + 10)]
-    assert "_unfold(page, history)" in run and "unfolded" not in run,         "unfolding is still once per address, and a checkout keeps one"
+    assert "_unfold(page, history" in run and "unfolded" not in run,         "unfolding is still once per address, and a checkout keeps one"
     assert "paUnfolded" in js, "something opened once could be pressed again"
-    assert run.index("_unfold(page, history)") < run.index(
+    assert "left.push(" in js and "'leaves the page'" in js, \
+        "what the unfold step leaves alone is not recorded for a capture"
+    assert run.index("_unfold(page, history") < run.index(
         "items, text = _page_snapshot(page, want=goal)"), \
         "the page is read before it is unfolded"
 
@@ -5549,6 +5551,33 @@ def _():
     body = src[i:i + 8000]
     assert 'emit("sms", frm[-4:]' in body and "NOT sent" in body, \
         "a text going out leaves no line in the live log"
+
+
+@check("a reply by text never starts with the channel tag")
+def _():
+    """8 Oct: the customer got "(sms) Picture attached." - past replies
+    were stored and replayed with "(sms)" in front, and the model copied
+    it."""
+    seen = {}
+
+    def fake_chat(messages, tools=None, model="", **k):
+        seen["msgs"] = messages
+        return {"choices": [{"message": {"content": "(sms) Picture attached."}}]}
+    undo = [everywhere("_openai_chat", fake_chat),
+            everywhere("OPENAI_API_KEY", "x"),
+            everywhere("mem_recent", lambda a, n: [
+                {"who": "user", "channel": "sms", "text": "hi"},
+                {"who": "assistant", "channel": "sms",
+                 "text": "(sms) Hello. [picture sent]"},
+                {"who": "user", "channel": "voice", "text": "the labels"}])]
+    try:
+        reply, pics = main.text_brain(1, "send me a forest")
+    finally:
+        for u in undo:
+            u()
+    assert reply == "Picture attached.", reply
+    past = [m["content"] for m in seen["msgs"][1:-1]]
+    assert past == ["hi", "Hello.", "[on a call] the labels"], past
 
 
 @check("a text is never called sent when it cannot be delivered")

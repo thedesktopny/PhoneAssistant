@@ -465,10 +465,19 @@ def text_brain(account_id: int, incoming: str, image_b64: str = ""):
     history = mem_recent(account_id, 16)
     msgs = [{"role": "system",
              "content": TEXT_RULES + f"\n\nToday is {today}."}]
+    # The channel goes on what THEY said, never on what we said: with
+    # "(sms) ..." on every past reply, the model began its own replies
+    # with "(sms)" and the customer got it (8 Oct).
     for h in history:
+        mine = h["who"] != "user"
+        text = h["text"]
+        if mine:
+            text = _re_scrub.sub(r"^\s*\((sms|voice)\)\s*", "", text)
+            text = text.replace(" [picture sent]", "")
         msgs.append({
-            "role": "user" if h["who"] == "user" else "assistant",
-            "content": f"({h['channel']}) {h['text']}",
+            "role": "assistant" if mine else "user",
+            "content": text if mine else
+            (f"[on a call] {text}" if h["channel"] == "voice" else text),
         })
     msgs.append(_text_turn(incoming, image_b64))
 
@@ -482,7 +491,9 @@ def text_brain(account_id: int, incoming: str, image_b64: str = ""):
         choice = data["choices"][0]["message"]
         calls = choice.get("tool_calls") or []
         if not calls:
-            return (choice.get("content") or "").strip()[:600], pictures[:2]
+            said = (choice.get("content") or "").strip()
+            said = _re_scrub.sub(r"^\s*\((sms|voice)\)\s*", "", said)
+            return said[:600], pictures[:2]
 
         msgs.append(choice)
         for c in calls:
@@ -2340,7 +2351,7 @@ there instead. Never report the old one as if it were the change."""
 @app.post("/jobs/checkout")
 def job_checkout(request: Request, account_id: int, site: str,
                  deliver_to: str = "", pay_with: str = "",
-                 call_id: int = 0, order_id: int = 0):
+                 call_id: int = 0, order_id: int = 0, capture: int = 0):
     """Take a cart as far as the review page and read everything back.
     Never completes a purchase: the buttons that would are blocked. With
     order_id, the total and the chosen address and card are written to
@@ -2356,7 +2367,8 @@ def job_checkout(request: Request, account_id: int, site: str,
             pay_with=pay_with or "the one already chosen")
     goal = CHECKOUT_GOAL.format(changes=changes)
     payload = {"goal": goal, "url": "", "max_steps": 18, "may_buy": False,
-               "deliver_to": deliver_to, "pay_with": pay_with}
+               "deliver_to": deliver_to, "pay_with": pay_with,
+               "capture": bool(capture)}
     if order_id:
         payload["order_id"] = order_id
         payload["budget"] = 240
