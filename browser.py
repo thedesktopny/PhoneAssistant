@@ -2869,6 +2869,10 @@ def _run_browse(jid: int, account_id: int, site: str):
                 if seen_here:
                     _job_set(jid, "working",
                              "CAPTURE " + " ".join(seen_here)[:900])
+                ticked = _select_all_if_none(page, page_text(page, 3000),
+                                             history)
+                if ticked:
+                    _job_set(jid, "working", f"pressed '{ticked}'")
                 if payload.get("capture"):
                     words = page_text(page, 6000) or ""
                     low = words.lower()
@@ -3536,6 +3540,40 @@ _UNFOLD_JS = r"""
   return {done: done, left: left};
 }
 """
+
+
+# Some baskets start with nothing ticked - "No items selected" - and their
+# checkout does nothing until something is. Ticking the boxes one by one
+# did not register on Amazon and the job went stuck; the page's own
+# "Select all items" does it in one press.
+NOTHING_SELECTED = _re_scrub.compile(r"(?i)\bno items? (are )?selected\b|"
+                                     r"\b0 items selected\b")
+_SELECT_ALL_JS = r"""
+() => {
+  const want = /^(select all( items)?|select all items in cart)$/i;
+  for (const el of document.querySelectorAll(
+         'a, button, [role=button], label, span, input[type=checkbox]')) {
+    const r = el.getBoundingClientRect();
+    if (!r.width || !r.height) continue;
+    const t = (el.innerText || el.getAttribute('aria-label')
+               || el.value || '').replace(/\s+/g, ' ').trim();
+    if (want.test(t)) { el.click(); return t; }
+  }
+  return '';
+}
+"""
+
+
+def _select_all_if_none(page, text: str, history: list) -> str:
+    """Press the basket's own Select all when it says nothing is ticked."""
+    if not NOTHING_SELECTED.search(text or ""):
+        return ""
+    got = page_eval(page, _SELECT_ALL_JS) or ""
+    if got:
+        settle(page, 2000)
+        history.append(f"The basket had nothing ticked, so the system "
+                       f"pressed '{got}'. Carry on to checkout.")
+    return got
 
 
 def _unfold(page, history: list, capture: list = None) -> list:

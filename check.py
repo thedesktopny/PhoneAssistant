@@ -5656,6 +5656,26 @@ def _():
     assert "Pillow" in io.open("requirements.txt", encoding="utf-8").read()
 
 
+@check("a basket with nothing ticked gets its own Select all pressed")
+def _():
+    """The address capture never left Amazon's cart: 'No items selected',
+    the boxes were ticked one by one, the clicks did not register, and the
+    job went stuck - with 'Select all items' on the page."""
+    import browser
+    assert browser.NOTHING_SELECTED.search("All Carts No items selected "
+                                           "Proceed to checkout")
+    assert browser.NOTHING_SELECTED.search("0 items selected")
+    assert not browser.NOTHING_SELECTED.search("2 items selected")
+    js = browser._SELECT_ALL_JS
+    assert "select all( items)?" in js
+    src = io.open("browser.py", encoding="utf-8").read()
+    i = src.index("def _run_browse(")
+    run = src[i:src.index("\ndef ", i + 10)]
+    assert "_select_all_if_none(page" in run and run.index(
+        "_select_all_if_none(page") < run.index("act = _decide("), \
+        "Select all is pressed after the model has already acted"
+
+
 @check("a text is never called sent when it cannot be delivered")
 def _():
     """Call 76: a new customer with no email was told twice "I've sent you
