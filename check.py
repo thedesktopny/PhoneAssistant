@@ -5558,7 +5558,7 @@ def _():
         "never a blocked subject by" in main.TEXT_RULES
     src = io.open("main.py", encoding="utf-8").read()
     i = src.index("def text_brain(")
-    assert 'result.get("pictures")' in src[i:i + 4000], \
+    assert 'result.get("pictures")' in src[i:i + 9000], \
         "a picture found is never attached to the reply"
     i = src.index("def _answer_text(")
     body = src[i:i + 3000]
@@ -5863,6 +5863,43 @@ def _():
     assert seen["incoming"].startswith("[They sent a voice note and you "
                                        "heard it clearly"), seen
     assert "Can you listen to my voice?" in seen["incoming"]
+
+
+@check("'I can't listen / see / send pictures' is neither copied nor sent")
+def _():
+    """9 Oct: three voice notes heard word for word, three replies of 'I
+    can't listen to voice notes' - copied from its own earlier replies."""
+    for bad in ("I can't listen to voice notes, but you can share it.",
+                "I cannot hear audio messages.",
+                "I'm unable to view images.",
+                "I can't send pictures directly."):
+        assert main._false_cant(bad), bad
+    for fine in ("I heard you: you asked about candle lighting.",
+                 "Picture attached.", "I can't find that order."):
+        assert not main._false_cant(fine), fine
+    seen, replies = {}, iter([
+        "I can't listen to voice notes. Please type it.",
+        "Yes - I heard you. You said: can you listen to this voice now."])
+
+    def fake_chat(messages, tools=None, model="", **k):
+        seen.setdefault("first", list(messages))
+        return {"choices": [{"message": {"content": next(replies)}}]}
+    undo = [everywhere("_openai_chat", fake_chat),
+            everywhere("OPENAI_API_KEY", "x"),
+            everywhere("mem_recent", lambda a, n: [
+                {"who": "user", "channel": "sms", "text": "hello"},
+                {"who": "assistant", "channel": "sms",
+                 "text": "I can't listen to voice notes, but share it."}])]
+    try:
+        reply, _ = main.text_brain(
+            1, "[They sent a voice note and you heard it clearly. They "
+               "said:] Can you listen to this voice now?")
+    finally:
+        for u in undo:
+            u()
+    assert reply.startswith("Yes - I heard you"), reply
+    past = [m["content"] for m in seen["first"][1:-1]]
+    assert past == ["hello"], f"an old 'can't listen' was replayed: {past}"
 
 
 @check("a text is never called sent when it cannot be delivered")

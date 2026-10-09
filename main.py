@@ -475,6 +475,25 @@ def _run_text_tool(account_id: int, name: str, args: dict):
 
 NOT_ALLOWED = "I am not allowed to talk to you about this"
 
+# Things the text side CAN do that the model kept saying it could not.
+# Its own old replies said so, and it copied them: three voice notes heard
+# word for word got "I can't listen to voice notes" (9 Oct).
+CANT_HEAR = _re_scrub.compile(
+    r"(?i)\b(can.?t|cannot|can not|unable to|not able to|don.?t have the "
+    r"ability to)\s+(listen|hear|play|process|open)\b[^.]{0,30}"
+    r"\b(voice|audio|recording|message)")
+CANT_SEE = _re_scrub.compile(
+    r"(?i)\b(can.?t|cannot|can not|unable to|not able to)\s+(see|view|"
+    r"open|process|look at)\b[^.]{0,30}\b(image|picture|photo|pic)")
+CANT_SEND_PIC = _re_scrub.compile(
+    r"(?i)\b(can.?t|cannot|can not|unable to)\s+send\b[^.]{0,20}"
+    r"\b(picture|image|photo|pic)")
+
+
+def _false_cant(said: str) -> bool:
+    return bool(CANT_HEAR.search(said or "") or CANT_SEE.search(said or "")
+                or CANT_SEND_PIC.search(said or ""))
+
 
 def _text_turn(msg: str, image_b64: str = ""):
     """A customer's text, with the picture they sent attached when there
@@ -690,6 +709,8 @@ def text_brain(account_id: int, incoming: str, image_b64: str = ""):
     for h in history:
         mine = h["who"] != "user"
         text = h["text"]
+        if mine and _false_cant(text):
+            continue                # never copied again
         if mine:
             text = _re_scrub.sub(r"^\s*\((sms|voice)\)\s*", "", text)
             text = text.replace(" [picture sent]", "")
@@ -717,6 +738,19 @@ def text_brain(account_id: int, incoming: str, image_b64: str = ""):
             # all-purpose "I can't". "Can you send me any picture" and
             # "now from you" (a picture of the assistant) both got it, and
             # neither touches one. Sent back once to answer plainly.
+            heard = incoming.startswith("[They sent a voice note")
+            wrong = ((heard and CANT_HEAR.search(said))
+                     or (image_b64 and CANT_SEE.search(said))
+                     or CANT_SEND_PIC.search(said))
+            if wrong and not retried:
+                retried = True
+                msgs.append({"role": "assistant", "content": said})
+                msgs.append({"role": "system", "content": (
+                    "That is wrong. You DID hear the voice note - its words "
+                    "are in their message - you CAN see pictures they send, "
+                    "and you CAN send pictures with send_picture_of. Answer "
+                    "what they actually asked.")})
+                continue
             if NOT_ALLOWED in said and not is_blocked(incoming) \
                     and not retried:
                 retried = True
