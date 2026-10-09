@@ -506,6 +506,104 @@ def _fetch_picture(url: str) -> str:
         return ""
 
 
+AUDIO_EXT = (".amr", ".m4a", ".mp3", ".ogg", ".oga", ".opus", ".3gp",
+             ".3gpp", ".aac", ".wav", ".caf", ".mp4")
+
+
+def _fetch_media(url: str):
+    """(bytes, content type, why-not) for a provider's media link. Tried
+    plain first, then with the provider's own login - a link that wants
+    one was refused and nobody could see why (8 Oct). Up to 10 MB."""
+    def get(headers):
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return (r.read(10 * 1024 * 1024),
+                    (r.headers.get("Content-Type") or "").lower())
+    base = {"User-Agent": "Mozilla/5.0"}
+    try:
+        data, kind = get(base)
+        return data, kind, ""
+    except urllib.error.HTTPError as e:
+        first = f"HTTP {e.code}"
+        if e.code in (401, 403) and SMS_PROVIDER == "bulkvs" and BULKVS_USER:
+            auth = _b64.b64encode(
+                f"{BULKVS_USER}:{BULKVS_PASS}".encode()).decode()
+            try:
+                data, kind = get(dict(base, Authorization=f"Basic {auth}"))
+                return data, kind, ""
+            except Exception as e2:
+                return b"", "", f"{first}, then with our login: {str(e2)[:60]}"
+        return b"", "", first
+    except Exception as e:
+        return b"", "", str(e)[:100]
+
+
+def _is_image(data: bytes, kind: str) -> bool:
+    return "image" in kind or data[:4] in (b"\xff\xd8\xff\xe0",
+                                           b"\xff\xd8\xff\xe1",
+                                           b"\x89PNG") or data[:3] == b"GIF"
+
+
+def _is_audio(data: bytes, kind: str, url: str) -> bool:
+    low = url.lower().split("?")[0]
+    return ("audio" in kind or low.endswith(AUDIO_EXT)
+            or data[:6] == b"#!AMR\n")
+
+
+def _transcribe(data: bytes, name: str) -> str:
+    """A voice note in words. '' when it cannot be heard."""
+    if not OPENAI_API_KEY or not data:
+        return ""
+    edge = "----pa" + secrets.token_hex(8)
+    body = (f"--{edge}\r\nContent-Disposition: form-data; name=\"model\""
+            f"\r\n\r\nwhisper-1\r\n--{edge}\r\nContent-Disposition: "
+            f"form-data; name=\"file\"; filename=\"{name}\"\r\n"
+            f"Content-Type: application/octet-stream\r\n\r\n").encode() \
+        + data + f"\r\n--{edge}--\r\n".encode()
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/audio/transcriptions", data=body,
+        headers={"Authorization": f"Bearer {OPENAI_API_KEY}",
+                 "Content-Type": f"multipart/form-data; boundary={edge}"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return (json.loads(r.read().decode()).get("text") or "").strip()
+    except Exception as e:
+        emit("sms", "voice", f"could not hear the voice note: {str(e)[:120]}",
+             "warn")
+        return ""
+
+
+def _open_attachments(urls: list, frm: str):
+    """What came with a text: the first picture as base64, any voice notes
+    as words, and a line for the live log about each attachment."""
+    picture, heard, seen = "", [], []
+    for url in [str(u) for u in urls if u][:3]:
+        data, kind, why = _fetch_media(url)
+        host = (url.split("/")[2] if url.count("/") >= 2 else "?")
+        if not data:
+            seen.append(f"{host}: NOT downloaded ({why})")
+            continue
+        if _is_image(data, kind):
+            if not picture:
+                picture = _b64.b64encode(data).decode()
+            seen.append(f"picture {len(data) // 1024} KB")
+        elif _is_audio(data, kind, url):
+            name = url.lower().split("?")[0].rsplit("/", 1)[-1] or "note.amr"
+            if "." not in name:
+                name += ".amr"
+            words = _transcribe(data, name)
+            if words:
+                heard.append(words)
+            seen.append(f"voice note {len(data) // 1024} KB"
+                        + (", heard" if words else ", could NOT be heard"))
+        else:
+            seen.append(f"{kind or 'unknown type'} {len(data) // 1024} KB, "
+                        f"not a picture or voice note")
+    emit("sms", frm[-4:], "attachments: " + ("; ".join(seen) or "none"),
+         "info" if (picture or heard) else "warn")
+    return picture, heard
+
+
 def text_brain(account_id: int, incoming: str, image_b64: str = ""):
     """Answer one incoming text, using shared memory and the same tools.
     With image_b64, the customer sent a picture: the model sees it.
@@ -1843,15 +1941,23 @@ async def sms_incoming(request: Request, background: BackgroundTasks):
     # first picture is fetched and shown to the model with whatever words
     # came with it. Refusing pictures was a limit of ours, not a rule
     # (David, 8 Oct 2026).
-    picture = ""
+    # Every text that arrives leaves a line, attachments and all - a
+    # picture or voice note that could not be opened used to vanish.
+    emit("sms", frm[-4:], f"received: {len(text.strip())} characters, "
+                          f"{len(media) if isinstance(media, list) else int(bool(media))}"
+                          f" attachment(s)", "info")
+    picture, heard = "", []
     if media:
         urls = media if isinstance(media, list) else [media]
-        picture = _fetch_picture(str(urls[0])) if urls and urls[0] else ""
+        picture, heard = _open_attachments(urls, frm)
+    if heard:
+        text = (text.strip() + " " + " ".join(
+            f"(voice note) {h}" for h in heard)).strip()
     if media and not picture and not text.strip():
         acct = account_for_number(frm)
         if acct:
-            tool_send_sms(frm, "I couldn't open that picture. Could you "
-                               "send it again, or tell me what it says?")
+            tool_send_sms(frm, "I couldn't open what you sent. Could you "
+                               "send it again, or tell me in words?")
         return {"ok": True, "mms": True, "opened": False}
 
     if not text.strip() and not picture:

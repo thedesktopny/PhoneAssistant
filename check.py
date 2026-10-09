@@ -5426,7 +5426,8 @@ def _():
     def fake_brain(account_id, incoming, image_b64=""):
         seen["incoming"], seen["image"] = incoming, image_b64
         return "It is a receipt for $12.40 from the pharmacy."
-    undo = [everywhere("_fetch_picture", lambda url: "QUJD"),
+    png = bytes([137]) + b"PNG" + b"0" * 64
+    undo = [everywhere("_fetch_media", lambda url: (png, "image/png", "")),
             everywhere("text_brain", fake_brain),
             everywhere("tool_send_sms",
                        lambda to, msg, media=None:
@@ -5439,16 +5440,18 @@ def _():
             "MediaURLs": ["https://media.example/pic.jpg"]})
         assert r.status_code == 200 and r.json().get("mms") is None or \
             r.json().get("ok"), r.text
-        assert seen.get("image") == "QUJD", "the picture never reached the model"
+        import base64 as _b64m
+        assert seen.get("image") == _b64m.b64encode(png).decode(),             "the picture never reached the model"
         assert "picture" in seen.get("incoming", "").lower()
         assert sent and "receipt" in sent[-1][1], sent
         # a picture that cannot be fetched is said so, not blamed on rules
         sent.clear()
-        undo.append(everywhere("_fetch_picture", lambda url: ""))
+        undo.append(everywhere("_fetch_media",
+                               lambda url: (b"", "", "HTTP 404")))
         r = c.post("/sms/incoming", json={
             "To": ["18459831774"], "From": "15550100777", "Message": "",
             "MediaURLs": ["https://media.example/pic.jpg"]})
-        assert sent and "couldn't open that picture" in sent[-1][1], sent
+        assert sent and "couldn't open what you sent" in sent[-1][1], sent
     finally:
         for u in undo:
             u()
@@ -5711,6 +5714,51 @@ def _():
             u()
     assert reply.startswith("I am not allowed to talk to you about this"), reply
     assert "ONLY for those subjects" in main.TEXT_RULES
+
+
+@check("a voice note is heard, a picture is seen, and every arrival is logged")
+def _():
+    """8 Oct: 'you can still not see pics or listen to voice notes'. A
+    voice note got 'I couldn't open that picture' and left no trace; a
+    picture whose link refused us left no reason."""
+    assert main._is_audio(b"#!AMR\n....", "", "https://m/x")
+    assert main._is_audio(b"....", "audio/mp4", "https://m/x")
+    assert main._is_audio(b"....", "", "https://m/note.m4a?sig=1")
+    assert main._is_image(b"\x89PNG....", "", )
+    assert not main._is_image(b"#!AMR\n", "audio/amr")
+    logged = []
+
+    def fake_fetch(url):
+        if "pic" in url:
+            return b"\x89PNG" + b"0" * 2048, "image/png", ""
+        if "voice" in url:
+            return b"#!AMR\n" + b"0" * 4096, "audio/amr", ""
+        return b"", "", "HTTP 403, then with our login: HTTP 403"
+    undo = [everywhere("_fetch_media", fake_fetch),
+            everywhere("_transcribe", lambda data, name:
+                       "please order more labels"),
+            everywhere("emit", lambda kind, ref, text, level="info", *a:
+                       logged.append(text))]
+    try:
+        pic, heard = main._open_attachments(
+            ["https://m/pic.png", "https://m/voice.amr", "https://m/locked"],
+            "+13476752334")
+    finally:
+        for u in undo:
+            u()
+    assert pic and heard == ["please order more labels"], (pic, heard)
+    line = " ".join(logged)
+    assert "picture 2 KB" in line and "voice note 4 KB, heard" in line, line
+    assert "NOT downloaded (HTTP 403" in line, line
+    src = io.open("main.py", encoding="utf-8").read()
+    i = src.index("async def sms_incoming(")
+    body = src[i:i + 7000]
+    assert 'f"received: ' in body, "an arriving text leaves no line"
+    assert "_open_attachments(urls, frm)" in body
+    assert "(voice note)" in body, "a voice note never reaches the reply"
+    i = src.index("def _fetch_media(")
+    assert "BULKVS_USER" in src[i:i + 1500], \
+        "a media link that wants the provider's login is never tried with it"
 
 
 @check("a text is never called sent when it cannot be delivered")
