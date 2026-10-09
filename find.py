@@ -20,6 +20,7 @@ Freshness is a code, not a feeling:
   none       nothing usable came back
 """
 from core import *                                   # noqa: F401,F403
+import urllib.parse
 from core import _re_scrub
 from rules import is_blocked, blocked_terms_in, BLOCKED_REPLY
 from ai import _openai_chat, ASK_SYSTEM
@@ -166,6 +167,72 @@ def _serper_pages(q: str) -> list:
     return out
 
 
+# A question about where something is written. Web search does badly at
+# these: "which Gemara has the two loaves on the roof" brought back pages
+# about the korban todah and showbread, and memory said "Pesachim 11b"
+# (it is the Mishnah, Pesachim 1:5, on 13b). So: the model names the
+# likeliest places, and each is READ from Sefaria's own text before
+# anything is said - a guess becomes a source only if the text bears it out.
+TORAH_SOURCE = _re_scrub.compile(
+    r"(?i)\b(gemara|gemora|gemorah|gomorrah|talmud|mishna|mishnah|"
+    r"mishnayos|daf|masechta|masechet|tractate|perek|pasuk|posuk|verse|"
+    r"rambam|shulchan aruch|mishna berura|mishnah berurah|midrash|rashi|"
+    r"tosafos|chumash|tanach|navi|tehillim)\b")
+
+SEFARIA_REFS = """Name the places in Jewish texts most likely to contain
+what is asked - Talmud Bavli (e.g. "Pesachim 13b"), Mishnah (e.g. "Mishnah
+Pesachim 1:5"), Tanakh (e.g. "Genesis 12:1"), Mishneh Torah, Shulchan
+Arukh, Midrash - in Sefaria's reference style. The person may spell
+things by sound ("Gomorrah" for Gemara). Up to four, likeliest first.
+Reply with JSON only: {"refs": ["...", "..."]}"""
+
+
+def _sefaria_text(ref: str) -> str:
+    """The English of one reference, from Sefaria, tags stripped."""
+    url = ("https://www.sefaria.org/api/v3/texts/"
+           + urllib.parse.quote(ref.replace(" ", "_")) + "?version=english")
+    req = urllib.request.Request(url, headers={"User-Agent": FETCH_UA})
+    with urllib.request.urlopen(req, timeout=12) as r:
+        d = json.loads(r.read().decode("utf-8"))
+
+    def flat(x):
+        if isinstance(x, list):
+            return " ".join(flat(y) for y in x)
+        return str(x or "")
+    versions = d.get("versions") or []
+    text = flat(versions[0].get("text")) if versions else ""
+    text = _re_scrub.sub(r"<[^>]+>", " ", text)
+    return " ".join(text.split())
+
+
+def _sefaria_pages(question: str, account_id=0, call_id=0) -> list:
+    """The likeliest places, each read from Sefaria. Empty if none read."""
+    try:
+        d = _openai_chat(model=MODEL_BROWSER, account_id=account_id,
+                         call_id=call_id, messages=[
+                             {"role": "system", "content": SEFARIA_REFS},
+                             {"role": "user", "content": question[:600]}])
+        raw = (d["choices"][0]["message"].get("content") or "").strip()
+        refs = json.loads(raw[raw.find("{"):raw.rfind("}") + 1]).get("refs")
+    except Exception:
+        return []
+    out = []
+    for ref in [str(r) for r in (refs or [])][:4]:
+        try:
+            text = _sefaria_text(ref)
+        except Exception:
+            continue
+        if text:
+            out.append({"title": ref[:120], "site": "sefaria.org",
+                        "url": "https://www.sefaria.org/"
+                               + urllib.parse.quote(ref.replace(" ", "_")),
+                        "text": text[:SOURCE_CHARS], "date": ""})
+    return out
+
+
+SOURCE_CHARS = 9000         # a whole daf is about 8,000 characters
+
+
 def _pages_for(q: str) -> list:
     if TAVILY_API_KEY:
         return _tavily_pages(q)
@@ -228,6 +295,10 @@ def find_out(question: str, account_id: int = 0, call_id: int = 0) -> dict:
 
     try:
         pages = [p for p in _pages_for(question) if p.get("text")]
+        if TORAH_SOURCE.search(question):
+            # the texts themselves first, then what the web says
+            pages = _sefaria_pages(question, account_id, call_id) \
+                + pages[:3]
     except Exception as e:
         return done({"answer": "", "freshness": "none",
                      "reason": f"search_failed: {str(e)[:80]}"}, "search")
@@ -257,6 +328,9 @@ def find_out(question: str, account_id: int = 0, call_id: int = 0) -> dict:
         return done({"answer": "", "freshness": "none",
                      "reason": f"model_failed: {str(e)[:80]}"}, "search")
     answer = str(act.get("answer") or "")[:900]
+    # "found=false. The sources here..." was said aloud (9 Oct)
+    answer = _re_scrub.sub(r"(?i)\bfound\s*=\s*(true|false)\b[.:,]?\s*",
+                           "", answer).strip()
     if is_blocked(answer):
         return done({"blocked": True, "answer": BLOCKED_REPLY,
                      "freshness": "none", "reason": "blocked"}, "refused")

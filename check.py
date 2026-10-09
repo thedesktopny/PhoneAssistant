@@ -6355,6 +6355,44 @@ def _():
     assert "Bereshit" in reply and "Lech" not in reply, reply
 
 
+@check("a Torah source is suggested, then read on Sefaria before it is said")
+def _():
+    """9 Oct: 'which Gemara has the bread outside as a sign' - web pages
+    about showbread, and memory said Pesachim 11b. It is Mishnah Pesachim
+    1:5, on 13b. A guessed place counts only if its text bears it out."""
+    import json
+    import find as F
+    assert F.TORAH_SOURCE.search("In which Gomorrah we found about bread")
+    assert not F.TORAH_SOURCE.search("how much is the Brother printer")
+    fetched = []
+    real_text, real_chat, real_pages = F._sefaria_text, F._openai_chat, \
+        F._pages_for
+    F._sefaria_text = lambda ref: fetched.append(ref) or (
+        "Two disqualified loaves of a thanks-offering are placed on the roof "
+        "of the colonnade as an indicator." if "1:5" in ref else "")
+    answers = iter([
+        {"refs": ["Pesachim 11b", "Mishnah Pesachim 1:5"]},
+        {"answer": "found=true. The Mishnah in Pesachim 1:5 says two "
+                   "loaves were put on the roof as a sign.",
+         "found": True, "used": [1]}])
+    F._openai_chat = lambda **k: {"choices": [{"message": {
+        "content": json.dumps(next(answers))}}]}
+    F._pages_for = lambda q: [{"title": "Showbread", "site": "example.org",
+                               "url": "https://example.org", "text": "bread",
+                               "date": ""}]
+    undo = everywhere("OPENAI_API_KEY", "x")
+    try:
+        d = F.find_out("Which Gemara has two loaves on the roof as a sign")
+    finally:
+        F._sefaria_text, F._openai_chat, F._pages_for = real_text, \
+            real_chat, real_pages
+        undo()
+    assert fetched == ["Pesachim 11b", "Mishnah Pesachim 1:5"], (fetched, d)
+    assert d["found"] and d["sources"][0]["title"] == "Mishnah Pesachim 1:5", d
+    assert d["sources"][0]["site"] == "sefaria.org", d
+    assert not d["answer"].lower().startswith("found"), d["answer"]
+
+
 @check("a text is never called sent when it cannot be delivered")
 def _():
     """Call 76: a new customer with no email was told twice "I've sent you
